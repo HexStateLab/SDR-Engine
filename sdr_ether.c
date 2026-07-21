@@ -1927,14 +1927,13 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
             int count = iarg1 > 0 ? iarg1 : 1;
             if (!interactive) {
                 loop_stack = realloc(loop_stack, (loop_depth+2)*sizeof(int));
-                loop_stack[loop_depth++] = ip;       /* save start IP */
-                loop_stack[loop_depth++] = count;     /* save count */
-                printf("  [LOOP] ×%d (lines %d–...)\n", count, ip);
+                loop_stack[loop_depth++] = ip;
+                loop_stack[loop_depth++] = count;
+                printf("  [LOOP] ×%d\n", count);
             } else {
                 printf("  [LOOP] Not supported in interactive mode\n");
-                /* skip to END */
-                while (ip < nlines && strcasecmp(lines[ip], "END") != 0) ip++;
             }
+            continue;
         }
         else if (strcasecmp(op, "END") == 0) {
             if (loop_depth >= 2 && !interactive) {
@@ -1944,12 +1943,10 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
                 if (count > 0) {
                     loop_stack[loop_depth++] = start;
                     loop_stack[loop_depth++] = count;
-                    ip = start;  /* jump back */
-                    printf("  [LOOP] ← %d remaining\n", count);
-                } else {
-                    printf("  [LOOP] done\n");
+                    ip = start;
                 }
             }
+            continue;
         }
 
         if (strcasecmp(op, "INIT") == 0) {
@@ -1986,7 +1983,30 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
             wf_print(&wf, "|ψ⟩", lineno);
         }
         else if (strcasecmp(op, "CZ") == 0) {
-            if (sdr_ok) gate_CZ(&sdr, &wf);
+            if (sdr_ok) {
+                /* Save current state, recapture, then cross-correlate */
+                double *prev_re = malloc(D * sizeof(double));
+                double *prev_im = malloc(D * sizeof(double));
+                memcpy(prev_re, wf.re, D * sizeof(double));
+                memcpy(prev_im, wf.im, D * sizeof(double));
+                sdr_capture(&sdr);
+                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
+                for (int k = 0; k < D; k++) {
+                    double cr = prev_re[k]*wf.re[k] + prev_im[k]*wf.im[k];
+                    double ci = prev_re[k]*wf.im[k] - prev_im[k]*wf.re[k];
+                    wf.re[k] = cr; wf.im[k] = ci;
+                    wf.prob[k] = cr*cr + ci*ci;
+                }
+                double total = 0;
+                for (int k = 0; k < D; k++) total += wf.prob[k];
+                if (total > 1e-15) for (int k=0;k<D;k++) wf.prob[k]/=total;
+                wf.entropy = 0; wf.purity = 0;
+                for (int k=0;k<D;k++) {
+                    if (wf.prob[k]>1e-15) wf.entropy-=wf.prob[k]*log2(wf.prob[k]);
+                    wf.purity += wf.prob[k]*wf.prob[k];
+                }
+                free(prev_re); free(prev_im);
+            }
             printf("  [CZ] Entangle\n");
             wf_print(&wf, "|ψ⟩", lineno);
         }
