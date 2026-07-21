@@ -5,6 +5,8 @@
  *        ./sdr_qe 6                          # D=6, defaults
  *        ./sdr_qe 12 100e6 2048000 400       # D=12, custom
  *        ./sdr_qe 256 50e6                   # D=256, 50 MHz
+ *        ./sdr_qe 6 --tx-file tx.iq          # TX: synthesize qudit I/Q to file
+ *        ./sdr_qe 6 --tx-stdout              # TX: pipe to SDR transmitter
  *
  * Build: gcc -O3 -std=gnu99 sdr_quantum_engine.c -lm -o sdr_qe
  */

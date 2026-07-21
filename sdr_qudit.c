@@ -5,22 +5,27 @@
  *   |k⟩ = coherent EM field at f₀ + k·Δf  (I/Q = complex amplitude)
  *
  * Architecture (physical layer):
- *   Level 0 → bin 0:  f₀ + 0·Δf    I/Q from R820T tuner → RTL2832U ADC
- *   Level 1 → bin 1:  f₀ + 1·Δf    
- *   ...
- *   Level D-1 → bin D-1: f₀ + (D-1)·Δf
+ *   TX: R820T2 PLL LO leakage radiates selected qudit level as CW tone
+ *       gate_tx() synthesizes full OFDM I/Q from qudit state (CU8 output)
+ *       gate_ether_loop() does TX→ether→RX as a physical gate
+ *   RX: Level 0→bin 0: f₀ + 0·Δf → R820T2 tuner → RTL2832U ADC
+ *       Level 1→bin 1: f₀ + 1·Δf    
+ *       ...
+ *       Level D-1→bin D-1: f₀ + (D-1)·Δf
  *
  * Physical gates:
- *   H (Hadamard)  → frequency hop LO to 2nd harmonic, fold spectrum
- *   X (NOT)       → cyclic shift of I/Q buffer → permutes levels
- *   Z (Phase)     → I/Q rotation via complex multiply (simulates dielectric phase plate)
- *   CZ (entangle) → cross-correlate two temporal I/Q windows (mixer intermod)
- *   DFT (basis change) → retune LO + recapture (physical Fourier basis)
- *
- * Measurement: ADC LSB entropy → Born rule collapse on bin probabilities.
+ *   TX           → LO hop through qudit levels + CU8 output
+ *   ETHER        → TX→ether channel→RX loopback gate
+ *   H (Hadamard) → frequency hop LO to 2nd harmonic, fold spectrum
+ *   X (NOT)      → cyclic shift of I/Q buffer → permutes levels
+ *   Z (Phase)    → I/Q rotation via complex multiply
+ *   CZ (entangle)→ cross-correlate two temporal I/Q windows
  *
  * Build: gcc -O3 -std=gnu99 -Wall sdr_qudit.c -lm -o sdr_qudit
  * Usage: ./sdr_qudit [D] [freq_hz] [rate_hz] [gain]
+ *        ./sdr_qudit 6 --tx-file tx.iq     # TX: synthesize qudit I/Q to file
+ *        ./sdr_qudit 6 --tx-stdout         # TX: pipe to SDR transmitter
+ *        ./sdr_qudit 6 --ether-loop         # TX→ether→RX physical gate
  */
 #include <stdio.h>
 #include <stdlib.h>
