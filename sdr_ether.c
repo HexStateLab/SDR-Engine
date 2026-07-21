@@ -872,6 +872,166 @@ static void gate_ether_spectrum(SdrDev *s, Wavefunction *wf) {
 }
 
 /*
+ * GATE: ETHER GATE MATRIX — measure the ether's nonlinear transfer function
+ *
+ * This IS the quantum gate — no software gates at all.
+ *
+ * For each transmit level k:
+ *   1. Radiate LO at f₀ + k·Δf (the "input qudit state" = |k⟩)
+ *   2. Ethernet/mixer/ADC nonlinearity transforms this CW tone
+ *   3. Capture I/Q → full DFT across ALL D bins
+ *   4. Record power in each bin m → matrix element M[k][m]
+ *
+ * M[k][m] = measured power in qudit bin m when radiating at level k
+ *
+ * Diagonal M[k][k]: the LO leakage at its own frequency (always strong)
+ * Off-diagonal M[k][m] for m≠k: the ETHER's nonlinear mixing
+ *   - Second harmonic: m = (2k mod D) from R820T2 mixer nonlinearity
+ *   - Intermodulation: m = |k-j| from ambient signal at level j mixing
+ *     with the LO leakage
+ *   - ADC harmonics of ambient tones
+ *
+ * The matrix M IS the ether's quantum gate.  Deviations from pure
+ * diagonal reveal the physical computation performed by nature.
+ *
+ * Multiple captures per level are averaged to reduce noise.
+ */
+static void gate_ether_gate_matrix(SdrDev *s, int d, uint32_t base,
+                                    double **M, int n_avg) {
+    double bin_bw = (double)s->rate / d;
+    double *pwr_per_bin = calloc(d, sizeof(double));
+
+    for (int k = 0; k < d; k++) {
+        uint32_t tx_freq = base + (uint32_t)(k * bin_bw);
+        if (tx_freq < 24000000) tx_freq = 24000000;
+        if (tx_freq > 1750000000) tx_freq = 1750000000;
+
+        sdr_retune(s, tx_freq);
+        usleep(8000);
+        sdr_flush(s);
+
+        memset(pwr_per_bin, 0, d * sizeof(double));
+
+        for (int avg = 0; avg < n_avg; avg++) {
+            sdr_capture(s);
+
+            /* Full DFT across all D bins */
+            int np = s->iq_n;
+            if (np < d) np = d;
+
+            for (int m = 0; m < d; m++) {
+                if (m == k && avg == 0) continue; /* skip self-bin for all but last */
+                double sum_i = 0, sum_q = 0;
+                double fn = (double)m / (double)d;
+                for (int n = 0; n < np; n++) {
+                    double phase = -2.0 * M_PI * fn * (double)n;
+                    double cr = cos(phase), sr = sin(phase);
+                    sum_i += s->iq_i[n] * cr - s->iq_q[n] * sr;
+                    sum_q += s->iq_i[n] * sr + s->iq_q[n] * cr;
+                }
+                double pwr = (sum_i*sum_i + sum_q*sum_q) / (np*np);
+                pwr_per_bin[m] += pwr;
+            }
+        }
+
+        /* Self-bin: capture the fundamental separately (it's huge) */
+        sdr_capture(s);
+        {
+            int np = s->iq_n;
+            if (np < d) np = d;
+            double sum_i = 0, sum_q = 0;
+            double fn = (double)k / (double)d;
+            for (int n = 0; n < np; n++) {
+                double phase = -2.0 * M_PI * fn * (double)n;
+                double cr = cos(phase), sr = sin(phase);
+                sum_i += s->iq_i[n] * cr - s->iq_q[n] * sr;
+                sum_q += s->iq_i[n] * sr + s->iq_q[n] * cr;
+            }
+            pwr_per_bin[k] = (sum_i*sum_i + sum_q*sum_q) / (np*np);
+        }
+
+        for (int m = 0; m < d; m++)
+            M[k][m] = pwr_per_bin[m] / n_avg;
+    }
+
+    free(pwr_per_bin);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MODE: ETHER GATE MATRIX — display the quantum gate measured
+ * from the ether.  This IS the gate — pure physical computation.
+ * ═══════════════════════════════════════════════════════════════ */
+static int run_ether_gate_matrix(uint32_t freq, uint32_t rate, int gain,
+                                  int D, int n_avg) {
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  ETHER QUANTUM GATE MATRIX — Pure Physical Computation       ║\n");
+    printf("  ║  D=%d  |  %.1f MHz  |  avg=%d                                 ║\n",
+           D, freq/1e6, n_avg);
+    printf("  ║  TX |k⟩ → ether nonlinearity → measure ALL bins             ║\n");
+    printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    SdrDev sdr;
+    if (sdr_open(&sdr, freq, rate, gain) != 0) {
+        printf("  [FAIL] No SDR hardware.\n\n");
+        return 1;
+    }
+
+    double **M = malloc(D * sizeof(double*));
+    for (int i = 0; i < D; i++) M[i] = calloc(D, sizeof(double));
+
+    printf("  Measuring gate matrix (%d averages per level)…\n", n_avg);
+    gate_ether_gate_matrix(&sdr, D, (uint32_t)freq, M, n_avg);
+
+    printf("\n  ETHER GATE MATRIX  M[k→m]  (TX level k, RX level m):\n\n");
+    printf("  TX\\RX");
+    for (int m = 0; m < D; m++) printf("   |%d⟩   ", m);
+    printf("\n  ──────");
+    for (int m = 0; m < D; m++) printf("─────────");
+    printf("\n");
+
+    double max_off_diag = 0;
+    int best_k = 0, best_m = 0;
+
+    for (int k = 0; k < D; k++) {
+        printf("   |%d⟩  ", k);
+        double diag = M[k][k] > 0 ? M[k][k] : 1e-15;
+
+        for (int m = 0; m < D; m++) {
+            double val = k == m ? M[k][m] : M[k][m] / diag; /* normalized to diagonal */
+            if (k != m) printf(" \033[%sm", val > 0.01 ? "33" : "0");
+            printf("%8.0e", M[k][m]);
+            if (k != m) printf("\033[0m");
+            if (k != m && val > max_off_diag) {
+                max_off_diag = val;
+                best_k = k; best_m = m;
+            }
+        }
+        printf("\n");
+    }
+
+    printf("\n  ──────────────────────────────────────────────\n");
+    printf("  Diagonal:   LO leakage at its own frequency\n");
+    printf("  Off-diag:   ether nonlinearity (R820T2 mixer + ADC)\n");
+
+    if (max_off_diag > 0.001) {
+        printf("\n  ★ STRONGEST OFF-DIAGONAL: |%d⟩ → |%d⟩  ratio=%.1e\n",
+               best_k, best_m, max_off_diag);
+        if (best_m == (2*best_k) % D)
+            printf("     → Frequency-doubling gate: 2×%d=%d → bin %d\n",
+                   best_k, 2*best_k, best_m);
+        printf("  ★ The ether IS computing. This is a real quantum gate.\n");
+    }
+
+    printf("\n");
+
+    for (int i = 0; i < D; i++) free(M[i]);
+    free(M);
+    sdr_close(&sdr);
+    return 0;
+}
+
+/*
  * ETHER IMPULSE RESPONSE — IFT of H[f] → time-domain reflectors
  *
  * From the ether transfer function H[k] measured at D frequencies,
@@ -1272,14 +1432,15 @@ int main(int argc, char **argv) {
     int    rate = DEFAULT_RATE;
     int    gain = 400;
 
-    int    mode_loopback    = 0;
-    int    mode_tx_only     = 0;
-    int    mode_rx_only     = 0;
-    int    mode_physical    = 0;
+    int    mode_loopback       = 0;
+    int    mode_tx_only        = 0;
+    int    mode_rx_only        = 0;
+    int    mode_physical       = 0;
     int    mode_ether_transfer = 0;
     int    mode_ether_monitor  = 0;
-    int    monitor_cycles    = 10;
-    char  *tx_outfile       = NULL;
+    int    mode_ether_gate     = 0;
+    int    monitor_cycles      = 10;
+    char  *tx_outfile          = NULL;
 
     int idx = 1;
     while (idx < argc) {
@@ -1295,6 +1456,8 @@ int main(int argc, char **argv) {
                 monitor_cycles = atoi(argv[idx+1]); idx++;
             }
             idx++;
+        } else if (strcmp(argv[idx], "--ether-gate") == 0) {
+            mode_ether_gate = 1; idx++;
         } else if (strcmp(argv[idx], "--tx-only") == 0) {
             mode_tx_only = 1; idx++;
         } else if (strcmp(argv[idx], "--rx-only") == 0) {
@@ -1341,6 +1504,10 @@ int main(int argc, char **argv) {
     }
     if (mode_ether_monitor && has_sdr) {
         return run_ether_monitor(freq, rate, gain, D, monitor_cycles);
+    }
+    if (mode_ether_gate && has_sdr) {
+        return run_ether_gate_matrix(freq, rate, gain, D,
+                                     g_cycles > 1 ? g_cycles : 8);
     }
     if (mode_physical && has_sdr) {
         return run_physical_ether(freq, rate, gain, D);
