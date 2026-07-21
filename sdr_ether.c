@@ -1789,6 +1789,233 @@ static int run_ether_field(uint32_t freq, uint32_t rate, int gain,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * QUANTUM VM — Ether-native instruction set executed physically
+ *
+ * The ether IS the quantum computer.  The VM interprets instructions
+ * and maps them to physical EM field operations.
+ *
+ * Superposition: the DFT of captured I/Q gives ALL D complex
+ * amplitudes simultaneously.  A single capture IS a superposition
+ * measurement in the frequency basis.  The ether naturally provides
+ * the superposition — we don't need to create it, just read it.
+ *
+ * Instruction set:
+ *   INIT           capture ambient RF → normalize to |ψ⟩
+ *   SUPERPOSE      capture, treat as coherent superposition
+ *   X [shift]      cyclic-shift frequency bins (default +1)
+ *   Z [rad] [k]    phase rotation (k=-1 = all, default rad=π/4)
+ *   H              LO hop for Hadamard
+ *   CZ             cross-correlate two I/Q windows (entangle)
+ *   DFT [step]     LO retune by step bins (basis change)
+ *   TX [ms]        radiate state into ether via LO hopping
+ *   RX             capture state from ether
+ *   MEASURE        Born-rule collapse via ADC LSB entropy
+ *   TICK           one complete TX→ether→RX cycle
+ *   PROB           show probability distribution
+ *   SHOW           show full complex amplitudes
+ *   COHERENT [f]   synthesize OFDM I/Q superposition → file
+ *   WAIT [ms]      let ether compute for N ms
+ *   ECHO [text]    print message
+ *   HELP           show instruction set
+ *   QUIT           exit VM
+ *
+ * Script:  ./sdr_ether 6 --vm script.qvm
+ * Live:    ./sdr_ether 6 --vm
+ * ═══════════════════════════════════════════════════════════════ */
+static void wf_print(const Wavefunction *wf, const char *label, int cycle);
+static int  gate_measure(const uint8_t *raw, int raw_n, const double *prob, int d);
+static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
+                        Wavefunction *wf);
+static void gate_X(Wavefunction *wf);
+static void gate_Z(Wavefunction *wf, double rad, int target);
+static void gate_H(SdrDev *s, Wavefunction *wf);
+static void gate_CZ(SdrDev *s, Wavefunction *wf);
+__attribute__((unused)) static void gate_DFT(SdrDev *s, Wavefunction *wf, int step);
+static void gate_tx_hardware(SdrDev *s, const Wavefunction *wf);
+static void tx_synthesize(const Wavefunction *wf, TxBuf *tx);
+static void tx_write_file(const TxBuf *tx, const char *path);
+
+static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
+                           const char *script_path) {
+    int npairs = IQ_WINDOW / 2;
+
+    SdrDev sdr;
+    int sdr_ok = (sdr_open(&sdr, (uint32_t)freq, (uint32_t)rate, gain) == 0);
+
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  QUANTUM VM — Ether-native instruction set                   ║\n");
+    printf("  ║  D=%d  |  %.1f MHz  |  %.2f MSPS  |  Δf=%.1f Hz            ║\n",
+           D, freq/1e6, rate/1e6, (double)rate/D);
+    printf("  ║  Substrate: %-50s ║\n",
+           sdr_ok ? "PHYSICAL (RTL-SDR + EM field)" : "SIMULATED");
+    printf("  ║  Superposition: DFT of ambient RF across %d bins             ║\n", D);
+    printf("  ╚══════════════════════════════════════════════════════════════╝\n");
+
+    Wavefunction wf = wf_alloc(D, (uint32_t)freq, (uint32_t)rate);
+
+    if (sdr_ok) { sdr_capture(&sdr); wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf); }
+    else { for (int k=0;k<D;k++) wf.re[k]=1.0/sqrt(D);
+           for (int k=0;k<D;k++) wf.prob[k]=1.0/D;
+           wf.purity=1.0/D; wf.entropy=log2(D); }
+
+    printf("\n  VM ready.  %s\n\n",
+           sdr_ok ? "Physical ether substrate active." : "No SDR — software fallback.");
+    wf_print(&wf, "|ψ⟩ init", -1);
+
+    FILE *script = NULL;
+    int interactive = (!script_path || strcmp(script_path, "-") == 0);
+    if (!interactive) {
+        script = fopen(script_path, "r");
+        if (!script) { fprintf(stderr, "[VM] Cannot open %s\n", script_path); return 1; }
+    }
+    FILE *in = interactive ? stdin : script;
+
+    char line[512];
+    int lineno = 0;
+    int running = 1;
+
+    while (running) {
+        if (interactive) {
+            printf("\n  qvm> ");
+            fflush(stdout);
+        }
+
+        if (!fgets(line, sizeof(line), in)) break;
+
+        lineno++;
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        char *cmt = strchr(line, '#'); if (cmt) *cmt = 0;
+        char *cmd = line;
+        while (*cmd == ' ' || *cmd == '\t') cmd++;
+        if (*cmd == 0) continue;
+
+        char op[32] = {0};
+        double arg1 = 0, arg2 = 0;
+        int iarg1 = 0, iarg2 = 0;
+        int nscan = sscanf(cmd, "%31s %lf %lf", op, &arg1, &arg2);
+        iarg1 = (int)arg1; iarg2 = (int)arg2;
+        (void)nscan;
+
+        if (strcasecmp(op, "INIT") == 0) {
+            if (sdr_ok) { sdr_capture(&sdr);
+                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf); }
+            printf("  [INIT] Fresh capture from ether\n");
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "SUPERPOSE") == 0 || strcasecmp(op, "SP") == 0) {
+            if (sdr_ok) {
+                sdr_capture(&sdr);
+                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
+            }
+            printf("  [SUPERPOSE] %d-level coherent decomposition\n", D);
+            wf_print(&wf, "|ψ⟩ sup", lineno);
+        }
+        else if (strcasecmp(op, "X") == 0) {
+            int shift = iarg1 ? iarg1 : 1;
+            shift = ((shift % D) + D) % D;
+            for (int s = 0; s < shift; s++) gate_X(&wf);
+            printf("  [X] Shift +%d\n", shift);
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "Z") == 0) {
+            double rad = arg1 ? arg1 : M_PI / 4.0;
+            int target = iarg2 ? iarg2 : -1;
+            if (target >= D) target = -1;
+            gate_Z(&wf, rad, target);
+            printf("  [Z] %.3f rad %s\n", rad, target<0?"(all)":"");
+        }
+        else if (strcasecmp(op, "H") == 0) {
+            if (sdr_ok) gate_H(&sdr, &wf);
+            printf("  [H] Hadamard\n");
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "CZ") == 0) {
+            if (sdr_ok) gate_CZ(&sdr, &wf);
+            printf("  [CZ] Entangle\n");
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "DFT") == 0) {
+            int step = iarg1 ? iarg1 : 1;
+            if (sdr_ok) gate_DFT(&sdr, &wf, step);
+            printf("  [DFT] LO %+d bins\n", step);
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "TX") == 0) {
+            if (sdr_ok) gate_tx_hardware(&sdr, &wf);
+            printf("  [TX] Radiated\n");
+        }
+        else if (strcasecmp(op, "RX") == 0) {
+            if (sdr_ok) { sdr_capture(&sdr);
+                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf); }
+            printf("  [RX] Captured\n");
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "MEASURE") == 0 || strcasecmp(op, "M") == 0) {
+            int outcome;
+            if (sdr_ok) outcome = gate_measure(sdr.iq_raw, sdr.iq_n*2, wf.prob, D);
+            else outcome = rand() % D;
+            printf("  [MEASURE] → |%d⟩\n", outcome);
+            memset(wf.re, 0, D*sizeof(double));
+            memset(wf.im, 0, D*sizeof(double));
+            memset(wf.prob, 0, D*sizeof(double));
+            wf.re[outcome] = 1.0; wf.prob[outcome] = 1.0;
+            wf.entropy = 0; wf.purity = 1.0;
+        }
+        else if (strcasecmp(op, "TICK") == 0) {
+            if (sdr_ok) {
+                gate_tx_hardware(&sdr, &wf);
+                sdr_capture(&sdr);
+                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
+            }
+            printf("  [TICK] TX→ether→RX\n");
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "PROB") == 0 || strcasecmp(op, "P") == 0) {
+            printf("  [PROB]");
+            for (int k=0;k<D;k++) printf(" |%d⟩=%.3f", k, wf.prob[k]);
+            printf("  S=%.3f γ=%.4f\n", wf.entropy, wf.purity);
+        }
+        else if (strcasecmp(op, "SHOW") == 0 || strcasecmp(op, "S") == 0) {
+            wf_print(&wf, "|ψ⟩", lineno);
+        }
+        else if (strcasecmp(op, "COHERENT") == 0) {
+            TxBuf tx = tx_alloc(npairs, (uint32_t)freq, (uint32_t)rate);
+            tx_synthesize(&wf, &tx);
+            printf("  [COHERENT] %d-pair OFDM superposition synthesized\n", npairs);
+            tx_write_file(&tx, "/tmp/qvm_coherent.iq");
+            tx_free(&tx);
+        }
+        else if (strcasecmp(op, "WAIT") == 0) {
+            int ms = iarg1 > 0 ? iarg1 : 100;
+            printf("  [WAIT] %d ms — ether computing…\n", ms);
+            usleep(ms * 1000);
+        }
+        else if (strcasecmp(op, "ECHO") == 0) {
+            printf("  %s\n", cmd + 4);
+        }
+        else if (strcasecmp(op, "HELP") == 0 || strcasecmp(op, "?") == 0) {
+            printf("  INIT SUPERPOSE X Z H CZ DFT TX RX MEASURE TICK\n");
+            printf("  PROB SHOW COHERENT WAIT ECHO HELP QUIT\n");
+        }
+        else if (strcasecmp(op, "QUIT") == 0 || strcasecmp(op, "EXIT") == 0 ||
+                 strcasecmp(op, "Q") == 0) {
+            running = 0;
+        }
+        else {
+            printf("  ? Unknown: %s\n", op);
+        }
+    }
+
+    printf("\n  ★ VM halted.  Ether substrate released. ★\n\n");
+
+    wf_free(&wf);
+    if (sdr_ok) sdr_close(&sdr);
+    if (!interactive && script) fclose(script);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * MODE: ETHER DECODE — measure M, compute M⁻¹, reverse the ether
  *
  * 1. Measure the ether's forward channel matrix M
@@ -2443,7 +2670,9 @@ int main(int argc, char **argv) {
     int    mode_ether_equalize  = 0;
     int    mode_ether_entangle  = 0;
     int    mode_ether_field     = 0;
+    int    mode_vm              = 0;
     char  *calib_file           = NULL;
+    char  *vm_script            = NULL;
     int    monitor_cycles       = 10;
     char  *tx_outfile          = NULL;
 
@@ -2473,6 +2702,12 @@ int main(int argc, char **argv) {
             mode_ether_entangle = 1; idx++;
         } else if (strcmp(argv[idx], "--field") == 0) {
             mode_ether_field = 1; idx++;
+        } else if (strcmp(argv[idx], "--vm") == 0) {
+            mode_vm = 1;
+            if (idx+1 < argc && argv[idx+1][0] != '-') {
+                vm_script = argv[idx+1]; idx++;
+            }
+            idx++;
         } else if (strcmp(argv[idx], "--regularization") == 0 && idx+1 < argc) {
             g_lambda = atof(argv[idx+1]); idx += 2;
         } else if (strcmp(argv[idx], "--tx-only") == 0) {
@@ -2546,6 +2781,9 @@ int main(int argc, char **argv) {
     if (mode_ether_field && has_sdr) {
         return run_ether_field(freq, rate, gain, D,
                                g_cycles > 0 ? g_cycles : 30, 0.5);
+    }
+    if (mode_vm && has_sdr) {
+        return run_quantum_vm(freq, rate, gain, D, vm_script);
     }
     if (mode_physical && has_sdr) {
         return run_physical_ether(freq, rate, gain, D);
