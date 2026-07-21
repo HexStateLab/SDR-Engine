@@ -290,19 +290,28 @@ static void sdr_retune(SdrDev *s, uint32_t hz) {
 }
 
 static void sdr_flush(SdrDev *s) {
-    uint8_t drain[4096];
-    struct pollfd p = { .fd = s->fd, .events = POLLIN };
-    if (poll(&p, 1, 50) <= 0) return;
-    struct v4l2_buffer db;
-    memset(&db, 0, sizeof(db));
-    db.type = V4L2_BUF_TYPE_SDR_CAPTURE;
-    db.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(s->fd, VIDIOC_DQBUF, &db) < 0) return;
-    if (s->bufs[db.index]) {
-        int n = db.bytesused < 4096 ? (int)db.bytesused : 4096;
-        memcpy(drain, s->bufs[db.index], n);
+    /* Reset internal state — force sdr_capture to get fresh buffers */
+    if (s->cur_buf >= 0) {
+        struct v4l2_buffer b;
+        memset(&b, 0, sizeof(b));
+        b.type = V4L2_BUF_TYPE_SDR_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = s->cur_buf;
+        ioctl(s->fd, VIDIOC_QBUF, &b);
     }
-    ioctl(s->fd, VIDIOC_QBUF, &db);
+    s->cur_buf = -1;
+    s->cur_off = 0;
+    /* Drain any queued buffers by polling and re-queueing */
+    for (int i = 0; i < 2; i++) {
+        struct pollfd p = { .fd = s->fd, .events = POLLIN };
+        if (poll(&p, 1, 20) <= 0) break;
+        struct v4l2_buffer db;
+        memset(&db, 0, sizeof(db));
+        db.type = V4L2_BUF_TYPE_SDR_CAPTURE;
+        db.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(s->fd, VIDIOC_DQBUF, &db) < 0) break;
+        ioctl(s->fd, VIDIOC_QBUF, &db);
+    }
 }
 
 static void sdr_close(SdrDev *s) {
@@ -800,9 +809,8 @@ static void gate_ether_transfer(SdrDev *s, int d, uint32_t base,
         if (tx_freq > 1750000000) tx_freq = 1750000000;
 
         sdr_retune(s, tx_freq);
-        usleep(500);
+        usleep(10000);  /* wait for PLL lock */
         sdr_flush(s);   /* discard stale I/Q from previous frequency */
-        usleep(500);
         sdr_capture(s); /* fresh I/Q at current frequency */
 
         /* RMS I/Q power over the capture window.
