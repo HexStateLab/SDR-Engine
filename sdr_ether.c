@@ -1871,21 +1871,46 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
     }
     FILE *in = interactive ? stdin : script;
 
-    char line[512];
-    int lineno = 0;
+    /* Pre-load script into array for LOOP support */
+    char **lines = NULL;
+    int nlines = 0;
+    if (!interactive) {
+        char lbuf[512];
+        lines = malloc(1024 * sizeof(char*));
+        while (fgets(lbuf, sizeof(lbuf), in) && nlines < 1024) {
+            char *nl = strchr(lbuf, '\n'); if (nl) *nl = 0;
+            char *cmt = strchr(lbuf, '#'); if (cmt) *cmt = 0;
+            char *s = lbuf; while (*s==' '||*s=='\t') s++;
+            if (*s) lines[nlines++] = strdup(s);
+        }
+        fclose(script); script = NULL;
+    }
+
+    int ip = 0;
+    int *loop_stack = NULL;
+    int loop_depth = 0;
     int running = 1;
 
     while (running) {
-        if (interactive) {
-            printf("\n  qvm> ");
-            fflush(stdout);
+        char line[512];
+        int lineno;
+
+        if (!interactive) {
+            if (ip >= nlines) break;
+            strcpy(line, lines[ip]);
+            lineno = ip + 1;
+            ip++;
+        } else {
+            if (interactive) {
+                printf("\n  qvm> ");
+                fflush(stdout);
+            }
+            if (!fgets(line, sizeof(line), stdin)) break;
+            char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+            char *cmt = strchr(line, '#'); if (cmt) *cmt = 0;
+            lineno = 0;
         }
 
-        if (!fgets(line, sizeof(line), in)) break;
-
-        lineno++;
-        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
-        char *cmt = strchr(line, '#'); if (cmt) *cmt = 0;
         char *cmd = line;
         while (*cmd == ' ' || *cmd == '\t') cmd++;
         if (*cmd == 0) continue;
@@ -1896,6 +1921,36 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
         int nscan = sscanf(cmd, "%31s %lf %lf", op, &arg1, &arg2);
         iarg1 = (int)arg1; iarg2 = (int)arg2;
         (void)nscan;
+
+        /* ── Control flow ── */
+        if (strcasecmp(op, "LOOP") == 0) {
+            int count = iarg1 > 0 ? iarg1 : 1;
+            if (!interactive) {
+                loop_stack = realloc(loop_stack, (loop_depth+2)*sizeof(int));
+                loop_stack[loop_depth++] = ip;       /* save start IP */
+                loop_stack[loop_depth++] = count;     /* save count */
+                printf("  [LOOP] ×%d (lines %d–...)\n", count, ip);
+            } else {
+                printf("  [LOOP] Not supported in interactive mode\n");
+                /* skip to END */
+                while (ip < nlines && strcasecmp(lines[ip], "END") != 0) ip++;
+            }
+        }
+        else if (strcasecmp(op, "END") == 0) {
+            if (loop_depth >= 2 && !interactive) {
+                int count = loop_stack[--loop_depth];
+                int start = loop_stack[--loop_depth];
+                count--;
+                if (count > 0) {
+                    loop_stack[loop_depth++] = start;
+                    loop_stack[loop_depth++] = count;
+                    ip = start;  /* jump back */
+                    printf("  [LOOP] ← %d remaining\n", count);
+                } else {
+                    printf("  [LOOP] done\n");
+                }
+            }
+        }
 
         if (strcasecmp(op, "INIT") == 0) {
             if (sdr_ok) { sdr_capture(&sdr);
@@ -2009,9 +2064,11 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
 
     printf("\n  ★ VM halted.  Ether substrate released. ★\n\n");
 
+    for (int i = 0; i < nlines; i++) free(lines[i]);
+    free(lines);
+    free(loop_stack);
     wf_free(&wf);
     if (sdr_ok) sdr_close(&sdr);
-    if (!interactive && script) fclose(script);
     return 0;
 }
 
