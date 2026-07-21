@@ -289,6 +289,22 @@ static void sdr_retune(SdrDev *s, uint32_t hz) {
     s->freq = hz;
 }
 
+static void sdr_flush(SdrDev *s) {
+    uint8_t drain[4096];
+    struct pollfd p = { .fd = s->fd, .events = POLLIN };
+    if (poll(&p, 1, 50) <= 0) return;
+    struct v4l2_buffer db;
+    memset(&db, 0, sizeof(db));
+    db.type = V4L2_BUF_TYPE_SDR_CAPTURE;
+    db.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(s->fd, VIDIOC_DQBUF, &db) < 0) return;
+    if (s->bufs[db.index]) {
+        int n = db.bytesused < 4096 ? (int)db.bytesused : 4096;
+        memcpy(drain, s->bufs[db.index], n);
+    }
+    ioctl(s->fd, VIDIOC_QBUF, &db);
+}
+
 static void sdr_close(SdrDev *s) {
     if (s->fd < 0) return;
     enum v4l2_buf_type t = V4L2_BUF_TYPE_SDR_CAPTURE;
@@ -784,10 +800,10 @@ static void gate_ether_transfer(SdrDev *s, int d, uint32_t base,
         if (tx_freq > 1750000000) tx_freq = 1750000000;
 
         sdr_retune(s, tx_freq);
-        usleep(1000);
-        sdr_capture(s); /* drain stale buffer from previous frequency */
-        usleep(1000);
-        sdr_capture(s); /* fresh capture at this frequency */
+        usleep(500);
+        sdr_flush(s);   /* discard stale I/Q from previous frequency */
+        usleep(500);
+        sdr_capture(s); /* fresh I/Q at current frequency */
 
         /* RMS I/Q power over the capture window.
          * This measures total RF power at this frequency:
