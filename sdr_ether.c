@@ -64,6 +64,7 @@ static int    g_cycles  = 1;
 static double g_snr_db  = 30.0;
 static int    g_fading  = 0;
 static int    g_drift   = 0;
+static double g_lambda  = 1.0;  /* Tikhonov regularization */
 
 /* ═══════════════════════════════════════════════════════════════
  * SDR RECEIVE DEVICE (RTL-SDR via V4L2)
@@ -958,6 +959,482 @@ static void gate_ether_gate_matrix(SdrDev *s, int d, uint32_t base,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * MATRIX INVERT — Gaussian elimination with partial pivoting
+ *
+ * Computes A_inv = A^{-1} for an n×n matrix.
+ * Returns: condition number estimate (>0), or 0.0 if singular.
+ * ═══════════════════════════════════════════════════════════════ */
+static double matrix_invert(double **A, double **A_inv, int n) {
+    double *aug = malloc(n * (2*n) * sizeof(double));
+    if (!aug) return 0.0;
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++)
+            aug[i*(2*n) + j] = A[i][j];
+        for (int j = 0; j < n; j++)
+            aug[i*(2*n) + n + j] = (i == j) ? 1.0 : 0.0;
+    }
+
+    double norm_a = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            norm_a += A[i][j] * A[i][j];
+    norm_a = sqrt(norm_a);
+
+    for (int col = 0; col < n; col++) {
+        int pivot = col;
+        double maxv = fabs(aug[col*(2*n) + col]);
+        for (int row = col + 1; row < n; row++) {
+            double v = fabs(aug[row*(2*n) + col]);
+            if (v > maxv) { maxv = v; pivot = row; }
+        }
+        if (maxv < 1e-30) { free(aug); return 0.0; }
+
+        if (pivot != col) {
+            for (int j = 0; j < 2*n; j++) {
+                double tmp = aug[col*(2*n) + j];
+                aug[col*(2*n) + j] = aug[pivot*(2*n) + j];
+                aug[pivot*(2*n) + j] = tmp;
+            }
+        }
+
+        double piv_val = aug[col*(2*n) + col];
+        for (int j = 0; j < 2*n; j++)
+            aug[col*(2*n) + j] /= piv_val;
+
+        for (int row = 0; row < n; row++) {
+            if (row == col) continue;
+            double factor = aug[row*(2*n) + col];
+            for (int j = 0; j < 2*n; j++)
+                aug[row*(2*n) + j] -= factor * aug[col*(2*n) + j];
+        }
+    }
+
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            A_inv[i][j] = aug[i*(2*n) + n + j];
+
+    double norm_inv = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            norm_inv += A_inv[i][j] * A_inv[i][j];
+    norm_inv = sqrt(norm_inv);
+
+    double cond = (norm_a > 1e-15 && norm_inv > 1e-15)
+        ? norm_a * norm_inv : 0.0;
+
+    free(aug);
+    return cond;
+}
+
+/*
+ * Apply matrix B to vector v_in → v_out = B · v_in
+ */
+static void matrix_apply(double **B, const double *v_in, double *v_out, int n) {
+    for (int i = 0; i < n; i++) {
+        v_out[i] = 0;
+        for (int j = 0; j < n; j++)
+            v_out[i] += B[i][j] * v_in[j];
+    }
+}
+
+/*
+ * Tikhonov-regularized pseudo-inverse:
+ *   M⁺ = (MᵀM + λI)⁻¹ · Mᵀ
+ *
+ * λ (lambda) controls the regularization:
+ *   λ = 0    → exact inverse (unstable for ill-conditioned M)
+ *   λ ≫ 0    → heavily smoothed, stable but biased
+ *   λ ≈ σ²  → optimal for noise variance σ² (Wiener filter)
+ *
+ * Returns condition number of (MᵀM + λI).
+ */
+static double matrix_pinv(double **M, double **Pinv, int n, double lambda) {
+    double **MT  = malloc(n * sizeof(double*));
+    double **MTM = malloc(n * sizeof(double*));
+    double **MTMi = malloc(n * sizeof(double*));
+    for (int i = 0; i < n; i++) {
+        MT[i]  = calloc(n, sizeof(double));
+        MTM[i] = calloc(n, sizeof(double));
+        MTMi[i]= calloc(n, sizeof(double));
+    }
+
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            MT[i][j] = M[j][i];
+
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            double sum = 0;
+            for (int k = 0; k < n; k++)
+                sum += MT[i][k] * M[k][j];
+            MTM[i][j] = sum + ((i == j) ? lambda : 0.0);
+        }
+
+    double cond = matrix_invert(MTM, MTMi, n);
+
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            double sum = 0;
+            for (int k = 0; k < n; k++)
+                sum += MTMi[i][k] * MT[k][j];
+            Pinv[i][j] = sum;
+        }
+
+    for (int i = 0; i < n; i++) { free(MT[i]); free(MTM[i]); free(MTMi[i]); }
+    free(MT); free(MTM); free(MTMi);
+    return cond;
+}
+
+static int matrix_save(double **M, int d, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { fprintf(stderr, "[SAVE] Cannot open %s\n", path); return -1; }
+    fwrite(&d, sizeof(int), 1, fp);
+    for (int i = 0; i < d; i++)
+        fwrite(M[i], sizeof(double), d, fp);
+    fclose(fp);
+    fprintf(stderr, "[SAVE] Matrix %d×%d → %s\n", d, d, path);
+    return 0;
+}
+
+static double **matrix_load(int *d, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "[LOAD] Cannot open %s\n", path); return NULL; }
+    fread(d, sizeof(int), 1, fp);
+    if (*d < 2 || *d > MAX_DIM) { fclose(fp); return NULL; }
+    double **M = malloc(*d * sizeof(double*));
+    for (int i = 0; i < *d; i++) {
+        M[i] = malloc(*d * sizeof(double));
+        fread(M[i], sizeof(double), *d, fp);
+    }
+    fclose(fp);
+    fprintf(stderr, "[LOAD] Matrix %d×%d ← %s\n", *d, *d, path);
+    return M;
+}
+
+/*
+ * Live equalizer: apply M⁺ to a received power vector and normalize.
+ * Returns the equalized probability distribution in v_out.
+ */
+static void equalize_apply(double **Pinv, const double *v_rx,
+                           double *v_eq, int d) {
+    matrix_apply(Pinv, v_rx, v_eq, d);
+    /* Clip negative values (artifact of ill-conditioned inverse) */
+    for (int i = 0; i < d; i++)
+        if (v_eq[i] < 0) v_eq[i] = 0;
+    /* Normalize to probability distribution */
+    double total = 0;
+    for (int i = 0; i < d; i++) total += v_eq[i];
+    if (total > 1e-15)
+        for (int i = 0; i < d; i++) v_eq[i] /= total;
+    else
+        for (int i = 0; i < d; i++) v_eq[i] = 1.0 / d;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MODE: ETHER CALIBRATE — measure M, compute M⁺, save to file
+ * ═══════════════════════════════════════════════════════════════ */
+static int run_ether_calibrate(uint32_t freq, uint32_t rate, int gain,
+                                int D, int n_avg, double lambda,
+                                const char *outfile) {
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  ETHER CALIBRATION — Measure M, compute M⁺(λ=%.1e)          ║\n", lambda);
+    printf("  ║  D=%d  |  %.1f MHz  |  avg=%d  |  → %s                     ║\n",
+           D, freq/1e6, n_avg, outfile);
+    printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    SdrDev sdr;
+    if (sdr_open(&sdr, freq, rate, gain) != 0) { printf("  [FAIL]\n\n"); return 1; }
+
+    double **M = malloc(D * sizeof(double*));
+    double **Pinv = malloc(D * sizeof(double*));
+    for (int i = 0; i < D; i++) {
+        M[i]    = calloc(D, sizeof(double));
+        Pinv[i] = calloc(D, sizeof(double));
+    }
+
+    printf("  Measuring channel matrix M…\n");
+    gate_ether_gate_matrix(&sdr, D, (uint32_t)freq, M, n_avg);
+
+    printf("  Computing M⁺ via Tikhonov (λ=%.1e)…\n", lambda);
+    double cond = matrix_pinv(M, Pinv, D, lambda);
+    printf("  Condition number after regularization: %.1f\n", cond);
+
+    printf("\n  Forward M:\n");
+    for (int k = 0; k < D; k++) {
+        printf("    ");
+        for (int m = 0; m < D; m++) printf(" %+.2e", M[k][m]);
+        printf("\n");
+    }
+
+    printf("\n  Pseudo-inverse M⁺:\n");
+    for (int k = 0; k < D; k++) {
+        printf("    ");
+        for (int m = 0; m < D; m++) printf(" %+.2e", Pinv[k][m]);
+        printf("\n");
+    }
+
+    /* Save M to file (not Pinv — recompute on load in case λ changes) */
+    matrix_save(M, D, outfile);
+
+    for (int i = 0; i < D; i++) { free(M[i]); free(Pinv[i]); }
+    free(M); free(Pinv);
+    sdr_close(&sdr);
+
+    printf("\n  ★ Calibration saved.  Use --ether-equalize %s to apply. ★\n\n", outfile);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MODE: ETHER EQUALIZE — apply M⁺ continuously to undo the ether
+ *
+ * Loads a calibrated channel matrix from file, computes M⁺,
+ * then continuously captures ambient RF and applies the inverse
+ * to "undo" the mixer saturation and multipath smearing.
+ *
+ * Each displayed line: raw ether state → equalized (decoded) state
+ * The equalized state is the BEST ESTIMATE of what was originally
+ * transmitted through the ether, before the channel distorted it.
+ * ═══════════════════════════════════════════════════════════════ */
+static int run_ether_equalize(uint32_t freq, uint32_t rate, int gain,
+                               const char *calib_file, double lambda,
+                               int n_cycles) {
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  ETHER EQUALIZER — Apply M⁺ to undo physical distortion      ║\n");
+    printf("  ║  Calibration: %-48s ║\n", calib_file);
+    printf("  ║  λ=%.1e  |  cycles=%d                                         ║\n", lambda, n_cycles);
+    printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    int D;
+    double **M = matrix_load(&D, calib_file);
+    if (!M) { printf("  [FAIL] Cannot load calibration.\n\n"); return 1; }
+
+    double **Pinv = malloc(D * sizeof(double*));
+    for (int i = 0; i < D; i++) Pinv[i] = calloc(D, sizeof(double));
+
+    printf("  Computing M⁺ (λ=%.1e)…\n", lambda);
+    double cond = matrix_pinv(M, Pinv, D, lambda);
+    printf("  Condition: %.1f\n\n", cond);
+
+    SdrDev sdr;
+    if (sdr_open(&sdr, (uint32_t)freq, (uint32_t)rate, gain) != 0) {
+        printf("  [FAIL] No SDR hardware.\n\n");
+        goto cleanup;
+    }
+
+    printf("  %-6s  %-30s  %-30s\n", "cycle", "raw |ψ⟩ (ether-distorted)", "equalized |ψ_eq⟩ = M⁺·|ψ_raw⟩");
+    printf("  ───────────────────────────────────────────────────────────────────────────\n");
+
+    double *v_raw = calloc(D, sizeof(double));
+    double *v_eq  = calloc(D, sizeof(double));
+
+    for (int c = 0; c < n_cycles; c++) {
+        sdr_capture(&sdr);
+        int np = sdr.iq_n;
+        if (np < D) np = D;
+
+        for (int m = 0; m < D; m++) {
+            double sum_i = 0, sum_q = 0;
+            double fn = (double)m / (double)D;
+            for (int n = 0; n < np; n++) {
+                double phase = -2.0 * M_PI * fn * (double)n;
+                double cr = cos(phase), sr = sin(phase);
+                sum_i += sdr.iq_i[n] * cr - sdr.iq_q[n] * sr;
+                sum_q += sdr.iq_i[n] * sr + sdr.iq_q[n] * cr;
+            }
+            v_raw[m] = (sum_i*sum_i + sum_q*sum_q) / (np*np);
+        }
+
+        equalize_apply(Pinv, v_raw, v_eq, D);
+
+        printf("  %-6d  [", c);
+        for (int m = 0; m < D && m < 8; m++) printf("%.3f ", v_raw[m]);
+        printf("] → [");
+        for (int m = 0; m < D && m < 8; m++) printf("%.3f ", v_eq[m]);
+        printf("]\n");
+
+        usleep(500000);
+    }
+
+    free(v_raw); free(v_eq);
+    sdr_close(&sdr);
+cleanup:
+    for (int i = 0; i < D; i++) { free(M[i]); free(Pinv[i]); }
+    free(M); free(Pinv);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MODE: ETHER DECODE — measure M, compute M⁻¹, reverse the ether
+ *
+ * 1. Measure the ether's forward channel matrix M
+ * 2. Compute its inverse M⁻¹ (Gaussian elimination)
+ * 3. For each qudit level k as a probe:
+ *      a. TX |k⟩ into ether via LO leakage
+ *      b. RX the distorted state vector v_rx (DFT over all D bins)
+ *      c. Decode: v_est = M⁻¹ · v_rx
+ *      d. v_est should peak at bin k — the ether distortion is removed
+ * 4. Show TX fidelity before and after decoding
+ *
+ * If M⁻¹ works, the decoded state should be MUCH closer to |k⟩
+ * than the raw received state.  This proves we can digitally invert
+ * the ether's physical transformation.
+ * ═══════════════════════════════════════════════════════════════ */
+static int run_ether_decode(uint32_t freq, uint32_t rate, int gain,
+                             int D, int n_avg) {
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  ETHER DECODE — Measure M, invert, cancel ether distortion   ║\n");
+    printf("  ║  D=%d  |  %.1f MHz  |  avg=%d                                 ║\n",
+           D, freq/1e6, n_avg);
+    printf("  ║  M⁻¹·M ≈ I  →  software reverses physical channel          ║\n");
+    printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    SdrDev sdr;
+    if (sdr_open(&sdr, freq, rate, gain) != 0) {
+        printf("  [FAIL] No SDR hardware.\n\n");
+        return 1;
+    }
+
+    double **M     = malloc(D * sizeof(double*));
+    double **M_inv = malloc(D * sizeof(double*));
+    for (int i = 0; i < D; i++) {
+        M[i]     = calloc(D, sizeof(double));
+        M_inv[i] = calloc(D, sizeof(double));
+    }
+
+    printf("  Step 1: Measure ether channel matrix M…\n");
+    gate_ether_gate_matrix(&sdr, D, (uint32_t)freq, M, n_avg);
+
+    printf("\n  Step 2: Compute M⁻¹ via Gaussian elimination…\n");
+    double cond = matrix_invert(M, M_inv, D);
+
+    if (cond < 1e-10) {
+        printf("  ✗ M is singular (cond ≈ 0) — cannot invert.\n");
+        printf("    The ether's channel is not uniquely reversible.\n");
+        goto cleanup;
+    }
+
+    printf("  ✓ M is invertible.  Condition number ≈ %.1f\n", cond);
+    if (cond > 1000.0)
+        printf("    ⚠ High condition number — decoding may amplify noise.\n");
+    else if (cond < 10.0)
+        printf("    Excellent conditioning — cleanly invertible.\n");
+
+    printf("\n  Forward channel M  (row = TX level, col = RX level):\n");
+    printf("  TX\\RX");
+    for (int m = 0; m < D; m++) printf("   |%d⟩   ", m);
+    printf("\n  ──────");
+    for (int m = 0; m < D; m++) printf("─────────");
+    printf("\n");
+    for (int k = 0; k < D; k++) {
+        printf("   |%d⟩  ", k);
+        for (int m = 0; m < D; m++)
+            printf(" %7.1e", M[k][m]);
+        printf("\n");
+    }
+
+    printf("\n  Inverse channel M⁻¹ (decoding matrix):\n");
+    printf("  RX\\TX");
+    for (int m = 0; m < D; m++) printf("   |%d⟩   ", m);
+    printf("\n  ──────");
+    for (int m = 0; m < D; m++) printf("─────────");
+    printf("\n");
+    for (int k = 0; k < D; k++) {
+        printf("   |%d⟩  ", k);
+        for (int m = 0; m < D; m++)
+            printf(" %+7.1e", M_inv[k][m]);
+        printf("\n");
+    }
+
+    double bin_bw = (double)rate / D;
+    double *v_rx  = calloc(D, sizeof(double));
+    double *v_est = calloc(D, sizeof(double));
+
+    printf("\n  Step 3: Probe each level, decode with M⁻¹\n");
+    printf("  ───────────────────────────────────────────────────\n");
+    printf("  %-6s  %8s  %8s  %s\n", "TX|k⟩", "RX peak", "Decoded", "Correct?");
+    printf("  ───────────────────────────────────────────────────\n");
+
+    int correct = 0;
+    for (int k = 0; k < D; k++) {
+        uint32_t tx_freq = (uint32_t)freq + (uint32_t)(k * bin_bw);
+        if (tx_freq < 24000000) tx_freq = 24000000;
+        if (tx_freq > 1750000000) tx_freq = 1750000000;
+
+        sdr_retune(&sdr, tx_freq);
+        usleep(8000);
+        sdr_flush(&sdr);
+
+        memset(v_rx, 0, D * sizeof(double));
+        for (int avg = 0; avg < 2; avg++) {
+            sdr_capture(&sdr);
+            int np = sdr.iq_n;
+            if (np < D) np = D;
+            for (int m = 0; m < D; m++) {
+                double sum_i = 0, sum_q = 0;
+                double fn = (double)m / (double)D;
+                for (int n = 0; n < np; n++) {
+                    double phase = -2.0 * M_PI * fn * (double)n;
+                    double cr = cos(phase), sr = sin(phase);
+                    sum_i += sdr.iq_i[n] * cr - sdr.iq_q[n] * sr;
+                    sum_q += sdr.iq_i[n] * sr + sdr.iq_q[n] * cr;
+                }
+                v_rx[m] += (sum_i*sum_i + sum_q*sum_q) / (np*np);
+            }
+        }
+        for (int m = 0; m < D; m++) v_rx[m] /= 2.0;
+
+        /* Subtract row-k mean to remove ambient bias, isolate LO */
+        double row_mean = 0;
+        for (int m = 0; m < D; m++) row_mean += v_rx[m];
+        row_mean /= D;
+        double *v_clean = calloc(D, sizeof(double));
+        for (int m = 0; m < D; m++)
+            v_clean[m] = v_rx[m] > row_mean ? v_rx[m] - row_mean : 0.0;
+
+        matrix_apply(M_inv, v_rx, v_est, D);
+
+        int rx_peak = 0, est_peak = 0;
+        double rx_max = v_rx[0], est_max = v_est[0];
+        for (int m = 1; m < D; m++) {
+            if (v_rx[m]  > rx_max)  { rx_max  = v_rx[m];  rx_peak  = m; }
+            if (v_est[m] > est_max) { est_max = v_est[m]; est_peak = m; }
+        }
+
+        int ok = (est_peak == k);
+        if (ok) correct++;
+        printf("  |%-5d  |%-8d  |%-8d  %s\n",
+               k, rx_peak, est_peak, ok ? "✓" : "✗");
+
+        /* Show the decoded vector for the most interesting case */
+        if (k == D/2 || !ok) {
+            printf("          v_rx:  ");
+            for (int m = 0; m < D; m++) printf("%.2e ", v_rx[m]);
+            printf("\n          v_est: ");
+            for (int m = 0; m < D; m++) printf("%.2e ", v_est[m]);
+            printf("\n");
+        }
+    }
+
+    printf("  ───────────────────────────────────────────────────\n");
+    printf("  Decode accuracy: %d/%d (%.0f%%)\n", correct, D, 100.0*correct/D);
+    if (correct >= D/2)
+        printf("  ★ M⁻¹ successfully reverses the ether channel!\n");
+    else
+        printf("  ⚠ Channel too noisy — more averaging needed.\n");
+
+    free(v_rx); free(v_est);
+cleanup:
+    for (int i = 0; i < D; i++) { free(M[i]); free(M_inv[i]); }
+    free(M); free(M_inv);
+    sdr_close(&sdr);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * MODE: ETHER GATE MATRIX — display the quantum gate measured
  * from the ether.  This IS the gate — pure physical computation.
  * ═══════════════════════════════════════════════════════════════ */
@@ -1439,7 +1916,11 @@ int main(int argc, char **argv) {
     int    mode_ether_transfer = 0;
     int    mode_ether_monitor  = 0;
     int    mode_ether_gate     = 0;
-    int    monitor_cycles      = 10;
+    int    mode_ether_decode   = 0;
+    int    mode_ether_calibrate = 0;
+    int    mode_ether_equalize  = 0;
+    char  *calib_file           = NULL;
+    int    monitor_cycles       = 10;
     char  *tx_outfile          = NULL;
 
     int idx = 1;
@@ -1458,6 +1939,14 @@ int main(int argc, char **argv) {
             idx++;
         } else if (strcmp(argv[idx], "--ether-gate") == 0) {
             mode_ether_gate = 1; idx++;
+        } else if (strcmp(argv[idx], "--ether-decode") == 0) {
+            mode_ether_decode = 1; idx++;
+        } else if (strcmp(argv[idx], "--ether-calibrate") == 0 && idx+1 < argc) {
+            mode_ether_calibrate = 1; calib_file = argv[idx+1]; idx += 2;
+        } else if (strcmp(argv[idx], "--ether-equalize") == 0 && idx+1 < argc) {
+            mode_ether_equalize = 1; calib_file = argv[idx+1]; idx += 2;
+        } else if (strcmp(argv[idx], "--regularization") == 0 && idx+1 < argc) {
+            g_lambda = atof(argv[idx+1]); idx += 2;
         } else if (strcmp(argv[idx], "--tx-only") == 0) {
             mode_tx_only = 1; idx++;
         } else if (strcmp(argv[idx], "--rx-only") == 0) {
@@ -1508,6 +1997,19 @@ int main(int argc, char **argv) {
     if (mode_ether_gate && has_sdr) {
         return run_ether_gate_matrix(freq, rate, gain, D,
                                      g_cycles > 1 ? g_cycles : 8);
+    }
+    if (mode_ether_decode && has_sdr) {
+        return run_ether_decode(freq, rate, gain, D,
+                                g_cycles > 1 ? g_cycles : 8);
+    }
+    if (mode_ether_calibrate && has_sdr) {
+        return run_ether_calibrate(freq, rate, gain, D,
+                                   g_cycles > 1 ? g_cycles : 16,
+                                   g_lambda, calib_file);
+    }
+    if (mode_ether_equalize && has_sdr) {
+        return run_ether_equalize(freq, rate, gain, calib_file,
+                                  g_lambda, g_cycles > 0 ? g_cycles : 20);
     }
     if (mode_physical && has_sdr) {
         return run_physical_ether(freq, rate, gain, D);
