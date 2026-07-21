@@ -47,8 +47,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <linux/videodev2.h>
+#include <dirent.h>
 
-#define SDR_DEVICE   "/dev/swradio0"
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
 #define MAX_DIM      256
@@ -64,6 +64,20 @@ static int    g_cycles  = 1;
 static double g_snr_db  = 30.0;
 static int    g_fading  = 0;
 static int    g_drift   = 0;
+static char   g_sdr_dev[64] = "";
+
+static int sdr_find(void) {
+    if (g_sdr_dev[0]) return 0;
+    DIR *d = opendir("/dev"); if (!d) goto fallback;
+    struct dirent *de;
+    while ((de = readdir(d)))
+        if (strncmp(de->d_name,"swradio",7)==0) {
+            snprintf(g_sdr_dev,64,"/dev/%s",de->d_name); closedir(d); return 0;
+        }
+    closedir(d);
+fallback:
+    snprintf(g_sdr_dev,64,"/dev/swradio0"); return -1;
+}
 static double g_lambda  = 1.0;  /* Tikhonov regularization */
 
 /* ═══════════════════════════════════════════════════════════════
@@ -171,13 +185,14 @@ static void ether_free(EtherChan *ch) { free(ch->bin_gain); free(ch->bin_phase);
  * SDR RECEIVE — capture I/Q from RTL-SDR hardware
  * ═══════════════════════════════════════════════════════════════ */
 static int sdr_open(SdrDev *s, uint32_t freq, uint32_t rate, int gain) {
+    sdr_find();
     memset(s, 0, sizeof(*s));
     s->freq = freq; s->rate = rate; s->gain = gain;
     s->cur_buf = -1;
 
-    s->fd = open(SDR_DEVICE, O_RDWR);
+    s->fd = open(g_sdr_dev, O_RDWR);
     if (s->fd < 0) {
-        fprintf(stderr, "[SDR] Cannot open %s: %s\n", SDR_DEVICE, strerror(errno));
+        fprintf(stderr, "[SDR] Cannot open %s: %s\n", g_sdr_dev, strerror(errno));
         return -1;
     }
 
@@ -1822,6 +1837,38 @@ static int run_ether_field(uint32_t freq, uint32_t rate, int gain,
  * Script:  ./sdr_ether 6 --vm script.qvm
  * Live:    ./sdr_ether 6 --vm
  * ═══════════════════════════════════════════════════════════════ */
+/*
+ * ETHER EMIT — radiate qudit state into the EM field via LO hopping.
+ * Each level k gets dwell time ∝ |amplitude|².  After this call,
+ * the ether physically holds the qudit state as frequency-multiplexed
+ * CW tones in the room's EM field.
+ */
+static void ether_emit(SdrDev *s, const Wavefunction *wf) {
+    double bin_bw = (double)s->rate / wf->d;
+    for (int k = 0; k < wf->d; k++) {
+        int dwell_us = (int)(wf->prob[k] * 8000.0);
+        if (dwell_us < 30) continue;
+        uint32_t f = (uint32_t)(wf->freq + k * bin_bw);
+        if (f < 24000000) f = 24000000; if (f > 1750000000) f = 1750000000;
+        sdr_retune(s, f); usleep(dwell_us);
+    }
+    sdr_retune(s, (uint32_t)wf->freq); usleep(500);
+}
+
+/*
+ * ETHER READ — capture the ether state back into the wavefunction.
+ * Retunes to center, captures I/Q, DFT decomposes into D levels.
+ * The returned wf IS the ether's physical state.
+ */
+static void ether_read(SdrDev *s, Wavefunction *wf) {
+    sdr_retune(s, (uint32_t)wf->freq);
+    usleep(2000);
+    sdr_flush(s);
+    sdr_capture(s);
+    wf_from_iq(s->iq_i, s->iq_q, s->iq_n, wf);
+    wf->freq = s->freq;
+}
+
 static void wf_print(const Wavefunction *wf, const char *label, int cycle);
 static int  gate_measure(const uint8_t *raw, int raw_n, const double *prob, int d);
 static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
@@ -2069,9 +2116,67 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
         else if (strcasecmp(op, "ECHO") == 0) {
             printf("  %s\n", cmd + 4);
         }
+        /* ── Extended VM instructions ── */
+        else if (strcasecmp(op, "SET") == 0) {
+            int k = iarg1; if (k<0||k>=D) { printf("  [SET] level out of range\n"); continue; }
+            wf.re[k]=arg2; wf.im[k]=0;
+            double t=0; for(int i=0;i<D;i++) t+=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];
+            if(t>1e-15){double sc=1.0/sqrt(t); for(int i=0;i<D;i++){wf.re[i]*=sc;wf.im[i]*=sc;}}
+            for(int i=0;i<D;i++) wf.prob[i]=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];
+            wf.entropy=0; wf.purity=0;
+            for(int i=0;i<D;i++){if(wf.prob[i]>1e-15)wf.entropy-=wf.prob[i]*log2(wf.prob[i]);wf.purity+=wf.prob[i]*wf.prob[i];}
+            printf("  [SET] |%d⟩ = %.3f\n",k,arg2);
+            wf_print(&wf,"|ψ⟩",lineno);
+        }
+        else if (strcasecmp(op, "RESET") == 0) {
+            for(int i=0;i<D;i++){wf.re[i]=1.0/sqrt(D);wf.im[i]=0;wf.prob[i]=1.0/D;}
+            wf.entropy=log2(D);wf.purity=1.0/D;
+            printf("  [RESET] Uniform superposition\n");
+            wf_print(&wf,"|+⟩",lineno);
+        }
+        else if (strcasecmp(op, "SWAP") == 0) {
+            int a=iarg1,b=iarg2; if(a<0||a>=D||b<0||b>=D){printf("  [SWAP] out of range\n");continue;}
+            double tr=wf.re[a],ti=wf.im[a],tp=wf.prob[a];
+            wf.re[a]=wf.re[b];wf.im[a]=wf.im[b];wf.prob[a]=wf.prob[b];
+            wf.re[b]=tr;wf.im[b]=ti;wf.prob[b]=tp;
+            printf("  [SWAP] |%d⟩ ⇄ |%d⟩\n",a,b);
+            wf_print(&wf,"|ψ⟩",lineno);
+        }
+        else if (strcasecmp(op, "INVERT") == 0) {
+            for(int i=0;i<D;i++) wf.im[i]=-wf.im[i];
+            printf("  [INVERT] Complex conjugate (time reversal)\n");
+        }
+        else if (strcasecmp(op, "SCALE") == 0) {
+            double sc = arg1>1e-15?arg1:1.0; double t=0;
+            for(int i=0;i<D;i++){wf.re[i]*=sc;wf.im[i]*=sc;t+=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];}
+            if(t>1e-15){double ns=1.0/sqrt(t);for(int i=0;i<D;i++){wf.re[i]*=ns;wf.im[i]*=ns;}}
+            for(int i=0;i<D;i++) wf.prob[i]=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];
+            printf("  [SCALE] ×%.3f\n",sc);
+        }
+        else if (strcasecmp(op, "PURITY") == 0) {
+            printf("  Purity γ=%.6f  Entropy S=%.4f bits\n",wf.purity,wf.entropy);
+        }
+        else if (strcasecmp(op, "DUMP") == 0) {
+            printf("  State vector:\n");
+            for(int i=0;i<D;i++) printf("    |%d⟩ = %+.6f %+.6fi  |ψ|²=%.6f\n",i,wf.re[i],wf.im[i],wf.prob[i]);
+        }
+        else if (strcasecmp(op, "SAMPLE") == 0) {
+            int n = iarg1>0?iarg1:100, counts[256]={0};
+            for(int s=0;s<n;s++){
+                double r=(double)rand()/RAND_MAX,cum=0; int out=D-1;
+                for(int k=0;k<D;k++){cum+=wf.prob[k];if(r<=cum){out=k;break;}}
+                if(out<256) counts[out]++;
+            }
+            printf("  [SAMPLE] %d Born-rule draws:\n  ",n);
+            for(int i=0;i<D;i++) printf("|%d⟩:%-3d ",i,counts[i]);
+            printf("\n  Expected: ");
+            for(int i=0;i<D;i++) printf("|%d⟩:%.2f ",i,(double)counts[i]/n);
+            printf("\n");
+        }
         else if (strcasecmp(op, "HELP") == 0 || strcasecmp(op, "?") == 0) {
             printf("  INIT SUPERPOSE X Z H CZ DFT TX RX MEASURE TICK\n");
-            printf("  PROB SHOW COHERENT WAIT ECHO HELP QUIT\n");
+            printf("  SET RESET SWAP INVERT SCALE SAMPLE PURITY DUMP\n");
+            printf("  PROB SHOW COHERENT WAIT ECHO LOOP END HELP QUIT\n");
         }
         else if (strcasecmp(op, "QUIT") == 0 || strcasecmp(op, "EXIT") == 0 ||
                  strcasecmp(op, "Q") == 0) {
@@ -2079,6 +2184,25 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
         }
         else {
             printf("  ? Unknown: %s\n", op);
+        }
+
+        /* ── After each instruction: re-sync state with the ether.
+         * The ether IS the quantum state.  Software wf is a cache.
+         * Mutating instructions dirty the cache; ether_emit+ether_read
+         * projects the state into the EM field and reads it back. */
+        if (sdr_ok && running) {
+            int dirty = (strcasecmp(op,"LOOP") && strcasecmp(op,"END") &&
+                         strcasecmp(op,"WAIT") && strcasecmp(op,"ECHO") &&
+                         strcasecmp(op,"HELP") && strcasecmp(op,"?") &&
+                         strcasecmp(op,"QUIT") && strcasecmp(op,"EXIT") &&
+                         strcasecmp(op,"Q") && strcasecmp(op,"PROB") &&
+                         strcasecmp(op,"P") && strcasecmp(op,"SHOW") &&
+                         strcasecmp(op,"S") && strcasecmp(op,"DUMP") &&
+                         strcasecmp(op,"PURITY") && strcasecmp(op,"SAMPLE"));
+            if (dirty) {
+                ether_emit(&sdr, &wf);
+                ether_read(&sdr, &wf);
+            }
         }
     }
 
@@ -2826,7 +2950,8 @@ int main(int argc, char **argv) {
         return run_loopback(freq, rate, D);
     }
 
-    int has_sdr = (access(SDR_DEVICE, R_OK|W_OK) == 0);
+    sdr_find();
+    int has_sdr = (access(g_sdr_dev, R_OK|W_OK) == 0);
 
     if (mode_ether_transfer && has_sdr) {
         return run_ether_compute(freq, rate, gain, D);
