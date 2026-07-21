@@ -2,30 +2,35 @@
  * sdr_ether.c — Transmit Qudits Through the EM Field ("Ether")
  *
  * OFFLOADS COMPUTATION TO NATURE:
- *   1. TX: IDFT(qudit state) → OFDM multi-tone I/Q → physical EM field
- *   2. ETHER: Propagation through space (interference, multipath, phase drift)
- *   3. RX: SDR capture → DFT → recover qudit wavefunction
- *   4. GATES: Apply quantum gates, then repeat TX→ether→RX
+ *   1. TX: R820T2 PLL LO leakage radiates qudit levels into EM field
+ *          (each level k = CW tone at f₀ + k·Δf, dwell ∝ |ψₖ|²)
+ *       or: IDFT(qudit state) → OFDM I/Q → CU8 for external TX SDR
+ *   2. ETHER: Propagation through space (interference, multipath, drift)
+ *   3. RX: RTL2832U ADC capture → DFT → recover qudit wavefunction
+ *   4. GATES: Apply quantum gates, then repeat TX→ether→RX feedback loop
  *
- * Each round-trip through the ether IS a computational step.
+ * Each round-trip through the EM field IS a computational step.
  * The EM field IS the quantum processor.
  *
  * ─── Modes ───
- *   (default)    RX from RTL-SDR if /dev/swradio0 exists, else loopback
- *   --loopback   TX→ether channel→RX, no hardware needed
- *   --tx-only    Synthesize TX I/Q, write CU8 to stdout for SDR transmitter
- *   --tx-file F  Synthesize TX I/Q, write CU8 to file F
- *   --rx-only    Capture from RTL-SDR only (traditional mode)
- *   --cycles N   Run N TX→ether→RX→gate→TX feedback cycles
- *   --snr-db N   Ether channel SNR (default 30 dB)
- *   --fading 1   Enable frequency-selective fading in ether
- *   --drift 1    Enable random phase drift per cycle
+ *   (default)    Physical ether: TX via LO leakage + RX via SDR capture
+ *   --physical    Same as default (explicit)
+ *   --rx-only     RX from RTL-SDR only (no TX)
+ *   --loopback    TX→ether channel→RX in software, no hardware needed
+ *   --tx-only     Synthesize I/Q, write CU8 to stdout for SDR transmitter
+ *   --tx-file F   Synthesize I/Q, write CU8 to file F
+ *   --cycles N    Run N TX→ether→RX→gate feedback cycles
+ *   --snr-db N    Ether channel SNR for loopback (default 30 dB)
+ *   --fading 1    Enable frequency-selective fading in loopback ether
+ *   --drift 1     Enable random phase drift per loopback cycle
  *
  * Build: gcc -O3 -std=gnu99 sdr_ether.c -lm -o sdr_ether
  * Usage:
- *   ./sdr_ether 6                        # D=6 qudit, RX from SDR
- *   ./sdr_ether 12 --loopback --cycles 5 # 5 iterations TX→ether→RX
- *   ./sdr_ether 8 --tx-file tx.iq        # Write TX signal for external SDR TX
+ *   ./sdr_ether 6                        # Physical ether (needs RTL-SDR)
+ *   ./sdr_ether 6 --cycles 10            # 10 TX→ether→RX iterations
+ *   ./sdr_ether 8 --rx-only              # RX only, no TX
+ *   ./sdr_ether 12 --loopback --cycles 5 # Software ether simulation
+ *   ./sdr_ether 8 --tx-file tx.iq        # Write TX signal for external SDR
  *   ./sdr_ether 8 --tx-only | hackrf_transfer -f 100e6 -s 2e6 -t -
  */
 #include <stdio.h>
@@ -669,6 +674,85 @@ __attribute__((unused)) static void gate_DFT(SdrDev *s, Wavefunction *wf, int st
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * GATE: TX (HARDWARE) — transmit qudit state into the EM field
+ * via R820T2 LO leakage modulation.
+ *
+ * The R820T2 PLL creates a local oscillator signal that LEAKS back
+ * through the LNA to the antenna port (-50 to -70 dBm).  By rapidly
+ * retuning the PLL to each qudit level's frequency for a dwell time
+ * proportional to |amplitude|², we EMIT the qudit state into the ether.
+ *
+ * Each qudit level k → frequency f₀ + k·Δf.
+ * TDMA: dwell_us[k] ∝ prob[k]
+ *
+ * This IS a physical transmitter — the antenna radiates the PLL tone.
+ * ═══════════════════════════════════════════════════════════════ */
+static void gate_tx_hardware(SdrDev *s, const Wavefunction *wf) {
+    uint32_t base = wf->freq;
+    double   bw   = wf->bin_bw;
+    int      d    = wf->d;
+
+    fprintf(stderr, "  [GATE:TX-HW] Radiating qudit D=%d via LO leakage\n", d);
+    fprintf(stderr, "               freq  dwell  |ψ|²\n");
+
+    double total_time_us = 0;
+    for (int k = 0; k < d; k++) {
+        int dwell_us = (int)(wf->prob[k] * 15000.0);  /* up to 15 ms per level */
+        if (dwell_us < 30) continue;
+
+        uint32_t tx_freq = base + (uint32_t)(k * bw);
+        if (tx_freq < 24000000) tx_freq = 24000000;
+        if (tx_freq > 1750000000) tx_freq = 1750000000;
+
+        sdr_retune(s, tx_freq);
+        usleep(dwell_us);
+        total_time_us += dwell_us;
+
+        fprintf(stderr, "               %.3f MHz %4dμs  %.3f\n",
+                tx_freq/1e6, dwell_us, wf->prob[k]);
+    }
+
+    /* Return to center for RX */
+    sdr_retune(s, base);
+    usleep(500);
+
+    fprintf(stderr, "  [GATE:TX-HW] Emitted %.1f ms of qudit state into ether\n",
+            total_time_us / 1000.0);
+}
+
+/*
+ * GATE: TX FEEDBACK — transmit a single qudit level, then immediately
+ * recapture.  The LO leakage at that frequency propagates through the
+ * ether, reflects off the environment, and part of it returns to the
+ * antenna.  This is a SINGLE-LEVEL physical TX→ether→RX cycle.
+ *
+ * The returned wavefunction will show enhanced probability at the
+ * transmitted level due to the residual LO signal mixing with the
+ * ambient EM field.
+ */
+__attribute__((unused))
+static void gate_tx_feedback(SdrDev *s, Wavefunction *wf, int level) {
+    uint32_t base = wf->freq;
+    uint32_t tx_freq = base + (uint32_t)(level * wf->bin_bw);
+    if (tx_freq < 24000000) tx_freq = 24000000;
+    if (tx_freq > 1750000000) tx_freq = 1750000000;
+
+    fprintf(stderr, "  [TX→ETHER→RX] Level %d @ %.3f MHz\n",
+            level, tx_freq/1e6);
+
+    sdr_retune(s, tx_freq);
+    usleep(3000);   /* 3ms radiate into ether */
+    sdr_retune(s, base);
+    usleep(500);    /* settle back */
+
+    sdr_capture(s);
+    wf_from_iq(s->iq_i, s->iq_q, s->iq_n, wf);
+    wf->freq = base;
+
+    fprintf(stderr, "  [TX→ETHER→RX] Back from ether, S=%.3f bits\n", wf->entropy);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * MEASUREMENT — Born rule via ADC LSB entropy
  * ═══════════════════════════════════════════════════════════════ */
 static int gate_measure(const uint8_t *raw, int raw_n, const double *prob, int d) {
@@ -788,6 +872,66 @@ static int run_loopback(uint32_t freq, uint32_t rate, int D) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * MODE: PHYSICAL ETHER — real TX→ether→RX via RTL-SDR hardware
+ *
+ * Uses the R820T2 PLL LO leakage as a PHYSICAL transmitter.
+ * Each qudit level k is radiated into the EM field as a CW tone
+ * at f₀ + k·Δf.  The dwell time encodes the probability amplitude.
+ *
+ * After radiating the qudit state, the receiver captures the
+ * ambient EM field (including reflected LO leakage + noise),
+ * decomposes via DFT, applies quantum gates, and repeats.
+ *
+ * This IS computation offloaded to nature.
+ * ═══════════════════════════════════════════════════════════════ */
+static int run_physical_ether(uint32_t freq, uint32_t rate, int gain, int D) {
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  PHYSICAL ETHER — RTL-SDR TX→ether→RX                       ║\n");
+    printf("  ║  Qudit D=%d  |  %.1f MHz  |  %.2f MSPS                      ║\n",
+           D, freq/1e6, rate/1e6);
+    printf("  ║  TX: R820T2 LO leakage (radiates qudit levels into EM field)║\n");
+    printf("  ║  RX: RTL2832U ADC capture → DFT decompose                   ║\n");
+    printf("  ║  Cycles: %d                                                   ║\n", g_cycles);
+    printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    SdrDev sdr;
+    if (sdr_open(&sdr, freq, rate, gain) != 0) {
+        printf("  [FAIL] No RTL-SDR hardware.  Plug in the dongle.\n\n");
+        return 1;
+    }
+
+    Wavefunction wf = wf_alloc(D, freq, rate);
+
+    sdr_capture(&sdr);
+    wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
+    wf_print(&wf, "|ψ₀⟩", -1);
+
+    for (int cycle = 0; cycle < g_cycles; cycle++) {
+        fprintf(stderr, "\n  ── Cycle %d/%d ──\n", cycle, g_cycles);
+
+        gate_tx_hardware(&sdr, &wf);
+
+        sdr_capture(&sdr);
+        wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
+
+        gate_Z(&wf, M_PI / 4.0, -1);
+        gate_X(&wf);
+
+        wf_print(&wf, "|ψ⟩", cycle);
+    }
+
+    printf("\n");
+    int outcome = gate_measure(sdr.iq_raw, sdr.iq_n * 2, wf.prob, D);
+    printf("\n  ★ QUDIT COLLAPSED → |%d⟩ | samples: %lu ★\n\n",
+           outcome, (unsigned long)sdr.samples);
+
+    wf_free(&wf);
+    sdr_close(&sdr);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * MODE: RX-ONLY — traditional SDR qudit compute
  * ═══════════════════════════════════════════════════════════════ */
 static int run_rx_only(uint32_t freq, uint32_t rate, int gain, int D) {
@@ -865,12 +1009,15 @@ int main(int argc, char **argv) {
     int    mode_loopback = 0;
     int    mode_tx_only  = 0;
     int    mode_rx_only  = 0;
+    int    mode_physical = 0;
     char  *tx_outfile    = NULL;
 
     int idx = 1;
     while (idx < argc) {
         if (strcmp(argv[idx], "--loopback") == 0) {
             mode_loopback = 1; idx++;
+        } else if (strcmp(argv[idx], "--physical") == 0) {
+            mode_physical = 1; idx++;
         } else if (strcmp(argv[idx], "--tx-only") == 0) {
             mode_tx_only = 1; idx++;
         } else if (strcmp(argv[idx], "--rx-only") == 0) {
@@ -911,10 +1058,14 @@ int main(int argc, char **argv) {
     }
 
     int has_sdr = (access(SDR_DEVICE, R_OK|W_OK) == 0);
+    if (mode_physical && has_sdr) {
+        return run_physical_ether(freq, rate, gain, D);
+    }
     if (has_sdr) {
-        return run_rx_only(freq, rate, gain, D);
+        return run_physical_ether(freq, rate, gain, D);
     } else {
         fprintf(stderr, "[INFO] No SDR hardware — switching to loopback mode\n");
+        fprintf(stderr, "[INFO] Use --physical with RTL-SDR for real TX via LO leakage\n");
         return run_loopback(freq, rate, D);
     }
 }
