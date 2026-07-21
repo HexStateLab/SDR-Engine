@@ -1984,30 +1984,30 @@ static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
         }
         else if (strcasecmp(op, "CZ") == 0) {
             if (sdr_ok) {
-                /* Save current state, recapture, then cross-correlate */
-                double *prev_re = malloc(D * sizeof(double));
-                double *prev_im = malloc(D * sizeof(double));
-                memcpy(prev_re, wf.re, D * sizeof(double));
-                memcpy(prev_im, wf.im, D * sizeof(double));
+                /* Power-correlation CZ: product of two captures' probabilities.
+                 * This is robust against phase decorrelation in ambient RF. */
+                double *prev_prob = malloc(D * sizeof(double));
+                memcpy(prev_prob, wf.prob, D * sizeof(double));
                 sdr_capture(&sdr);
                 wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
-                for (int k = 0; k < D; k++) {
-                    double cr = prev_re[k]*wf.re[k] + prev_im[k]*wf.im[k];
-                    double ci = prev_re[k]*wf.im[k] - prev_im[k]*wf.re[k];
-                    wf.re[k] = cr; wf.im[k] = ci;
-                    wf.prob[k] = cr*cr + ci*ci;
-                }
+                double *curr_prob = malloc(D * sizeof(double));
+                memcpy(curr_prob, wf.prob, D * sizeof(double));
                 double total = 0;
-                for (int k = 0; k < D; k++) total += wf.prob[k];
+                for (int k = 0; k < D; k++) {
+                    wf.prob[k] = prev_prob[k] * curr_prob[k];
+                    wf.re[k] = sqrt(wf.prob[k]);
+                    wf.im[k] = 0;
+                    total += wf.prob[k];
+                }
                 if (total > 1e-15) for (int k=0;k<D;k++) wf.prob[k]/=total;
                 wf.entropy = 0; wf.purity = 0;
                 for (int k=0;k<D;k++) {
                     if (wf.prob[k]>1e-15) wf.entropy-=wf.prob[k]*log2(wf.prob[k]);
                     wf.purity += wf.prob[k]*wf.prob[k];
                 }
-                free(prev_re); free(prev_im);
+                free(prev_prob); free(curr_prob);
             }
-            printf("  [CZ] Entangle\n");
+            printf("  [CZ] Entangle (power correlation)\n");
             wf_print(&wf, "|ψ⟩", lineno);
         }
         else if (strcasecmp(op, "DFT") == 0) {
