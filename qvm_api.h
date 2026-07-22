@@ -45,4 +45,10 @@ int    qvm_calibrated(QvmCtx *q);
 void   qvm_get_channel(QvmCtx *q, double **M_out, double **Minv_out, int *dim_out);
 int    qvm_compute(QvmCtx *q, const double *x, double *y, int d);
 
+/* ─── Low-level SDR access (for advanced waveform synthesis) ─── */
+void   qvm_sdr_tune(QvmCtx *q, uint32_t freq_hz);
+void   qvm_sdr_flush(QvmCtx *q);
+int    qvm_sdr_rx(QvmCtx *q, double *I_out, double *Q_out, int max_samples);
+void   qvm_sdr_dft(QvmCtx *q, double *pwr, int D, const double *I, const double *Q, int n_samples);
+
 #endif /* QVM_API_H */

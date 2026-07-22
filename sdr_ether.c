@@ -2358,6 +2358,30 @@ int qvm_compute(QvmCtx *q, const double *x, double *y, int d){
     return 0;
 }
 
+/* ── Low-level SDR access for waveform synthesis ── */
+void qvm_sdr_tune(QvmCtx *q, uint32_t hz){
+    if(!q->sdr_ok)return;
+    sdr_retune(q->sdr,hz);
+}
+void qvm_sdr_flush(QvmCtx *q){
+    if(!q->sdr_ok)return;
+    sdr_flush(q->sdr);
+}
+int qvm_sdr_rx(QvmCtx *q, double *I, double *Q, int max_n){
+    if(!q->sdr_ok)return 0;
+    sdr_capture(q->sdr);
+    int n=q->sdr->iq_n; if(n>max_n)n=max_n;
+    for(int i=0;i<n;i++){I[i]=q->sdr->iq_i[i];Q[i]=q->sdr->iq_q[i];}
+    return n;
+}
+void qvm_sdr_dft(QvmCtx *q, double *pwr, int D, const double *I, const double *Q, int np){
+    if(np<D)np=D;
+    for(int k=0;k<D;k++){double fn=(double)k/D,si=0,sq=0;
+        for(int n=0;n<np;n++){double ph=-2*M_PI*fn*n,c=cos(ph),s=sin(ph);
+            si+=I[n]*c-Q[n]*s;sq+=I[n]*s+Q[n]*c;}
+        pwr[k]=(si*si+sq*sq)/((double)np*np);}
+}
+
 /* ── qvm_eval: parse & dispatch one instruction ── */
 int qvm_eval(QvmCtx *q, const char *cmd){
     char op[32]={0}; double a1=0,a2=0;
