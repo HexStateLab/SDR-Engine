@@ -2328,6 +2328,151 @@ static int op_measure(QvmCtx *q, double a1, double a2){
     q->wf.re[o]=1.0;q->wf.prob[o]=1.0;q->wf.entropy=0;q->wf.purity=1.0; return 0;
 }
 
+/* QMEASURE [qubit_idx]: physical collapse via room.
+   After ANTISYM entanglement, choose outcome from ADC entropy,
+   TX only the surviving GHZ branch into the room. Room responds. */
+/* QMEASURE: passive wait → environment decoheres → capture.
+   Room's thermal/mechanical/RF perturbations scramble phase faster than
+   the DFT integration window → M[k≠m]→0, only diagonal survives. */
+static int op_qmeasure(QvmCtx *q, double a1, double a2){
+    int dwell_ms = ((int)a1)>0 ? (int)a1 : 100;
+    (void)a2;
+    if(!q->sdr_ok){printf("  [QMEASURE] no SDR\n");return 0;}
+    if(q->n_qbins<4){printf("  [QMEASURE] need ≥2 qudits\n");return 0;}
+    int k0=q->qbins[0], k1=q->qbins[q->n_qbins-1];
+    double pb0=q->wf.prob[k0], pb1=q->wf.prob[k1];
+    double tb=pb0+pb1;
+    printf("  [QMEASURE] before: |00⟩=%.3f |11⟩=%.3f → wait %dms (env decoheres)\n",
+        tb>1e-15?pb0/tb:0,tb>1e-15?pb1/tb:0,dwell_ms);
+    usleep(dwell_ms*1000);
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    double p0=q->wf.prob[k0], p1=q->wf.prob[k1], t=p0+p1;
+    printf("  [QMEASURE] after:  |00⟩=%.3f |11⟩=%.3f → %s\n",
+        t>1e-15?p0/t:0,t>1e-15?p1/t:0, p0>p1?"|00⟩":"|11⟩");
+    return 0;
+}
+
+/* PROBE: noise-collapse test — fix denominator, DMA settle, order.
+   Protocol: ANTISYM→read, wait, single-probe→read (natural pair)
+             ANTISYM→read, NOISE, wait, single-probe→read (noise pair) */
+static int op_probe(QvmCtx *q, double a1, double a2){
+    int nt=((int)a1)>0?(int)a1:10;(void)a2;
+    if(!q->sdr_ok)return 0;
+    if(q->n_qbins<4){printf("  [PROBE] need QBIN\n");return 0;}
+    int k0=q->qbins[0],k1=q->qbins[q->n_qbins-1],D=q->wf.d;
+    /* Collect all qbin bins for proper normalization */
+    int nb=q->n_qbins; if(nb>16)nb=16;
+    double delta_nat[20]={0},delta_noise[20]={0};
+
+    printf("  [PROBE] %d trials (fixed denominator, DMA settle, order)\n",nt);
+    for(int t=0;t<nt;t++){
+        /* --- Natural baseline: A→wait→probe→B --- */
+        qvm_eval(q,"ANTISYM");
+        double pa=0;for(int i=0;i<nb;i++)pa+=q->wf.prob[q->qbins[i]];
+        double valA=pa>1e-30?q->wf.prob[k0]/pa:0;
+        usleep(2000); /* DMA buffer settle */
+        /* Single anti-sym probe (not full ANTISYM) */
+        { double x[D],xi[D],y[D],a=0.7071;
+          memset(x,0,D*8);memset(xi,0,D*8);
+          x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
+          for(int i=0;i<16;i++)x[i]=xi[i]=0;
+          qvm_ofdm_compute(q,x,xi,y,D);
+          double pb=0;for(int i=0;i<nb;i++)pb+=y[q->qbins[i]];
+          double valB=pb>1e-30?y[k0]/pb:0;
+          delta_nat[t]=fabs(valB-valA);
+          printf("    %2d nat: A=%.3f B=%.3f Δ=%.3f\n",t,valA,valB,delta_nat[t]);
+        }
+
+        /* --- Noise test: A→NOISE→wait→probe→C --- */
+        qvm_eval(q,"ANTISYM");
+        pa=0;for(int i=0;i<nb;i++)pa+=q->wf.prob[q->qbins[i]];
+        valA=pa>1e-30?q->wf.prob[k0]/pa:0;
+        qvm_eval(q,"NOISE 1.0");
+        usleep(2000);
+        { double x[D],xi[D],y[D],a=0.7071;
+          memset(x,0,D*8);memset(xi,0,D*8);
+          x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
+          for(int i=0;i<16;i++)x[i]=xi[i]=0;
+          qvm_ofdm_compute(q,x,xi,y,D);
+          double pc=0;for(int i=0;i<nb;i++)pc+=y[q->qbins[i]];
+          double valC=pc>1e-30?y[k0]/pc:0;
+          delta_noise[t]=fabs(valC-valA);
+          printf("    %2d ns:  A=%.3f C=%.3f Δ=%.3f\n",t,valA,valC,delta_noise[t]);
+        }
+    }
+    double mn=0,ms=0;
+    for(int t=0;t<nt;t++){mn+=delta_nat[t];ms+=delta_noise[t];}
+    mn/=nt;ms/=nt;
+    printf("  [PROBE] mean Δ_nat=%.3f  Δ_noise=%.3f  ratio=%.2fx\n",mn,ms,ms/(mn+1e-9));
+    printf("  [PROBE] %s\n",ms>mn*1.5?"★ NOISE COLLAPSES STATE ★":"noise ≈ natural jitter");
+
+    /* ═══ In-cycle: compare with-noise vs without-noise single pass ═══ */
+    printf("  [PROBE] in-cycle: single pass ± noise (0.05× amplitude)\n");
+    for(int t=0;t<nt;t++){
+        double x[D],xi[D],a=0.7071;
+
+        /* --- No-noise: anti-sym TX → capture (baseline single pass) --- */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,x,D); /* reuse x as y */
+        double pb=0;for(int i=0;i<nb;i++)pb+=x[q->qbins[i]];
+        double valBase=pb>1e-30?x[k0]/pb:0;
+
+        /* --- With-noise: anti-sym TX → noise TX → capture --- */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr,&q->wf,NULL);
+        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+        usleep(3000);
+        /* Inject low-amplitude noise */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        for(int i=0;i<D;i++){double phi=((double)rand()/RAND_MAX)*2*M_PI;
+            x[i]=0.05*cos(phi);xi[i]=0.05*sin(phi);}
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr,&q->wf,NULL);
+        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+        usleep(50000);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        double pc=0;for(int i=0;i<nb;i++)pc+=q->wf.prob[q->qbins[i]];
+        double valNoisy=pc>1e-30?q->wf.prob[k0]/pc:0;
+
+        printf("    %2d: base=%.3f  noise=%.3f  Δ=%.3f  %s\n",
+            t,valBase,valNoisy,fabs(valNoisy-valBase),
+            fabs(valNoisy-valBase)>0.15?"COLLAPSED":"same");
+    }
+    return 0;
+}
+
+/* NOISE: spectral flush — TX white noise across all bins.
+   Each bin gets random phase → overwrites deterministic M[k≠m].
+   Diagonal power per bin survives, off-diagonal collapses to 0. */
+static int op_noise(QvmCtx *q, double a1, double a2){
+    double level = a1>0 ? a1 : 1.0; (void)a2;
+    if(!q->sdr_ok){printf("  [NOISE] no SDR\n");return 0;}
+    int D=q->wf.d;
+    double x[D],xi[D],y[D];
+    /* Frequency-domain white noise: uniform I, uniform Q per bin */
+    for(int k=0;k<D;k++){
+        double phi = ((double)rand()/RAND_MAX)*2*M_PI;
+        double mag = ((double)rand()/RAND_MAX)*level;
+        x[k]=mag*cos(phi); xi[k]=mag*sin(phi);
+    }
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,D);
+    printf("  [NOISE] spectral flush ×%.1f — M[k≠m]→0\n",level);
+    return 0;
+}
+
 static int op_tick(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(q->sdr_ok){gate_tx_hardware(q->sdr,&q->wf);sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
@@ -2531,7 +2676,9 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "RX",        op_rx,        "capture from ether");
     qvm_reg(q, "MEASURE",   op_measure,   "Born-rule collapse");
     qvm_reg(q, "M",         op_measure,   "alias for MEASURE");
-    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
+    qvm_reg(q, "QMEASURE",  op_qmeasure,  "passive wait → env decoheres");
+    qvm_reg(q, "NOISE",     op_noise,     "spectral flush — TX white noise → collapse");
+    qvm_reg(q, "PROBE",     op_probe,     "noise-collapse test (fixed DMA/denom/order)");    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
     qvm_reg(q, "SHOW",      op_show,      "show state");
