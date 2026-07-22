@@ -2561,6 +2561,57 @@ static int op_kill(QvmCtx *q, double a1, double a2){
         }
     return 0;
 }
+/* DELAYED: independent-frequency qudits. A at k0/k0+2, B at k1/k1+2.
+   GHZ |00⟩+|11⟩ → 4 separate anti-sym pairs. Mixer couples them.
+   Measure B via active TX, then capture A from room's delayed response. */
+static int op_delayed(QvmCtx *q, double a1, double a2){
+    int nt=((int)a1)>0?(int)a1:10;(void)a2;
+    if(!q->sdr_ok)return 0;
+    if(q->n_qbins<8){printf("  [DELAYED] need 8 bins (2 qudits with separate basis bins)\n");return 0;}
+    /* Qudit A: qbins[0]=|0_A⟩, qbins[1]=|1_A⟩ */
+    /* Qudit B: qbins[2]=|0_B⟩, qbins[3]=|1_B⟩ */
+    int a0=q->qbins[0],a1b=q->qbins[1],b0=q->qbins[2],b1=q->qbins[3];
+    int D=q->wf.d;double a=0.7071,x[D],xi[D],y[D];
+    int corr=0;
+
+    printf("  [DELAYED] %d trials: A@(%d,%d) B@(%d,%d) — measure B, capture A\n",
+        nt,a0,a1,b0,b1);
+    for(int tr=0;tr<nt;tr++){
+        /* TX GHZ |00⟩+|11⟩: pairs at (a0,b0) and (a1,b1) */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[a0]=+a;x[D-a0]=-a;x[b0]=+a;x[D-b0]=-a;
+        x[a1b]=+a;x[D-a1b]=-a;x[b1]=+a;x[D-b1]=-a;
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr,&q->wf,NULL);
+        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+        usleep(8000);
+
+        /* Measure B: TX only B's anti-sym pairs, capture */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[b0]=+a;x[D-b0]=-a;x[b1]=+a;x[D-b1]=-a;
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+        double bp0=y[b0]+y[D-b0],bp1=y[b1]+y[D-b1],bt=bp0+bp1;
+        int b_out=(bt>1e-15?bp1/bt:0)>0.5?1:0;
+
+        /* Capture A from room's delayed response */
+        usleep(30000);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        double ap0=q->wf.prob[a0]+q->wf.prob[D-a0];
+        double ap1=q->wf.prob[a1b]+q->wf.prob[D-a1b];
+        double at=ap0+ap1;
+        int a_out=(at>1e-15?ap1/at:0)>0.5?1:0;
+        if(a_out==b_out)corr++;
+        printf("    %2d: B=|%d⟩ A=|%d⟩ %s\n",tr,b_out,a_out,a_out==b_out?"✓":"✗");
+    }
+    printf("  [DELAYED] %d/%d correlated (%.0f%%) %s\n",
+        corr,nt,100.0*corr/nt,corr>nt*0.6?"★ RETROCAUSAL ★":"no effect");
+    return 0;
+}
 
 static int op_tick(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
@@ -2768,7 +2819,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "QMEASURE",  op_qmeasure,  "passive wait → env decoheres");
     qvm_reg(q, "COLLAPSE",  op_collapse,  "anti-sym noise → collapse (87.5%)");
     qvm_reg(q, "KILL",      op_kill,      "winner feedback → lock outcome (75%)");
-    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
+    qvm_reg(q, "DELAYED",   op_delayed,   "delayed-choice: TX A, measure B, capture A");    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
     qvm_reg(q, "SHOW",      op_show,      "show state");
