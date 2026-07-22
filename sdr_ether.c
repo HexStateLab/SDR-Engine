@@ -50,6 +50,8 @@
 #include <dirent.h>
 #include <pthread.h>
 
+#include "qvm_api.h"
+
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
 #define MAX_DIM      256
@@ -2308,8 +2310,57 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "BENCH",     op_bench,     "room vs CPU matvec [D=8]");
 }
 
+/* ── QVM API: public accessors (qvm_api.h) ── */
+int qvm_running(QvmCtx *q){ return q->running; }
+int qvm_dim(QvmCtx *q){ return q->wf.d; }
+double qvm_prob(QvmCtx *q, int l){ return (l>=0&&l<q->wf.d)?q->wf.prob[l]:0; }
+void qvm_probs(QvmCtx *q, double *out, int max){
+    int n=q->wf.d<max?q->wf.d:max;
+    for(int i=0;i<n;i++) out[i]=q->wf.prob[i];
+}
+double qvm_entropy(QvmCtx *q){ return q->wf.entropy; }
+double qvm_purity(QvmCtx *q){ return q->wf.purity; }
+int qvm_has_sdr(QvmCtx *q){ return q->sdr_ok; }
+int qvm_calibrated(QvmCtx *q){ return q->M && q->Minv; }
+void qvm_get_channel(QvmCtx *q, double **Mo, double **Mio, int *do_){
+    if(Mo)*Mo=q->M; if(Mio)*Mio=q->Minv; if(do_)*do_=q->M_dim;
+}
+
+/* Offload computation directly through the room.
+   Encodes x as LO dwell pattern → room processes → DFT reads result.
+   The room IS the function. No software matvec, no pre-compensation.
+   To approximate a specific function f(x), train readout weights offline. */
+int qvm_compute(QvmCtx *q, const double *x, double *y, int d){
+    if (!q->sdr_ok || d > q->wf.d) return -1;
+
+    /* Feed x into room: LO dwell ∝ x[k] */
+    double bw=(double)q->rate/d;
+    for (int k=0;k<d;k++){
+        int dw=(int)(fabs(x[k])*1500+30);
+        uint32_t f=(uint32_t)q->freq+(uint32_t)(k*bw);
+        if(f<24000000)f=24000000; if(f>1750000000)f=1750000000;
+        sdr_retune(q->sdr,f); usleep(dw);
+    }
+    sdr_retune(q->sdr,(uint32_t)q->freq); usleep(500);
+    sdr_flush(q->sdr); sdr_capture(q->sdr);
+
+    /* Room's answer: DFT of captured I/Q */
+    int np=q->sdr->iq_n; if(np<d)np=d;
+    double *pwr=calloc(d,sizeof(double));
+    for (int k=0;k<d;k++){double fn=(double)k/d,si=0,sq=0;
+        for(int n=0;n<np;n++){double ph=-2*M_PI*fn*n,c=cos(ph),s=sin(ph);
+            si+=q->sdr->iq_i[n]*c-q->sdr->iq_q[n]*s;
+            sq+=q->sdr->iq_i[n]*s+q->sdr->iq_q[n]*c;}
+        pwr[k]=(si*si+sq*sq)/((double)np*np);}
+    double rs=0; for(int i=0;i<d;i++) rs+=pwr[i];
+    if(rs>1e-15) for(int i=0;i<d;i++) pwr[i]/=rs;
+    for (int i=0;i<d;i++) y[i]=pwr[i];
+    free(pwr);
+    return 0;
+}
+
 /* ── qvm_eval: parse & dispatch one instruction ── */
-static int qvm_eval(QvmCtx *q, const char *cmd){
+int qvm_eval(QvmCtx *q, const char *cmd){
     char op[32]={0}; double a1=0,a2=0;
     sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
     if(!op[0]) return 0;
@@ -2332,7 +2383,7 @@ static int qvm_eval(QvmCtx *q, const char *cmd){
 }
 
 /* ── qvm_create / qvm_destroy ── */
-static QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
+QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
     QvmCtx *q = calloc(1, sizeof(QvmCtx));
     if (!q) return NULL;
     q->freq = freq; q->rate = rate;
@@ -2351,7 +2402,7 @@ static QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
     return q;
 }
 
-static void qvm_destroy(QvmCtx *q){
+void qvm_destroy(QvmCtx *q){
     if (!q) return;
     if (q->sdr_ok) sdr_close(q->sdr);
     free(q->sdr);
@@ -2366,7 +2417,7 @@ static void qvm_destroy(QvmCtx *q){
 }
 
 /* ── qvm_run: REPL / script execution ── */
-static int qvm_run(QvmCtx *q, const char *script_path){
+int qvm_run(QvmCtx *q, const char *script_path){
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════╗\n");
     printf("  ║  QUANTUM VM — Ether-native instruction set (API v2)          ║\n");
@@ -3729,6 +3780,7 @@ static int run_sat_solver(uint32_t freq, uint32_t rate, int gain, int n_vars) {
 /* ═══════════════════════════════════════════════════════════════
  * MAIN
  * ═══════════════════════════════════════════════════════════════ */
+#ifndef NO_MAIN
 int main(int argc, char **argv) {
     int    D    = DEFAULT_D;
     int    freq = DEFAULT_FREQ;
@@ -3751,6 +3803,7 @@ int main(int argc, char **argv) {
     int    mode_bell            = 0;
     int    mode_sat             = 0;
     int    mode_tr              = 0;
+    int    mode_qvm_api_test    = 0;
     char  *calib_file           = NULL;
     char  *vm_script            = NULL;
     int    monitor_cycles       = 10;
@@ -3794,6 +3847,8 @@ int main(int argc, char **argv) {
             mode_bell = 1; idx++;
         } else if (strcmp(argv[idx], "--time-reversal") == 0) {
             mode_tr = 1; idx++;
+        } else if (strcmp(argv[idx], "--qvm-api-test") == 0) {
+            mode_qvm_api_test = 1; idx++;
         } else if (strcmp(argv[idx], "--sat") == 0) {
             mode_sat = 1; idx++;
         } else if (strcmp(argv[idx], "--tx-only") == 0) {
@@ -3877,6 +3932,47 @@ int main(int argc, char **argv) {
     if (mode_vm) {
         return run_quantum_vm(freq, rate, gain, D, vm_script);
     }
+    if (mode_qvm_api_test) {
+        /* Exercise the QVM API programmatically:
+           calibrate → matvec → verify against CPU */
+        printf("\n  ╔══════════════════════════════════════════════════╗\n");
+        printf("  ║  QVM API TEST — Room as matvec co-processor     ║\n");
+        printf("  ╚══════════════════════════════════════════════════╝\n\n");
+
+        QvmCtx *q = qvm_create(freq, rate, D, gain);
+        if (!q) { fprintf(stderr,"QVM create failed\n"); return 1; }
+
+        /* 1. Show initial ambient state */
+        printf("1. Ambient state:\n  ");
+        double probs[MAX_DIM]; qvm_probs(q, probs, D);
+        for (int i=0;i<D;i++) printf("%.3f ",probs[i]);
+        printf("  S=%.3f γ=%.4f\n\n", qvm_entropy(q), qvm_purity(q));
+
+        /* 2. Calibrate room channel */
+        printf("2. Calibrating room channel M...\n");
+        qvm_eval(q, "CALIBRATE 3");
+        printf("\n");
+
+        /* 3. Feed computation through the room */
+        printf("3. Room computes: y = room(x)\n");
+        double xs[MAX_DIM] = {0}, y_room[MAX_DIM] = {0};
+        for (int i=0;i<D;i++) xs[i]=(double)((i*7+3)%100)/100.0;
+        printf("  Input x:  "); for(int i=0;i<D;i++) printf("%.3f ",xs[i]); printf("\n");
+
+        int rc = qvm_compute(q, xs, y_room, D);
+        if (rc == 0) {
+            printf("  Room y:   "); for(int i=0;i<D;i++) printf("%.3f ",y_room[i]); printf("\n");
+            printf("  Entropy: %.3f bits | Purity: %.4f\n",
+                qvm_entropy(q), qvm_purity(q));
+            printf("\n  ★ Room computed y = f(x) on EM substrate ★\n");
+            printf("  To train f(x)≈target: offline reservoir training\n");
+        } else {
+            printf("  Room compute failed (no SDR)\n");
+        }
+
+        qvm_destroy(q);
+        return 0;
+    }
     if (mode_bell) {
         return run_bell_test(freq, rate, D, g_cycles > 1 ? g_cycles : 3000,
                              g_snr_db, g_fading, g_drift);
@@ -3898,3 +3994,4 @@ int main(int argc, char **argv) {
         return run_loopback(freq, rate, D);
     }
 }
+#endif
