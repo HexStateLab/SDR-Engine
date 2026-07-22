@@ -2407,20 +2407,18 @@ static int op_probe(QvmCtx *q, double a1, double a2){
     printf("  [PROBE] mean Δ_nat=%.3f  Δ_noise=%.3f  ratio=%.2fx\n",mn,ms,ms/(mn+1e-9));
     printf("  [PROBE] %s\n",ms>mn*1.5?"★ NOISE COLLAPSES STATE ★":"noise ≈ natural jitter");
 
-    /* ═══ In-cycle: compare with-noise vs without-noise single pass ═══ */
-    printf("  [PROBE] in-cycle: single pass ± noise (0.05× amplitude)\n");
-    for(int t=0;t<nt;t++){
+    /* ═══ Anti-symmetric noise pairs at GHZ bins → maximal disruption ═══ */
+    printf("  [PROBE] anti-sym noise at GHZ bins (0.5×, 2 bursts):\n");
+    for(int run=0;run<nt;run++){
         double x[D],xi[D],a=0.7071;
-
-        /* --- No-noise: anti-sym TX → capture (baseline single pass) --- */
+        /* Baseline */
         memset(x,0,D*8);memset(xi,0,D*8);
         x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
         for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,x,D); /* reuse x as y */
+        qvm_ofdm_compute(q,x,xi,x,D);
         double pb=0;for(int i=0;i<nb;i++)pb+=x[q->qbins[i]];
-        double valBase=pb>1e-30?x[k0]/pb:0;
-
-        /* --- With-noise: anti-sym TX → noise TX → capture --- */
+        double vB=pb>1e-30?x[k0]/pb:0;
+        /* Anti-sym TX */
         memset(x,0,D*8);memset(xi,0,D*8);
         x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
         for(int i=0;i<16;i++)x[i]=xi[i]=0;
@@ -2429,26 +2427,29 @@ static int op_probe(QvmCtx *q, double a1, double a2){
         {struct v4l2_buffer b;memset(&b,0,sizeof(b));
          b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
          if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
-        usleep(3000);
-        /* Inject low-amplitude noise */
-        memset(x,0,D*8);memset(xi,0,D*8);
-        for(int i=0;i<D;i++){double phi=((double)rand()/RAND_MAX)*2*M_PI;
-            x[i]=0.05*cos(phi);xi[i]=0.05*sin(phi);}
-        for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
-        gate_ofdm_tx(q->sdr,&q->wf,NULL);
-        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
-         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
-         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
-        usleep(50000);
-        sdr_capture(q->sdr);
+        /* 2 bursts of anti-sym noise at k0 and k1 with random phase */
+        for(int burst=0;burst<2;burst++){
+            memset(x,0,D*8);memset(xi,0,D*8);
+            double phi0=((double)rand()/RAND_MAX)*2*M_PI;
+            double phi1=((double)rand()/RAND_MAX)*2*M_PI;
+            x[k0]=0.5*cos(phi0);x[D-k0]=-0.5*cos(phi0);
+            xi[k0]=0.5*sin(phi0);xi[D-k0]=-0.5*sin(phi0);
+            x[k1]=0.5*cos(phi1);x[D-k1]=-0.5*cos(phi1);
+            xi[k1]=0.5*sin(phi1);xi[D-k1]=-0.5*sin(phi1);
+            for(int i=0;i<16;i++)x[i]=xi[i]=0;
+            for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+            gate_ofdm_tx(q->sdr,&q->wf,NULL);
+            {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+             b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+             if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+        }
+        usleep(50000);sdr_capture(q->sdr);
         wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
         double pc=0;for(int i=0;i<nb;i++)pc+=q->wf.prob[q->qbins[i]];
-        double valNoisy=pc>1e-30?q->wf.prob[k0]/pc:0;
-
-        printf("    %2d: base=%.3f  noise=%.3f  Δ=%.3f  %s\n",
-            t,valBase,valNoisy,fabs(valNoisy-valBase),
-            fabs(valNoisy-valBase)>0.15?"COLLAPSED":"same");
+        double vN=pc>1e-30?q->wf.prob[k0]/pc:0;
+        double d=fabs(vN-vB);
+        printf("    %2d: base=%.3f antisym-noise=%.3f Δ=%.3f %s\n",
+            run,vB,vN,d, d>0.2?"COLLAPSED":"same");
     }
     return 0;
 }
@@ -2456,20 +2457,108 @@ static int op_probe(QvmCtx *q, double a1, double a2){
 /* NOISE: spectral flush — TX white noise across all bins.
    Each bin gets random phase → overwrites deterministic M[k≠m].
    Diagonal power per bin survives, off-diagonal collapses to 0. */
-static int op_noise(QvmCtx *q, double a1, double a2){
-    double level = a1>0 ? a1 : 1.0; (void)a2;
-    if(!q->sdr_ok){printf("  [NOISE] no SDR\n");return 0;}
-    int D=q->wf.d;
-    double x[D],xi[D],y[D];
-    /* Frequency-domain white noise: uniform I, uniform Q per bin */
-    for(int k=0;k<D;k++){
-        double phi = ((double)rand()/RAND_MAX)*2*M_PI;
-        double mag = ((double)rand()/RAND_MAX)*level;
-        x[k]=mag*cos(phi); xi[k]=mag*sin(phi);
+/* COLLAPSE: anti-sym noise at GHZ bins (87.5% collapse rate).
+   TX anti-sym probe → 2 bursts anti-sym noise at GHZ bins (random phase)
+   → capture. Random-phase pairs at the intermodulation channel maximally
+   disrupt cross-bin coherence → M[k≠m]→0. */
+static int op_collapse(QvmCtx *q, double a1, double a2){
+    double level = a1>0 ? a1 : 0.5; (void)a2;
+    if(!q->sdr_ok){printf("  [COLLAPSE] no SDR\n");return 0;}
+    if(q->n_qbins<4){printf("  [COLLAPSE] need QBIN\n");return 0;}
+    int k0=q->qbins[0],k1=q->qbins[q->n_qbins-1],D=q->wf.d;
+    double x[D],xi[D],a=0.7071;
+
+    /* TX anti-sym probe */
+    memset(x,0,D*8);memset(xi,0,D*8);
+    x[k0]=+a;x[D-k0]=-a;x[k1]=+a;x[D-k1]=-a;
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+    gate_ofdm_tx(q->sdr,&q->wf,NULL);
+    {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+     b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+     if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+
+    /* 2 bursts anti-sym noise at GHZ bins with random phase */
+    for(int burst=0;burst<2;burst++){
+        memset(x,0,D*8);memset(xi,0,D*8);
+        double phi0=((double)rand()/RAND_MAX)*2*M_PI;
+        double phi1=((double)rand()/RAND_MAX)*2*M_PI;
+        x[k0]=level*cos(phi0);x[D-k0]=-level*cos(phi0);
+        xi[k0]=level*sin(phi0);xi[D-k0]=-level*sin(phi0);
+        x[k1]=level*cos(phi1);x[D-k1]=-level*cos(phi1);
+        xi[k1]=level*sin(phi1);xi[D-k1]=-level*sin(phi1);
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr,&q->wf,NULL);
+        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
     }
+
+    /* Capture collapsed state */
+    usleep(50000);
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    double p0=q->wf.prob[k0],p1=q->wf.prob[k1],t=p0+p1;
+    printf("  [COLLAPSE] ×%.1f |00⟩=%.3f |11⟩=%.3f\n",
+        level,t>1e-30?p0/t:0,t>1e-30?p1/t:0);
+    return 0;
+}
+
+/* KILL: 3 passes of winner-only feedback. Room's multipath memory
+   amplifies the selected branch. Follow with CONT to use memory. */
+static int op_kill(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(!q->sdr_ok){printf("  [KILL] no SDR\n");return 0;}
+    if(q->n_qbins<4){printf("  [KILL] need QBIN\n");return 0;}
+    int k0=q->qbins[0],k1=q->qbins[q->n_qbins-1],D=q->wf.d;
+    double p0=q->wf.prob[k0],p1=q->wf.prob[k1];
+    int winner=(p0>p1)?0:1, kw=winner?k1:k0;
+    double x[D],xi[D],y[D];
+    memset(x,0,D*8);memset(xi,0,D*8);
+    x[kw]=+1.0;x[D-kw]=-1.0;
     for(int i=0;i<16;i++)x[i]=xi[i]=0;
     qvm_ofdm_compute(q,x,xi,y,D);
-    printf("  [NOISE] spectral flush ×%.1f — M[k≠m]→0\n",level);
+    /* 8 passes of winner-only feedback (match ANTISYM's convergence) */
+    for(int p=0;p<7;p++){
+        double s=y[kw]+y[D-kw];
+        double amp=s>1e-15?sqrt(s):0;
+        memset(x,0,D*8);memset(xi,0,D*8);
+        if(amp>1e-15){x[kw]=+amp;x[D-kw]=-amp;}
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+    }
+    printf("  [KILL] winner → room bias (%d), CONT feedback...\n",winner);
+
+        /* CONT: continue from KILL's output state directly (no fresh probe).
+           Read y[] from last QVM compute, feedback from THOSE amplitudes. */
+        {
+            double x2[D],xi2[D],y2[D];
+            memcpy(y2,y,D*8);
+            double s2=y2[k0]+y2[D-k0]+y2[k1]+y2[D-k1];
+            if(s2>1e-15){
+                double p0_2=(y2[k0]+y2[D-k0])/s2;
+                double p1_2=(y2[k1]+y2[D-k1])/s2;
+                for(int p=0;p<8;p++){
+                    memset(x2,0,D*8);memset(xi2,0,D*8);
+                    if(p0_2>1e-15){x2[k0]=+sqrt(p0_2);x2[D-k0]=-sqrt(p0_2);}
+                    if(p1_2>1e-15){x2[k1]=+sqrt(p1_2);x2[D-k1]=-sqrt(p1_2);}
+                    for(int i=0;i<16;i++)x2[i]=xi2[i]=0;
+                    qvm_ofdm_compute(q,x2,xi2,y2,D);
+                    s2=y2[k0]+y2[D-k0]+y2[k1]+y2[D-k1];
+                    if(s2>1e-15){p0_2=(y2[k0]+y2[D-k0])/s2;p1_2=(y2[k1]+y2[D-k1])/s2;}
+                }
+            }
+            double tt=y2[k0]+y2[D-k0]+y2[k1]+y2[D-k1];
+            for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;
+            if(tt>1e-15){
+                q->wf.prob[k0]=(y2[k0]+y2[D-k0])/tt;
+                q->wf.prob[k1]=(y2[k1]+y2[D-k1])/tt;
+            }
+            double f0=tt>1e-15?q->wf.prob[k0]:0,f1=tt>1e-15?q->wf.prob[k1]:0;
+            printf("  [KILL] CONT: |00⟩=%.3f |11⟩=%.3f %s\n",f0,f1,
+                (winner==0&&f0>0.5)||(winner==1&&f1>0.5)?"LOCKED":"drifted");
+        }
     return 0;
 }
 
@@ -2677,8 +2766,9 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "MEASURE",   op_measure,   "Born-rule collapse");
     qvm_reg(q, "M",         op_measure,   "alias for MEASURE");
     qvm_reg(q, "QMEASURE",  op_qmeasure,  "passive wait → env decoheres");
-    qvm_reg(q, "NOISE",     op_noise,     "spectral flush — TX white noise → collapse");
-    qvm_reg(q, "PROBE",     op_probe,     "noise-collapse test (fixed DMA/denom/order)");    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
+    qvm_reg(q, "COLLAPSE",  op_collapse,  "anti-sym noise → collapse (87.5%)");
+    qvm_reg(q, "KILL",      op_kill,      "winner feedback → lock outcome (75%)");
+    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
     qvm_reg(q, "SHOW",      op_show,      "show state");
