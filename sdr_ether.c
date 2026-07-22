@@ -2059,8 +2059,8 @@ struct QvmCtx {
     double *M, *Minv;
     int    M_dim;
 
-    /* Qubit bin mapping for ANTISYM gate (supports up to 5 qudits = 32 bins) */
-    int    qbins[32];
+    /* Qubit bin mapping for ANTISYM gate (up to 128 qudits = 256 bins) */
+    int    qbins[256];
     int    n_qbins;
 };
 
@@ -2154,16 +2154,18 @@ static int op_cz(QvmCtx *q, double a1, double a2){
 
 static int op_qbin(QvmCtx *q, double a1, double a2){
     (void)a2;
-    if(a1>=32){printf("  [QBIN] max 32 bins (5 qudits)\n");return 0;}
+    if(a1>=256){printf("  [QBIN] max 256 bins (128 qudits)\n");return 0;}
     q->qbins[(int)a1]=(int)a2;
     return 0;
 }
 static int op_qbin_done(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     q->n_qbins=0;
-    for(int i=0;i<32;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
+    for(int i=0;i<256;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
     printf("  [QBIN] %d bins (%d qudits): ",q->n_qbins,q->n_qbins/2);
-    for(int i=0;i<q->n_qbins;i++)printf("%d ",q->qbins[i]);printf("\n");
+    for(int i=0;i<q->n_qbins && i<20;i++)printf("%d ",q->qbins[i]);
+    if(q->n_qbins>20)printf("...");
+    printf("\n");
     return 0;
 }
 /* ANTISYM: anti-symmetric pair entanglement gate.
@@ -2178,7 +2180,6 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
     if(!q->sdr_ok)return 0;
     int n=q->n_qbins;
     if(n<4){printf("  [ANTISYM] need ≥4 bins (≥2 qudits)\n");return 0;}
-    if(n>32)n=32;
     int k0=q->qbins[0], k1=q->qbins[n-1]; /* GHZ: |0...0⟩ and |1...1⟩ */
     int D=q->wf.d, n_pass=8;
     double x[D],xi[D],y[D],amp=1.0/sqrt(2.0);
