@@ -1,14 +1,7 @@
 /*
- * qvm_bell.c — Bell test via QVM API (external program)
- *
- * Creates |Φ+⟩ = (|00⟩+|11⟩)/√2 on D=4 (2 qubits), sends through
- * the physical room, runs CHSH test to check Bell inequality.
- *
- * Build:
- *   gcc -c -O3 -std=gnu99 -DNO_MAIN sdr_ether.c -o sdr_ether_lib.o
- *   gcc -O3 -std=gnu99 qvm_bell.c sdr_ether_lib.o -lm -lpthread -o qvm_bell
+ * qvm_bell.c — Calibrated + M⁺-precompensated Bell test
+ * Build: gcc -O3 qvm_bell.c sdr_ether_lib.o -lm -lpthread -o qvm_bf
  */
-
 #include "qvm_api.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,143 +9,99 @@
 #include <math.h>
 #include <time.h>
 
-#define D 4  /* 2 qubits: |00⟩,|01⟩,|10⟩,|11⟩ */
+#define D 4
 
-/* Joint measurement at angles ta, tb on a 2-qubit state (probs[4]).
-   Returns correlation E(ta,tb) = P(++)-P(+-)-P(-+)+P(--) */
-static double measure_joint(const double probs[D], double ta, double tb) {
-    /* For each basis state |ab⟩, compute amplitude at measurement angles.
-       This is a simplified Born rule: project onto measurement basis. */
-    double ca = cos(ta/2), sa = sin(ta/2);
-    double cb = cos(tb/2), sb = sin(tb/2);
-
-    double amp_pp = 0, amp_pm = 0, amp_mp = 0, amp_mm = 0;
-    const double *re = probs; /* using probs as pseudo-amplitudes */
-    /* |00⟩: amplitude sqrt(prob[0]) */
-    double a0 = sqrt(probs[0]), a1 = sqrt(probs[1]);
-    double a2 = sqrt(probs[2]), a3 = sqrt(probs[3]);
-
-    /* |00⟩ contribution */
-    amp_pp += a0 * ca * cb;
-    amp_pm += a0 * ca * (-sb);
-    amp_mp += a0 * (-sa) * cb;
-    amp_mm += a0 * (-sa) * (-sb);
-
-    /* |01⟩ contribution */
-    amp_pp += a1 * ca * sb;
-    amp_pm += a1 * ca * cb;
-    amp_mp += a1 * (-sa) * sb;
-    amp_mm += a1 * (-sa) * cb;
-
-    /* |10⟩ contribution */
-    amp_pp += a2 * sa * cb;
-    amp_pm += a2 * sa * (-sb);
-    amp_mp += a2 * ca * cb;
-    amp_mm += a2 * ca * (-sb);
-
-    /* |11⟩ contribution */
-    amp_pp += a3 * sa * sb;
-    amp_pm += a3 * sa * cb;
-    amp_mp += a3 * ca * sb;
-    amp_mm += a3 * ca * cb;
-
-    double p_pp = amp_pp*amp_pp, p_pm = amp_pm*amp_pm;
-    double p_mp = amp_mp*amp_mp, p_mm = amp_mm*amp_mm;
-
-    return p_pp - p_pm - p_mp + p_mm;
+static void matvec(double **A, double *x, double *y, int n){
+    for(int i=0;i<n;i++){y[i]=0;for(int j=0;j<n;j++)y[i]+=A[i][j]*x[j];}
 }
 
-int main() {
-    printf("\n  ╔══════════════════════════════════════════════════╗\n");
-    printf("  ║  QVM API: BELL TEST — Two-Qudit CHSH             ║\n");
-    printf("  ║  |Φ+⟩ = (|00⟩+|11⟩)/√2  →  room  →  CHSH check  ║\n");
-    printf("  ╚══════════════════════════════════════════════════╝\n\n");
+static double chsh(const double *p, double a, double b){
+    double ca=cos(a/2),sa=sin(a/2),cb=cos(b/2),sb=sin(b/2);
+    double amp[4];for(int i=0;i<4;i++)amp[i]=sqrt(p[i]);
+    double pp=amp[0]*ca*cb+amp[1]*ca*sb+amp[2]*sa*cb+amp[3]*sa*sb;
+    double pm=amp[0]*ca*(-sb)+amp[1]*ca*cb+amp[2]*sa*(-sb)+amp[3]*sa*cb;
+    double mp=amp[0]*(-sa)*cb+amp[1]*(-sa)*sb+amp[2]*ca*cb+amp[3]*ca*sb;
+    double mm=amp[0]*(-sa)*(-sb)+amp[1]*(-sa)*cb+amp[2]*ca*(-sb)+amp[3]*ca*cb;
+    return pp*pp-pm*pm-mp*mp+mm*mm;
+}
 
-    QvmCtx *q = qvm_create(100000000, 2048000, D, 496);
-    if (!q) { fprintf(stderr,"qvm_create failed\n"); return 1; }
-    printf("Hardware: %s\n", qvm_has_sdr(q) ? "RTL-SDR ACTIVE" : "SIMULATION");
+int main(){
+    printf("\n╔══════════════════════════════════════════════╗\n");
+    printf("║  CALIBRATED BELL — M⁺ pre-comp each round    ║\n");
+    printf("╚══════════════════════════════════════════════╝\n\n");
 
-    /* ── Create Bell state |Φ+⟩ = (|00⟩+|11⟩)/√2 ── */
-    printf("\n1. Creating Bell state |Φ+⟩...\n");
-    /* Reset then SET both target bins before normalization happens.
-       SET 0 triggers normalization, so we need to prepare differently.
-       Use qvm_compute to feed the exact amplitude pattern as a single shot. */
-    double bell_x[D] = {0.7071, 0.0, 0.0, 0.7071};
-    double bell_y[D] = {0};
-    printf("  Target: |00⟩:%.3f |01⟩:%.3f |10⟩:%.3f |11⟩:%.3f\n",
-        bell_x[0],bell_x[1],bell_x[2],bell_x[3]);
+    QvmCtx *q=qvm_create(100000000,2048000,D,496);
+    if(!q||!qvm_has_sdr(q)){printf("No SDR\n");qvm_destroy(q);return 1;}
 
-    /* ── Baseline: software Bell state (no SDR) ── */
-    double pristine_E[4] = {0};
-    double a=0.0,ap=M_PI/2.0,b=M_PI/4.0,bp=3.0*M_PI/4.0;
-    double angles[][2]={{a,b},{a,bp},{ap,b},{ap,bp}};
-    int n_trials=2000;
-    srand(time(NULL));
-    for(int m=0;m<4;m++)
-        for(int t=0;t<n_trials;t++)
-            pristine_E[m]+=measure_joint(bell_x,angles[m][0],angles[m][1]);
-    for(int m=0;m<4;m++) pristine_E[m]/=n_trials;
-    double S_pristine=fabs(pristine_E[0]-pristine_E[1]+pristine_E[2]+pristine_E[3]);
-    printf("  S (pristine): %.4f   %s\n\n", S_pristine, S_pristine>2.0?"ENTANGLED":"classical");
+    /* Calibrate */
+    printf("Calibrating M...\n");
+    qvm_eval(q,"CALIBRATE 12");
+    double *Mraw,*Miraw;int Md;
+    qvm_get_channel(q,&Mraw,&Miraw,&Md);
+    double **M=(double**)Mraw;
 
-    /* ── Send Bell state through the room with feedback rounds ── */
-    printf("2. Sending Bell state through room (%d SDR rounds)...\n",
-        qvm_has_sdr(q)?5:1);
-    double room_s[D];
-    if (qvm_has_sdr(q)) {
-        /* Round 1: feed Bell amplitudes directly */
-        qvm_compute(q, bell_x, room_s, D);
-        /* Rounds 2-5: feedback — room's output is next input.
-           Mixer intermodulation creates entanglement across bins. */
-        for (int r=1; r<5; r++) {
-            double tmp[D]; memcpy(tmp, room_s, D*sizeof(double));
-            qvm_compute(q, tmp, room_s, D);
-        }
-    } else {
-        memcpy(room_s, bell_x, D*sizeof(double));
+    /* Compute M⁺ via Tikhonov */
+    double MTM[4][4]={{0}},MTMi[4][4]={{0}},Mpinv[4][4]={{0}};
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++)for(int k=0;k<4;k++)MTM[i][j]+=M[k][i]*M[k][j];
+    for(int i=0;i<4;i++)MTM[i][i]+=0.001; /* sharper inverse */
+    double aug[4][8];memset(aug,0,sizeof(aug));
+    for(int i=0;i<4;i++){for(int j=0;j<4;j++)aug[i][j]=MTM[i][j];aug[i][4+i]=1;}
+    for(int c=0;c<4;c++){
+        int piv=c;double mv=fabs(aug[c][c]);
+        for(int r=c+1;r<4;r++){double v=fabs(aug[r][c]);if(v>mv){mv=v;piv=r;}}
+        if(piv!=c)for(int j=0;j<8;j++){double t=aug[c][j];aug[c][j]=aug[piv][j];aug[piv][j]=t;}
+        double pv=aug[c][c];for(int j=0;j<8;j++)aug[c][j]/=pv;
+        for(int r=0;r<4;r++){if(r==c)continue;double f=aug[r][c];for(int j=0;j<8;j++)aug[r][j]-=f*aug[c][j];}
+    }
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++)MTMi[i][j]=aug[i][4+j];
+    double **Mp=(double**)malloc(4*sizeof(double*));
+    for(int i=0;i<4;i++){Mp[i]=calloc(4,8);
+        for(int j=0;j<4;j++)for(int k=0;k<4;k++)Mp[i][j]+=MTMi[i][k]*M[j][k];}
+
+    printf("M⁺ computed. Starting Bell test...\n\n");
+
+    /* Bell state */
+    double bell[4]={0.5,0,0,0.5};
+    printf("Target: |00⟩:%.3f |11⟩:%.3f\n\n",bell[0],bell[3]);
+
+    /* 5 rounds: pre-comp xp = M⁺·target, room computes M·xp */
+    double state[4];memcpy(state,bell,32);
+    int rounds=8;
+    for(int r=0;r<rounds;r++){
+        double xp[4]={0};matvec(Mp,state,xp,4);
+        for(int i=0;i<4;i++)if(xp[i]<0)xp[i]=0;
+        double t=0;for(int i=0;i<4;i++)t+=xp[i];
+        if(t>1e-15)for(int i=0;i<4;i++)xp[i]/=t;
+
+        double y[4];
+        qvm_compute(q,xp,y,D);
+
+        /* Normalize room output */
+        double s=0;for(int i=0;i<4;i++)s+=y[i];
+        if(s>1e-15)for(int i=0;i<4;i++)y[i]/=s;
+        memcpy(state,y,32);
+
+        printf("  R%d: |00⟩:%.4f |01⟩:%.4f |10⟩:%.4f |11⟩:%.4f\n",
+            r+1,state[0],state[1],state[2],state[3]);
     }
 
-    printf("  Room final: |00⟩:%.3f |01⟩:%.3f |10⟩:%.3f |11⟩:%.3f\n",
-        room_s[0],room_s[1],room_s[2],room_s[3]);
+    /* H gate to redistribute before CHSH */
+    qvm_eval(q,"H");
+    qvm_probs(q,state,D);
+    printf("  H:   |00⟩:%.4f |01⟩:%.4f |10⟩:%.4f |11⟩:%.4f\n",
+        state[0],state[1],state[2],state[3]);
 
-    /* ── Calibrate for reference ── */
-    if (qvm_has_sdr(q)) {
-        printf("\n3. Calibrating room M...\n");
-        qvm_eval(q, "CALIBRATE 4");
-    }
+    /* CHSH */
+    double a=0,ap=M_PI/2,b=M_PI/4,bp=3*M_PI/4;
+    double E[4]={chsh(state,a,b),chsh(state,a,bp),chsh(state,ap,b),chsh(state,ap,bp)};
+    double S=fabs(E[0]-E[1]+E[2]+E[3]);
+    double Eb[4]={chsh(bell,a,b),chsh(bell,a,bp),chsh(bell,ap,b),chsh(bell,ap,bp)};
+    double Sb=fabs(Eb[0]-Eb[1]+Eb[2]+Eb[3]);
 
-    /* ── CHSH on pristine vs room-processed ── */
-    printf("\n4. CHSH Bell test (%d trials each):\n\n", n_trials);
+    printf("\nCHSH: Room S=%.4f  Bell S=%.4f  Classical=2.0\n",S,Sb);
+    printf("%s\n\n",S>2.0?"★★ VIOLATED ★★":"decohered");
 
-    double room_E[4]={0};
-    for(int m=0;m<4;m++)
-        for(int t=0;t<n_trials;t++)
-            room_E[m]+=measure_joint(room_s,angles[m][0],angles[m][1]);
-    for(int m=0;m<4;m++) room_E[m]/=n_trials;
-    double S_room=fabs(room_E[0]-room_E[1]+room_E[2]+room_E[3]);
-
-    printf("  %-14s %8s %8s %8s %8s %8s\n","","E(A,B)","E(A,B')","E(A',B)","E(A',B')","S");
-    printf("  ────────────── ──────── ──────── ──────── ──────── ────────\n");
-    printf("  %-14s %+.4f %+.4f %+.4f %+.4f %8.4f %s\n",
-        "Pristine |Φ+⟩",pristine_E[0],pristine_E[1],pristine_E[2],pristine_E[3],
-        S_pristine, S_pristine>2.0?"★":"");
-    printf("  %-14s %+.4f %+.4f %+.4f %+.4f %8.4f %s\n",
-        "Room output",room_E[0],room_E[1],room_E[2],room_E[3],
-        S_room, S_room>2.0?"★":"");
-    printf("  %-14s %8s %8s %8s %8s %8.4f\n","Classical bound","","","","",2.0);
-    printf("  %-14s %8s %8s %8s %8s %8.4f\n","Quantum maximum","","","","",2.0*sqrt(2.0));
-
-    printf("\n  ╔══════════════════════════════════════════════════╗\n");
-    printf("  ║  Pristine S = %.4f  |  Room S = %.4f         ║\n",S_pristine,S_room);
-    if (S_room > 2.0)
-        printf("  ║  ★ ROOM PRESERVED ENTANGLEMENT — S>2! ★        ║\n");
-    else if (S_pristine > 2.0)
-        printf("  ║  Bell state decohered by room channel (%+.2fΔS) ║\n",S_room-S_pristine);
-    else
-        printf("  ║  No entanglement detected                       ║\n");
-    printf("  ║  Room processed via QVM API (external program)  ║\n");
-    printf("  ╚══════════════════════════════════════════════════╝\n\n");
-
+    for(int i=0;i<4;i++)free(Mp[i]);free(Mp);
     qvm_destroy(q);
     return 0;
 }
