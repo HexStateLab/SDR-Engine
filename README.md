@@ -378,3 +378,6 @@ and the architecture holds.
 | `qvm_factor.c` | Integer factorization via room |
 | `qsm.c` | Random circuit supremacy (room-only) |
 | `README.md` | This file |
+
+Note to self: The room's native gate is the polynomial:
+ *   f(x)[k] = Σᵢ αᵢₖ·x[i] + Σᵢⱼ βᵢⱼₖ·x[i]·x[j] + Σᵢⱼₗ γᵢⱼₗₖ·x[i]·x[j]·x[l] + ...
