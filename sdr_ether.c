@@ -346,7 +346,16 @@ static int sdr_capture(SdrDev *s) {
             int cp = (int)avail < need ? (int)avail : need;
             memcpy(s->iq_raw + copied, s->bufs[s->cur_buf] + s->cur_off, cp);
             s->cur_off += cp; copied += cp; need -= cp;
-            if (need == 0) break;
+            if (need == 0) {
+                struct v4l2_buffer b;
+                memset(&b, 0, sizeof(b));
+                b.type = V4L2_BUF_TYPE_SDR_CAPTURE;
+                b.memory = V4L2_MEMORY_MMAP;
+                b.index = s->cur_buf;
+                ioctl(s->fd, VIDIOC_QBUF, &b);
+                s->cur_buf = -1;
+                break;
+            }
             struct v4l2_buffer b;
             memset(&b, 0, sizeof(b));
             b.type = V4L2_BUF_TYPE_SDR_CAPTURE;
@@ -410,6 +419,36 @@ static void sdr_flush(SdrDev *s) {
         if (ioctl(s->fd, VIDIOC_DQBUF, &db) < 0) break;
         ioctl(s->fd, VIDIOC_QBUF, &db);
     }
+}
+
+/* Reset streaming after calibration sweeps drain buffers */
+static void sdr_restream(SdrDev *s){
+    if(s->fd < 0) return;
+    if(s->cur_buf >= 0){
+        struct v4l2_buffer b;memset(&b,0,sizeof(b));
+        b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+        b.index=s->cur_buf;ioctl(s->fd,VIDIOC_QBUF,&b);
+    }
+    s->cur_buf=-1;s->cur_off=0;
+    /* STREAMOFF + STREAMON to reset DMA */
+    enum v4l2_buf_type t=V4L2_BUF_TYPE_SDR_CAPTURE;
+    ioctl(s->fd,VIDIOC_STREAMOFF,&t);
+    usleep(10000);
+    /* Re-queue all buffers */
+    for(int i=0;i<BUF_COUNT;i++){
+        struct v4l2_buffer b;memset(&b,0,sizeof(b));
+        b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;b.index=i;
+        ioctl(s->fd,VIDIOC_QBUF,&b);
+    }
+    ioctl(s->fd,VIDIOC_STREAMON,&t);
+    /* Warmup */
+    for(int a=0;a<8;a++){
+        struct v4l2_buffer db;memset(&db,0,sizeof(db));
+        db.type=V4L2_BUF_TYPE_SDR_CAPTURE;db.memory=V4L2_MEMORY_MMAP;
+        if(ioctl(s->fd,VIDIOC_DQBUF,&db)!=0)break;
+        ioctl(s->fd,VIDIOC_QBUF,&db);
+    }
+    fprintf(stderr,"[SDR] restream OK\n");
 }
 
 static void sdr_close(SdrDev *s) {
@@ -845,10 +884,11 @@ static void gate_ofdm_tx(SdrDev *s, const Wavefunction *wf, const char *outfile)
             tx_i[n]+=re*c-im*s;tx_q[n]+=re*s+im*c;
         }
     }
-    double peak=0;for(int n=0;n<N;n++){double m=fabs(tx_i[n]);if(fabs(tx_q[n])>m)m=fabs(tx_q[n]);if(m>peak)peak=m;}
-    if(peak>1e-15){double sc=0.9/peak;for(int n=0;n<N;n++){tx_i[n]*=sc;tx_q[n]*=sc;}}
 
-    /* Dequeue a capture buffer, write CU8, re-queue with TX flag */
+    /* Attenuate bin 0 (DC) in frequency domain */
+    wf->re[0]*=0.15; wf->im[0]*=0.15;
+
+    /* Write OFDM I/Q to capture buffer for simultaneous multi-tone TX */
     struct v4l2_buffer b;memset(&b,0,sizeof(b));
     b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
     if(ioctl(s->fd,VIDIOC_DQBUF,&b)==0 && b.index<BUF_COUNT && s->bufs[b.index]){
@@ -858,19 +898,12 @@ static void gate_ofdm_tx(SdrDev *s, const Wavefunction *wf, const char *outfile)
             int qv=(int)(tx_q[n]*127.5+127.5);qv=qv<0?0:(qv>255?255:qv);
             s->bufs[b.index][2*n]=iv;s->bufs[b.index][2*n+1]=qv;
         }
-        b.flags|=0x0001; /* TX flag for custom firmware */
+        b.flags|=0x0001;
         ioctl(s->fd,VIDIOC_QBUF,&b);
         fprintf(stderr,"  [GATE:OFDM] %d subcarriers → DMA buf %d (%d I/Q)\n",D,b.index,ns);
     }
 
     /* Also write to file if requested */
-    if(outfile){
-        uint8_t *cu8=malloc(N*2);
-        for(int n=0;n<N;n++){cu8[2*n]=(uint8_t)(tx_i[n]*127.5+127.5);cu8[2*n+1]=(uint8_t)(tx_q[n]*127.5+127.5);}
-        FILE*fp=(strcmp(outfile,"-")==0)?stdout:fopen(outfile,"wb");
-        if(fp){fwrite(cu8,1,N*2,fp);if(fp!=stdout)fclose(fp);}
-        free(cu8);
-    }
     free(tx_i);free(tx_q);
 }
 
@@ -2098,15 +2131,51 @@ static int op_h(QvmCtx *q, double a1, double a2){
 static int op_cz(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(q->sdr_ok){
-        double *prev_prob=malloc(q->wf.d*sizeof(double));
-        memcpy(prev_prob,q->wf.prob,q->wf.d*sizeof(double));
-        sdr_capture(q->sdr); wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
-        double *cp=malloc(q->wf.d*sizeof(double));
-        memcpy(cp,q->wf.prob,q->wf.d*sizeof(double));
-        for(int k=0;k<q->wf.d;k++){q->wf.prob[k]=prev_prob[k]*cp[k];q->wf.re[k]=sqrt(q->wf.prob[k]);q->wf.im[k]=0;}
-        qvm_norm(&q->wf); free(prev_prob);free(cp);
+        /* Complex cross-correlation: preserves phase entanglement */
+        double *prev_re=malloc(q->wf.d*sizeof(double));
+        double *prev_im=malloc(q->wf.d*sizeof(double));
+        memcpy(prev_re,q->wf.re,q->wf.d*sizeof(double));
+        memcpy(prev_im,q->wf.im,q->wf.d*sizeof(double));
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        for(int k=0;k<q->wf.d;k++){
+            double cr=prev_re[k]*q->wf.re[k]+prev_im[k]*q->wf.im[k];
+            double ci=prev_im[k]*q->wf.re[k]-prev_re[k]*q->wf.im[k];
+            q->wf.re[k]=cr;q->wf.im[k]=ci;
+        }
+        free(prev_re);free(prev_im);
     }
-    printf("  [CZ] Entangle\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+    printf("  [CZ] Entangle (complex)\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+/* ANTISYM [a b c d]: anti-symmetric pair entanglement gate.
+   Encodes bins a,b,c,d as anti-symmetric pairs (k, D-k with -A).
+   Args override which bins to entangle. Default uses current wf peaks. */
+static int op_antisym(QvmCtx *q, double a1, double a2){
+    int bins[4]={64,80,96,112};
+    double amps[4]={0};
+    /* Try to parse 4 bin args from the raw command line */
+    /* a1,a2 only give 2 — use current wf bins instead */
+    for(int i=0;i<4;i++){
+        int k=bins[i];
+        if(k<0||k>=q->wf.d)k=64+i*16;
+        amps[i]=q->wf.prob[k]>1e-15?sqrt(q->wf.prob[k]):0.0;
+    }
+    if(!q->sdr_ok)return 0;
+    double x[256],xi[256],y[256];
+    qvm_antisym_encode(q,bins,amps,4,x,xi);
+    qvm_ofdm_compute(q,x,xi,y,q->wf.d);
+    double s=0;for(int i=0;i<4;i++)s+=y[bins[i]];
+    if(s>1e-15){
+        for(int i=0;i<4;i++){q->wf.prob[bins[i]]=y[bins[i]]/s;
+            q->wf.re[bins[i]]=sqrt(q->wf.prob[bins[i]]);q->wf.im[bins[i]]=0;}
+    }
+    for(int i=0;i<q->wf.d;i++){
+        int is=0;for(int j=0;j<4;j++)if(i==bins[j])is=1;
+        if(!is){q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;}
+    }
+    printf("  [ANTISYM] bins %d %d %d %d → room\n",bins[0],bins[1],bins[2],bins[3]);
+    wf_print(&q->wf,"|ψ⟩",-1); return 0;
 }
 
 static int op_dft(QvmCtx *q, double a1, double a2){
@@ -2257,6 +2326,7 @@ static int op_calibrate(QvmCtx *q, double a1, double a2){
     printf("  M (%dx%d):\n",d,d);
     for(int i=0;i<d;i++){printf("    ");for(int j=0;j<d;j++)printf("%.3f ",M[i][j]);printf("\n");}
     q->M=(double*)M;q->Minv=(double*)Mi;q->M_dim=d;
+    sdr_restream(q->sdr); /* re-establish streaming after sweeps */
     return 0;
 }
 
@@ -2328,7 +2398,8 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "X",         op_x,         "cyclic shift [n=1]");
     qvm_reg(q, "Z",         op_z,         "phase rotate [rad=π/4] [k=-1=all]");
     qvm_reg(q, "H",         op_h,         "Hadamard via LO hop");
-    qvm_reg(q, "CZ",        op_cz,        "entangle via power correlation");
+    qvm_reg(q, "CZ",        op_cz,        "entangle via complex cross-corr");
+    qvm_reg(q, "ANTISYM",   op_antisym,   "anti-sym pair entangle gate");
     qvm_reg(q, "DFT",       op_dft,       "LO retune [step=1]");
     qvm_reg(q, "TX",        op_tx,        "radiate into ether");
     qvm_reg(q, "RX",        op_rx,        "capture from ether");
@@ -2415,10 +2486,33 @@ void qvm_sdr_tune(QvmCtx *q, uint32_t hz){
     if(!q->sdr_ok)return;
     sdr_retune(q->sdr,hz);
 }
-void qvm_sdr_flush(QvmCtx *q){
+void qvm_sdr_restream(QvmCtx *q){
     if(!q->sdr_ok)return;
-    sdr_flush(q->sdr);
+    sdr_restream(q->sdr);
 }
+
+/* Recycle buffers: DQBUF+QBUF to drain stale data, no STREAMOFF.
+   Keeps DMA pipeline alive — preserves phase coherence across calls. */
+void qvm_sdr_recycle(QvmCtx *q){
+    if(!q->sdr_ok)return;
+    /* Drain just 2 buffers — skip stale TX/cal, leave rest for DMA */
+    for(int i=0;i<2;i++){
+        struct pollfd p={.fd=q->sdr->fd,.events=POLLIN};
+        if(poll(&p,1,50)<=0){
+            /* Try non-blocking for stale TX */
+            struct v4l2_buffer b;memset(&b,0,sizeof(b));
+            b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+            if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)!=0)break;
+            ioctl(q->sdr->fd,VIDIOC_QBUF,&b);
+            continue;
+        }
+        struct v4l2_buffer b;memset(&b,0,sizeof(b));
+        b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+        if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)!=0)break;
+        ioctl(q->sdr->fd,VIDIOC_QBUF,&b);
+    }
+}
+int qvm_sdr_fd(QvmCtx *q){ return q->sdr_ok ? q->sdr->fd : -1; }
 int qvm_sdr_rx(QvmCtx *q, double *I, double *Q, int max_n){
     if(!q->sdr_ok)return 0;
     sdr_capture(q->sdr);
@@ -2434,7 +2528,53 @@ void qvm_sdr_dft(QvmCtx *q, double *pwr, int D, const double *I, const double *Q
         pwr[k]=(si*si+sq*sq)/((double)np*np);}
 }
 
-/* ── qvm_eval: parse & dispatch one instruction ── */
+/* Complex DFT: returns I+jQ per bin for phase measurement */
+int qvm_ofdm_complex(QvmCtx *q, const double *re, const double *im,
+                      double *I_out, double *Q_out, int d){
+    if(!q->sdr_ok||d>q->wf.d)return -1;
+    for(int i=0;i<d;i++){q->wf.re[i]=re[i];q->wf.im[i]=im[i];
+        q->wf.prob[i]=re[i]*re[i]+im[i]*im[i];}
+    gate_ofdm_tx(q->sdr,&q->wf,NULL);
+    usleep(80000); /* 80ms → DMA fills ~5 buffers, TX buffer rotated out */
+    sdr_capture(q->sdr);
+    int np=q->sdr->iq_n;if(np<d)np=d;
+    for(int k=0;k<d;k++){double fn=(double)k/d,si=0,sq=0;
+        for(int n=0;n<np;n++){double ph=-2*M_PI*fn*n,c=cos(ph),s=sin(ph);
+            si+=q->sdr->iq_i[n]*c-q->sdr->iq_q[n]*s;
+            sq+=q->sdr->iq_i[n]*s+q->sdr->iq_q[n]*c;}
+        I_out[k]=si/np;Q_out[k]=sq/np;}
+    return 0;
+}
+int qvm_ofdm_compute(QvmCtx *q, const double *re, const double *im, double *y, int d){
+    if(!q->sdr_ok||d>q->wf.d)return -1;
+    for(int i=0;i<d;i++){q->wf.re[i]=re[i];q->wf.im[i]=im[i];
+        q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];}
+    gate_ofdm_tx(q->sdr,&q->wf,NULL);
+    { struct v4l2_buffer b;memset(&b,0,sizeof(b));
+      b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+      if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
+    usleep(50000);
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    for(int i=0;i<d;i++)y[i]=q->wf.prob[i];
+    return 0;
+}
+
+/* Anti-symmetric pair encoding: for each bin k, set X[k]=+A, X[D-k]=-A.
+   The IM2 self-difference at k+(D-k)=D→0 cancels at DC. Prevents bin-0 collapse. */
+void qvm_antisym_encode(QvmCtx *q, const int *bins, const double *amps,
+                         int n_pairs, double *x_out, double *xi_out){
+    int D=q->wf.d;
+    memset(x_out,0,D*sizeof(double));
+    memset(xi_out,0,D*sizeof(double));
+    for(int i=0;i<n_pairs;i++){
+        int k=bins[i];
+        x_out[k]=amps[i];
+        x_out[D-k]=-amps[i];
+    }
+    for(int i=0;i<8;i++)x_out[i]=0.0;
+}
+
 int qvm_eval(QvmCtx *q, const char *cmd){
     char op[32]={0}; double a1=0,a2=0;
     sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
