@@ -56,7 +56,7 @@
 
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
-#define MAX_DIM      256
+#define MAX_DIM      65536
 #define DEFAULT_D    6
 #define DEFAULT_FREQ 100000000
 #define DEFAULT_RATE 2048000
