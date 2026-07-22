@@ -423,7 +423,7 @@ static void gate_ether_loop(SdrDev *s, Qudit *q, double snr_db) {
  */
 static void gate_hadamard(SdrDev *s, Qudit *q) {
     double orig_freq = q->freq_hz;
-    double hop_freq  = orig_freq * 1.5;  /* shift by 3/2 to decorrelate */
+    double hop_freq  = orig_freq + q->rate_hz / 2.0;  /* Nyquist fold */
     qudit_retune(s, hop_freq, q);
     gate_init(s, q);
     qudit_retune(s, orig_freq, q);  /* retune back */
