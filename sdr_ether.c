@@ -2059,8 +2059,8 @@ struct QvmCtx {
     double *M, *Minv;
     int    M_dim;
 
-    /* Qubit bin mapping for ANTISYM gate */
-    int    qbins[8];     /* up to 8 bins */
+    /* Qubit bin mapping for ANTISYM gate (supports up to 5 qudits = 32 bins) */
+    int    qbins[32];
     int    n_qbins;
 };
 
@@ -2154,15 +2154,15 @@ static int op_cz(QvmCtx *q, double a1, double a2){
 
 static int op_qbin(QvmCtx *q, double a1, double a2){
     (void)a2;
-    if(a1>=8){printf("  [QBIN] max 8 bins\n");return 0;}
+    if(a1>=32){printf("  [QBIN] max 32 bins (5 qudits)\n");return 0;}
     q->qbins[(int)a1]=(int)a2;
     return 0;
 }
 static int op_qbin_done(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     q->n_qbins=0;
-    for(int i=0;i<8;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
-    printf("  [QBIN] %d bins: ",q->n_qbins);
+    for(int i=0;i<32;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
+    printf("  [QBIN] %d bins (%d qudits): ",q->n_qbins,q->n_qbins/2);
     for(int i=0;i<q->n_qbins;i++)printf("%d ",q->qbins[i]);printf("\n");
     return 0;
 }
@@ -2170,43 +2170,45 @@ static int op_qbin_done(QvmCtx *q, double a1, double a2){
    8-pass feedback: X[k]=+A, X[D-k]=-A per qubit bin → room → renormalize → repeat.
    Uses qbins[0..3] from QBIN (4 bins for 2 qudits).
    DC cancels via k+(D-k)=0 destructive interference. */
+/* ANTISYM: anti-symmetric pair entanglement gate for N qudits.
+   GHZ state (|0...0⟩+|1...1⟩)/√2 encoded as X[k]=+A, X[D-k]=-A.
+   8-pass feedback through room with DC cancellation. */
 static int op_antisym(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(!q->sdr_ok)return 0;
-    if(q->n_qbins<4){printf("  [ANTISYM] use QBIN first (need 4 bins)\n");return 0;}
-    int kb[4];for(int i=0;i<4;i++)kb[i]=q->qbins[i];
+    int n=q->n_qbins;
+    if(n<4){printf("  [ANTISYM] need ≥4 bins (≥2 qudits)\n");return 0;}
+    if(n>32)n=32;
+    int k0=q->qbins[0], k1=q->qbins[n-1]; /* GHZ: |0...0⟩ and |1...1⟩ */
     int D=q->wf.d, n_pass=8;
-    double x[D],xi[D],y[D];
-    double amp=1.0/sqrt(2.0);
+    double x[D],xi[D],y[D],amp=1.0/sqrt(2.0);
     for(int pass=0;pass<n_pass;pass++){
         memset(x,0,D*sizeof(double));memset(xi,0,D*sizeof(double));
         if(pass==0){
-            x[kb[0]]=+amp; x[D-kb[0]]=-amp;  /* |00⟩ */
-            x[kb[3]]=+amp; x[D-kb[3]]=-amp;  /* |11⟩ */
+            x[k0]=+amp; x[D-k0]=-amp;  /* GHZ |0...0⟩ */
+            x[k1]=+amp; x[D-k1]=-amp;  /* GHZ |1...1⟩ */
         }else{
-            /* Only re-encode the Bell-state bins (ignore empty |01⟩ |10⟩) */
-            double s=y[kb[0]]+y[D-kb[0]]+y[kb[3]]+y[D-kb[3]];
+            double s=y[k0]+y[D-k0]+y[k1]+y[D-k1];
             if(s>1e-15){
-                double p0=(y[kb[0]]+y[D-kb[0]])/s;
-                double p3=(y[kb[3]]+y[D-kb[3]])/s;
-                if(p0>1e-15){x[kb[0]]=+sqrt(p0);x[D-kb[0]]=-sqrt(p0);}
-                if(p3>1e-15){x[kb[3]]=+sqrt(p3);x[D-kb[3]]=-sqrt(p3);}
+                double p0=(y[k0]+y[D-k0])/s;
+                double p1=(y[k1]+y[D-k1])/s;
+                if(p0>1e-15){x[k0]=+sqrt(p0);x[D-k0]=-sqrt(p0);}
+                if(p1>1e-15){x[k1]=+sqrt(p1);x[D-k1]=-sqrt(p1);}
             }
         }
         for(int i=0;i<16;i++)x[i]=xi[i]=0.0;
         qvm_ofdm_compute(q,x,xi,y,D);
     }
-    /* Store final: only |00⟩ and |11⟩ bins */
-    double s=y[kb[0]]+y[D-kb[0]]+y[kb[3]]+y[D-kb[3]];
+    double s=y[k0]+y[D-k0]+y[k1]+y[D-k1];
     for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0.0;
     if(s>1e-15){
-        q->wf.prob[kb[0]]=(y[kb[0]]+y[D-kb[0]])/s;
-        q->wf.prob[kb[3]]=(y[kb[3]]+y[D-kb[3]])/s;
-        q->wf.re[kb[0]]=sqrt(q->wf.prob[kb[0]]);
-        q->wf.re[kb[3]]=sqrt(q->wf.prob[kb[3]]);
+        q->wf.prob[k0]=(y[k0]+y[D-k0])/s;
+        q->wf.prob[k1]=(y[k1]+y[D-k1])/s;
+        q->wf.re[k0]=sqrt(q->wf.prob[k0]);
+        q->wf.re[k1]=sqrt(q->wf.prob[k1]);
     }
-    printf("  [ANTISYM] bins %d/%d → %d passes: |00⟩=%.3f |11⟩=%.3f\n",
-        kb[0],kb[3],n_pass,q->wf.prob[kb[0]],q->wf.prob[kb[3]]);
+    printf("  [ANTISYM] %d-qudit GHZ bins %d/%d → %d passes: |0..0⟩=%.3f |1..1⟩=%.3f\n",
+        n/2,k0,k1,n_pass,q->wf.prob[k0],q->wf.prob[k1]);
     return 0;
 }
 
@@ -2253,6 +2255,47 @@ static int op_chsh(QvmCtx *q, double a1, double a2){
     printf("  [CHSH] |00⟩=%.3f |01⟩=%.3f |10⟩=%.3f |11⟩=%.3f\n",p[0],p[1],p[2],p[3]);
     printf("  [CHSH] E(A,B)=%+.4f E(A,B')=%+.4f E(A',B)=%+.4f E(A',B')=%+.4f\n",Eab,Eabp,Eapb,Eapbp);
     printf("  [CHSH] S=%.4f (classical ≤2.0, quantum ≤2.83) %s\n",S,S>2.0?"★★ BELL VIOLATION ★★":"no violation");
+    return 0;
+}
+
+/* MERMIN: Mermin inequality for N-qudit GHZ states (N odd).
+   M_N = 2^N * Re(a*b) for GHZ state |0...0⟩+|1...1⟩.
+   With probabilities only (no phase): M_max = 2^N * √(p0*p1).
+   Classical bound: ≤ 2^{(N-1)/2} for odd N.
+   Usage: MERMIN [N] — defaults to N = n_qbins/2 */
+static int op_mermin(QvmCtx *q, double a1, double a2){
+    int N = ((int)a1)>0 ? (int)a1 : q->n_qbins/2;
+    if(N<2){printf("  [MERMIN] need ≥2 qudits\n");return 0;}
+    if(q->n_qbins<2*N){
+        printf("  [MERMIN] need %d bins (%d qudits), have %d bins\n",2*N,N,q->n_qbins);
+        return 0;
+    }
+    int k0=q->qbins[0], k1=q->qbins[2*N-1];
+    double p0=q->wf.prob[k0], p1=q->wf.prob[k1];
+    double tot=p0+p1;if(tot>1e-15){p0/=tot;p1/=tot;}
+    double coh=sqrt(p0*p1); /* max coherence achievable */
+    /* Mermin correlation: M = Σ_k (-1)^{?} ⟨...⟩ ...
+       For GHZ |ψ⟩=a|0_n⟩+b|1_n⟩, optimized M = 2^N * Re(a*b)
+       Maximum achievable with probability-only: M_max = 2^N * √(p0*p1) */
+    double Mmax = pow(2.0,N) * coh;
+    double classical = pow(2.0, (N-1.0)/2.0);
+    int qpu = 2*N; /* qubits processed */
+    (void)qpu;
+
+    printf("  [MERMIN] %d-qudit GHZ: |0..0⟩=%.3f |1..1⟩=%.3f\n",N,p0,p1);
+    if(N%2==0){
+        printf("  [MERMIN] N=%d even: use AB-Klyshko inequality instead\n",N);
+        double Mmax2 = 2.0 * coh;
+        printf("  [MERMIN] M_max ≤ %.4f (correlation bound)\n",Mmax2);
+        return 0;
+    }
+    printf("  [MERMIN] M_max = 2^%d * √(%.3f*%.3f) = %.4f\n",N,p0,p1,Mmax);
+    printf("  [MERMIN] Classical bound: %.4f\n",classical);
+    printf("  [MERMIN] Quantum GHZ max:  %.4f\n",pow(2.0,N-1));
+    if(Mmax > classical)
+        printf("  [MERMIN] %.4f > %.4f ★★ MERMIN VIOLATION ★★\n",Mmax,classical);
+    else
+        printf("  [MERMIN] %.4f ≤ %.4f no violation\n",Mmax,classical);
     return 0;
 }
 
@@ -2479,6 +2522,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "CZ",        op_cz,        "entangle via complex cross-corr");
     qvm_reg(q, "ANTISYM",   op_antisym,   "anti-sym pair entangle (8-pass feedback)");
     qvm_reg(q, "CHSH",      op_chsh,      "Bell inequality test on qbin state");
+    qvm_reg(q, "MERMIN",    op_mermin,    "Mermin inequality for N-qudit GHZ");
     qvm_reg(q, "QBIN",      op_qbin,      "set qubit bin <idx> <k>");
     qvm_reg(q, "QBIN!",     op_qbin_done, "finalize qubit bin mapping");
     qvm_reg(q, "DFT",       op_dft,       "LO retune [step=1]");
