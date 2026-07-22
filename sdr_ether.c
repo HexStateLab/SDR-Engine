@@ -1933,338 +1933,498 @@ __attribute__((unused)) static void gate_DFT(SdrDev *s, Wavefunction *wf, int st
 static void tx_synthesize(const Wavefunction *wf, TxBuf *tx);
 static void tx_write_file(const TxBuf *tx, const char *path);
 
-static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
-                           const char *script_path) {
-    int npairs = IQ_WINDOW / 2;
+/* ═══════════════════════════════════════════════════════════════
+ * QVM API — Extensible Quantum VM instruction set /dispatch table
+ *
+ * Architecture:
+ *   QvmCtx    — VM context (wavefunction, SDR, instruction table)
+ *   QvmOp     — int handler(QvmCtx*, double arg1, double arg2)
+ *                Returns 0=continue, 1=quit, -1=error
+ *   qvm_reg() — register a named opcode
+ *   qvm_eval()— parse & dispatch a single instruction string
+ *   qvm_run() — REPL or script execution loop
+ *
+ * External code (e.g. CUDA wrapper) calls qvm_create() + qvm_eval()
+ * ═══════════════════════════════════════════════════════════════ */
 
-    SdrDev sdr;
-    int sdr_ok = (sdr_open(&sdr, (uint32_t)freq, (uint32_t)rate, gain) == 0);
+typedef struct QvmCtx QvmCtx;
+typedef int (*QvmOp)(QvmCtx *q, double a1, double a2);
 
+#define QVM_MAX_OPS 64
+
+struct QvmCtx {
+    SdrDev       *sdr;
+    Wavefunction  wf;
+    int           sdr_ok;
+    uint32_t      freq, rate;
+    int           running;
+
+    /* Instruction table */
+    struct { char name[16]; QvmOp fn; const char *help; } ops[QVM_MAX_OPS];
+    int n_ops;
+
+    /* Script state */
+    char **lines;  int nlines, ip;
+    int  *loop_stack, loop_depth;
+    int   interactive;
+
+    /* GPU offload state (calibrated channel) */
+    double *M, *Minv;
+    int    M_dim;
+};
+
+/* ─── Helpers ─── */
+static void qvm_norm(Wavefunction *w) {
+    double t=0; for(int i=0;i<w->d;i++) t+=w->re[i]*w->re[i]+w->im[i]*w->im[i];
+    if(t>1e-15){double s=1.0/sqrt(t);for(int i=0;i<w->d;i++){w->re[i]*=s;w->im[i]*=s;}}
+    w->entropy=0;w->purity=0;
+    for(int i=0;i<w->d;i++){w->prob[i]=w->re[i]*w->re[i]+w->im[i]*w->im[i];
+        if(w->prob[i]>1e-15)w->entropy-=w->prob[i]*log2(w->prob[i]);
+        w->purity+=w->prob[i]*w->prob[i];}
+}
+
+static void qvm_sync(QvmCtx *q) {
+    if (!q->sdr_ok) return;
+    ether_emit(q->sdr, &q->wf);
+    ether_read(q->sdr, &q->wf);
+}
+
+/* ─── Op table management ─── */
+static int qvm_reg(QvmCtx *q, const char *name, QvmOp fn, const char *help){
+    if (q->n_ops >= QVM_MAX_OPS) return -1;
+    strncpy(q->ops[q->n_ops].name, name, 15);
+    q->ops[q->n_ops].fn   = fn;
+    q->ops[q->n_ops].help = help ? help : "";
+    q->n_ops++;
+    return 0;
+}
+
+static QvmOp qvm_lookup(QvmCtx *q, const char *name){
+    for (int i=0;i<q->n_ops;i++)
+        if (strcasecmp(q->ops[i].name, name)==0) return q->ops[i].fn;
+    return NULL;
+}
+
+/* ── Instruction handlers ── */
+static int op_init(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok){sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
+    printf("  [INIT] Capture from ether\n");
+    wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_superpose(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok){sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
+    printf("  [SUPERPOSE] %d-level decomposition\n",q->wf.d);
+    wf_print(&q->wf,"|ψ⟩ sup",-1); return 0;
+}
+
+static int op_x(QvmCtx *q, double a1, double a2){
+    int shift = ((int)a1) ? (int)a1 : 1;
+    shift = ((shift % q->wf.d)+q->wf.d)%q->wf.d;
+    for(int s=0;s<shift;s++) gate_X(&q->wf);
+    printf("  [X] +%d\n",shift); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_z(QvmCtx *q, double a1, double a2){
+    double rad = a1 ? a1 : M_PI/4.0;
+    int target = ((int)a2) ? (int)a2 : -1;
+    if(target >= q->wf.d) target = -1;
+    gate_Z(&q->wf, rad, target);
+    printf("  [Z] %.3f rad\n",rad); return 0;
+}
+
+static int op_h(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok) gate_H(q->sdr, &q->wf);
+    printf("  [H] Hadamard\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_cz(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok){
+        double *prev_prob=malloc(q->wf.d*sizeof(double));
+        memcpy(prev_prob,q->wf.prob,q->wf.d*sizeof(double));
+        sdr_capture(q->sdr); wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        double *cp=malloc(q->wf.d*sizeof(double));
+        memcpy(cp,q->wf.prob,q->wf.d*sizeof(double));
+        for(int k=0;k<q->wf.d;k++){q->wf.prob[k]=prev_prob[k]*cp[k];q->wf.re[k]=sqrt(q->wf.prob[k]);q->wf.im[k]=0;}
+        qvm_norm(&q->wf); free(prev_prob);free(cp);
+    }
+    printf("  [CZ] Entangle\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_dft(QvmCtx *q, double a1, double a2){
+    int step=((int)a1)?(int)a1:1;
+    if(q->sdr_ok) gate_DFT(q->sdr,&q->wf,step);
+    printf("  [DFT] %+d bins\n",step); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_tx(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok) gate_tx_hardware(q->sdr,&q->wf);
+    printf("  [TX] Radiated\n"); return 0;
+}
+
+static int op_rx(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok){sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
+    printf("  [RX] Captured\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_measure(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    int o;
+    if(q->sdr_ok) o=gate_measure(q->sdr->iq_raw,q->sdr->iq_n*2,q->wf.prob,q->wf.d);
+    else o=rand()%q->wf.d;
+    printf("  [MEASURE] → |%d⟩\n",o);
+    memset(q->wf.re,0,q->wf.d*8); memset(q->wf.im,0,q->wf.d*8); memset(q->wf.prob,0,q->wf.d*8);
+    q->wf.re[o]=1.0;q->wf.prob[o]=1.0;q->wf.entropy=0;q->wf.purity=1.0; return 0;
+}
+
+static int op_tick(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->sdr_ok){gate_tx_hardware(q->sdr,&q->wf);sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
+    printf("  [TICK] TX→ether→RX\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_prob(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    printf("  [PROB]"); for(int k=0;k<q->wf.d;k++) printf(" |%d⟩=%.3f",k,q->wf.prob[k]);
+    printf("  S=%.3f γ=%.4f\n",q->wf.entropy,q->wf.purity); return 0;
+}
+
+static int op_show(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2; wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_dump(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    printf("  State vector:\n");
+    for(int i=0;i<q->wf.d;i++) printf("    |%d⟩ = %+.6f %+.6fi  |ψ|²=%.6f\n",i,q->wf.re[i],q->wf.im[i],q->wf.prob[i]);
+    return 0;
+}
+
+static int op_sample(QvmCtx *q, double a1, double a2){
+    int n=((int)a1)>0?(int)a1:100, counts[256]={0};
+    for(int s=0;s<n;s++){double r=(double)rand()/RAND_MAX,cum=0;int out=q->wf.d-1;
+        for(int k=0;k<q->wf.d;k++){cum+=q->wf.prob[k];if(r<=cum){out=k;break;}}if(out<256)counts[out]++;}
+    printf("  [SAMPLE] %d draws:\n  ",n);
+    for(int i=0;i<q->wf.d;i++) printf("|%d⟩:%-3d ",i,counts[i]);printf("\n"); return 0;
+}
+
+static int op_set(QvmCtx *q, double a1, double a2){
+    int k=(int)a1; if(k<0||k>=q->wf.d){printf("  [SET] out of range\n");return 0;}
+    q->wf.re[k]=a2;q->wf.im[k]=0; qvm_norm(&q->wf);
+    printf("  [SET] |%d⟩ = %.3f\n",k,a2); wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_reset(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    for(int i=0;i<q->wf.d;i++){q->wf.re[i]=1.0/sqrt(q->wf.d);q->wf.im[i]=0;q->wf.prob[i]=1.0/q->wf.d;}
+    q->wf.entropy=log2(q->wf.d);q->wf.purity=1.0/q->wf.d;
+    printf("  [RESET] Uniform\n"); wf_print(&q->wf,"|+⟩",-1); return 0;
+}
+
+static int op_swap(QvmCtx *q, double a1, double a2){
+    int a=(int)a1,b=(int)a2; if(a<0||a>=q->wf.d||b<0||b>=q->wf.d){printf("  [SWAP] range\n");return 0;}
+    double tr=q->wf.re[a],ti=q->wf.im[a],tp=q->wf.prob[a];
+    q->wf.re[a]=q->wf.re[b];q->wf.im[a]=q->wf.im[b];q->wf.prob[a]=q->wf.prob[b];
+    q->wf.re[b]=tr;q->wf.im[b]=ti;q->wf.prob[b]=tp;
+    printf("  [SWAP] |%d⟩ ⇄ |%d⟩\n",a,b); return 0;
+}
+
+static int op_invert(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2; for(int i=0;i<q->wf.d;i++) q->wf.im[i]=-q->wf.im[i];
+    printf("  [INVERT] Complex conjugate\n"); return 0;
+}
+
+static int op_scale(QvmCtx *q, double a1, double a2){
+    (void)a2; double sc=a1>1e-15?a1:1.0;
+    for(int i=0;i<q->wf.d;i++){q->wf.re[i]*=sc;q->wf.im[i]*=sc;} qvm_norm(&q->wf);
+    printf("  [SCALE] ×%.3f\n",sc); return 0;
+}
+
+static int op_purity(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2; printf("  γ=%.6f  S=%.4f bits\n",q->wf.purity,q->wf.entropy); return 0;
+}
+
+static int op_coherent(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    int np=IQ_WINDOW/2; TxBuf tx=tx_alloc(np,q->freq,q->rate);
+    tx_synthesize(&q->wf,&tx); tx_write_file(&tx,"/tmp/qvm_coherent.iq"); tx_free(&tx);
+    printf("  [COHERENT] OFDM → /tmp/qvm_coherent.iq\n"); return 0;
+}
+
+static int op_wait(QvmCtx *q, double a1, double a2){
+    (void)a2; int ms=((int)a1)>0?(int)a1:100;
+    printf("  [WAIT] %d ms\n",ms); usleep(ms*1000); return 0;
+}
+
+static int op_echo(QvmCtx *q, double a1, double a2){
+    (void)q;(void)a1;(void)a2; return 0; /* handled in dispatcher */
+}
+
+static int op_help(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    for(int i=0;i<q->n_ops;i++){if(q->ops[i].help[0])printf("  %-12s — %s\n",q->ops[i].name,q->ops[i].help);}
+    return 0;
+}
+
+static int op_quit(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2; q->running=0; return 1;
+}
+
+/* ── Extended: GPU offload instructions ── */
+static int op_calibrate(QvmCtx *q, double a1, double a2){
+    int n_avg=((int)a1)>0?(int)a1:4; (void)a2;
+    if(!q->sdr_ok){printf("  [CALIBRATE] No SDR\n");return 0;}
+    printf("  [CALIBRATE] M (%d averages)...\n",n_avg);
+    int d=q->wf.d;
+    if(q->M){for(int i=0;i<q->M_dim;i++)free(((double**)q->M)[i]);free(q->M);free(q->Minv);}
+    double **M=malloc(d*sizeof(double*)),**Mi=malloc(d*sizeof(double*));
+    for(int i=0;i<d;i++){M[i]=calloc(d,sizeof(double));Mi[i]=calloc(d,sizeof(double));}
+    double bw=(double)q->rate/d;
+    for(int k=0;k<d;k++){
+        uint32_t f=(uint32_t)q->freq+(uint32_t)(k*bw);
+        sdr_retune(q->sdr,f);usleep(8000);sdr_flush(q->sdr);
+        double sum[256]={0};int ncaps=0;
+        for(int a=0;a<n_avg;a++){
+            sdr_capture(q->sdr);int np=q->sdr->iq_n;if(np<d)continue;ncaps++;
+            for(int m=0;m<d;m++){double fn=(double)m/d,si=0,sq=0;
+                for(int n=0;n<np;n++){double ph=-2*M_PI*fn*n,c=cos(ph),s=sin(ph);si+=q->sdr->iq_i[n]*c-q->sdr->iq_q[n]*s;sq+=q->sdr->iq_i[n]*s+q->sdr->iq_q[n]*c;}
+                sum[m]+=(si*si+sq*sq)/(np*np);}
+        }
+        if(ncaps)for(int m=0;m<d;m++)M[k][m]=sum[m]/ncaps;
+    }
+    sdr_retune(q->sdr,(uint32_t)q->freq);
+    for(int i=0;i<d;i++){double rs=0;for(int j=0;j<d;j++)rs+=M[i][j];if(rs>1e-15)for(int j=0;j<d;j++)M[i][j]/=rs;}
+    printf("  M (%dx%d):\n",d,d);
+    for(int i=0;i<d;i++){printf("    ");for(int j=0;j<d;j++)printf("%.3f ",M[i][j]);printf("\n");}
+    q->M=(double*)M;q->Minv=(double*)Mi;q->M_dim=d;
+    return 0;
+}
+
+static int op_solve(QvmCtx *q, double a1, double a2){
+    int n=((int)a1)>0?(int)a1:5;(void)a2;
+    if(n<3)n=3;if(n>10)n=10;int sd=1<<n;
+    if(!q->sdr_ok){printf("  [SOLVE] No SDR\n");return 0;}
+    int items[12];srand(time(NULL));
+    printf("  [SOLVE] n=%d items: [",n);for(int i=0;i<n;i++){items[i]=rand()%100+1;printf("%d ",items[i]);}
+    int *sol=calloc(sd,sizeof(int)),ns=0,tg=0;
+    for(int a=0;a<50;a++){int m=rand()%sd;tg=0;for(int i=0;i<n;i++)if(m&(1<<i))tg+=items[i];
+        ns=0;memset(sol,0,sd*sizeof(int));
+        for(int s=0;s<sd;s++){int sm=0;for(int i=0;i<n;i++)if(s&(1<<i))sm+=items[i];if(sm==tg){sol[s]=1;ns++;}}
+        if(ns>=1&&ns<=sd/2&&tg>0)break;}
+    printf("] target=%d sols=%d/%d\n",tg,ns,sd);
+    double bw=(double)q->rate/sd;int dw=500;
+    for(int s=0;s<sd;s++){if(sol[s])continue;uint32_t f=(uint32_t)q->freq+(uint32_t)(s*bw);if(f<24000000)f=24000000;if(f>1750000000)f=1750000000;sdr_retune(q->sdr,f);usleep(dw);}
+    sdr_retune(q->sdr,(uint32_t)q->freq);usleep(500);sdr_flush(q->sdr);sdr_capture(q->sdr);
+    int np=q->sdr->iq_n;if(np<sd)np=sd;double*pwr=calloc(sd,sizeof(double));
+    for(int b=0;b<sd;b++){double fn=(double)b/sd,si=0,sq=0;
+        for(int n=0;n<np;n++){double ph=-2*M_PI*fn*n,c=cos(ph),s=sin(ph);si+=q->sdr->iq_i[n]*c-q->sdr->iq_q[n]*s;sq+=q->sdr->iq_i[n]*s+q->sdr->iq_q[n]*c;}
+        pwr[b]=(si*si+sq*sq)/((double)np*np);}
+    double*srt=malloc(sd*sizeof(double));memcpy(srt,pwr,sd*sizeof(double));
+    for(int i=0;i<sd-1;i++)for(int j=i+1;j<sd;j++)if(srt[i]>srt[j]){double t=srt[i];srt[i]=srt[j];srt[j]=t;}
+    double med=srt[sd/2],th=med*0.5;free(srt);
+    int fnd=0,cor=0;
+    for(int s=0;s<sd;s++)if(pwr[s]<th){fnd++;if(sol[s])cor++;printf("  bin %3d [",s);for(int i=n-1;i>=0;i--)printf("%d",(s>>i)&1);int sm=0;for(int i=0;i<n;i++)if(s&(1<<i))sm+=items[i];printf("] sum=%d pwr=%.2e %s\n",sm,pwr[s],sol[s]?"✓":"✗");}
+    for(int s=0;s<sd;s++)if(sol[s]&&pwr[s]>=th){int sm=0;for(int i=0;i<n;i++)if(s&(1<<i))sm+=items[i];printf("  ★ solution bin %d pwr=%.2e (missed)\n",s,pwr[s]);}
+    printf("  Found %d/%d (%.0f%%)\n",cor,ns,ns>0?100.0*cor/ns:0);
+    free(sol);free(pwr);return 0;
+}
+
+static int op_bench(QvmCtx *q, double a1, double a2){
+    int bd=((int)a1)>0?(int)a1:8;(void)a2;
+    if(bd<4)bd=4;if(bd>MAX_DIM)bd=MAX_DIM;
+    double*ba=calloc(bd*bd,sizeof(double)),*bx=calloc(bd,sizeof(double)),*by=calloc(bd,sizeof(double));
+    srand(42);for(int i=0;i<bd*bd;i++)ba[i]=(rand()%100)/100.0;for(int i=0;i<bd;i++)bx[i]=(rand()%100)/100.0;
+    clock_t t0=clock();
+    for(int t=0;t<100;t++)for(int i=0;i<bd;i++){by[i]=0;for(int j=0;j<bd;j++)by[i]+=ba[i*bd+j]*bx[j];}
+    double cpu_us=(double)(clock()-t0)*1000000.0/CLOCKS_PER_SEC/100.0;
+    if(q->sdr_ok){clock_t t1=clock();
+        double bw=(double)q->rate/bd;
+        for(int j=0;j<bd;j++){int dw=(int)(bx[j]/1.0*500+30);uint32_t f=(uint32_t)q->freq+(uint32_t)(j*bw);sdr_retune(q->sdr,f);usleep(dw);}
+        sdr_retune(q->sdr,(uint32_t)q->freq);usleep(500);sdr_flush(q->sdr);sdr_capture(q->sdr);
+        double room_us=(double)(clock()-t1)*1000000.0/CLOCKS_PER_SEC;
+        printf("  [BENCH] %dx%d  CPU:%.1fμs/iter  Room:%.0fμs  ratio:%.1fx\n",bd,bd,cpu_us,room_us,cpu_us/room_us*100.0);
+    }else{printf("  [BENCH] %dx%d  CPU:%.1fμs (no SDR)\n",bd,bd,cpu_us);}
+    free(ba);free(bx);free(by);return 0;
+}
+
+/* ── LOOP / END (special: access script state) ── */
+static int op_loop(QvmCtx *q, double a1, double a2){
+    int count=((int)a1)>0?(int)a1:1;(void)a2;
+    if(!q->interactive){q->loop_stack=realloc(q->loop_stack,(q->loop_depth+2)*sizeof(int));
+        q->loop_stack[q->loop_depth++]=q->ip;q->loop_stack[q->loop_depth++]=count;printf("  [LOOP] ×%d\n",count);}
+    else printf("  [LOOP] script only\n"); return 0;
+}
+static int op_end(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->loop_depth>=2&&!q->interactive){int ct=q->loop_stack[--q->loop_depth];int st=q->loop_stack[--q->loop_depth];
+        if(--ct>0){q->loop_stack[q->loop_depth++]=st;q->loop_stack[q->loop_depth++]=ct;q->ip=st;}}return 0;
+}
+
+/* ── Register all standard ops ── */
+static void qvm_init_ops(QvmCtx *q){
+    qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
+    qvm_reg(q, "SUPERPOSE", op_superpose, "coherent decomposition");
+    qvm_reg(q, "SP",        op_superpose, "alias for SUPERPOSE");
+    qvm_reg(q, "X",         op_x,         "cyclic shift [n=1]");
+    qvm_reg(q, "Z",         op_z,         "phase rotate [rad=π/4] [k=-1=all]");
+    qvm_reg(q, "H",         op_h,         "Hadamard via LO hop");
+    qvm_reg(q, "CZ",        op_cz,        "entangle via power correlation");
+    qvm_reg(q, "DFT",       op_dft,       "LO retune [step=1]");
+    qvm_reg(q, "TX",        op_tx,        "radiate into ether");
+    qvm_reg(q, "RX",        op_rx,        "capture from ether");
+    qvm_reg(q, "MEASURE",   op_measure,   "Born-rule collapse");
+    qvm_reg(q, "M",         op_measure,   "alias for MEASURE");
+    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
+    qvm_reg(q, "PROB",      op_prob,      "show probabilities");
+    qvm_reg(q, "P",         op_prob,      "alias for PROB");
+    qvm_reg(q, "SHOW",      op_show,      "show state");
+    qvm_reg(q, "S",         op_show,      "alias for SHOW");
+    qvm_reg(q, "DUMP",      op_dump,      "full state vector");
+    qvm_reg(q, "SAMPLE",    op_sample,    "Born-rule sampling [n=100]");
+    qvm_reg(q, "SET",       op_set,       "set |k⟩ amplitude");
+    qvm_reg(q, "RESET",     op_reset,     "uniform superposition");
+    qvm_reg(q, "SWAP",      op_swap,      "swap |a⟩ and |b⟩");
+    qvm_reg(q, "INVERT",    op_invert,    "complex conjugate");
+    qvm_reg(q, "SCALE",     op_scale,     "scale amplitudes");
+    qvm_reg(q, "PURITY",    op_purity,    "show purity/entropy");
+    qvm_reg(q, "COHERENT",  op_coherent,  "OFDM synthesis → file");
+    qvm_reg(q, "WAIT",      op_wait,      "idle [ms=100]");
+    qvm_reg(q, "ECHO",      op_echo,      "print text");
+    qvm_reg(q, "LOOP",      op_loop,      "start loop [n=1]");
+    qvm_reg(q, "END",       op_end,       "end loop block");
+    qvm_reg(q, "HELP",      op_help,      "this list");
+    qvm_reg(q, "?",         op_help,      "alias for HELP");
+    qvm_reg(q, "QUIT",      op_quit,      "exit VM");
+    qvm_reg(q, "EXIT",      op_quit,      "alias for QUIT");
+    qvm_reg(q, "Q",         op_quit,      "alias for QUIT");
+    qvm_reg(q, "CALIBRATE", op_calibrate, "measure room channel M [avg=4]");
+    qvm_reg(q, "SOLVE",     op_solve,     "subset sum via room [n=5]");
+    qvm_reg(q, "BENCH",     op_bench,     "room vs CPU matvec [D=8]");
+}
+
+/* ── qvm_eval: parse & dispatch one instruction ── */
+static int qvm_eval(QvmCtx *q, const char *cmd){
+    char op[32]={0}; double a1=0,a2=0;
+    sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
+    if(!op[0]) return 0;
+
+    QvmOp fn = qvm_lookup(q, op);
+    if (!fn) { printf("  ? Unknown: %s\n", op); return 0; }
+    if (fn == op_echo) { printf("  %s\n", cmd+4); return 0; }
+
+    int rc = fn(q, a1, a2);
+
+    /* Auto-sync with ether after mutating instructions */
+    if (q->sdr_ok && q->running && rc >= 0) {
+        int nosync = (fn==op_loop||fn==op_end||fn==op_wait||fn==op_echo||
+                      fn==op_help||fn==op_quit||fn==op_prob||fn==op_show||
+                      fn==op_dump||fn==op_purity||fn==op_sample||
+                      fn==op_bench||fn==op_calibrate||fn==op_solve);
+        if (!nosync) qvm_sync(q);
+    }
+    return rc;
+}
+
+/* ── qvm_create / qvm_destroy ── */
+static QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
+    QvmCtx *q = calloc(1, sizeof(QvmCtx));
+    if (!q) return NULL;
+    q->freq = freq; q->rate = rate;
+    q->sdr = calloc(1, sizeof(SdrDev));
+    q->sdr_ok = (sdr_open(q->sdr, freq, rate, gain) == 0);
+    q->wf = wf_alloc(D, freq, rate);
+    if (q->sdr_ok) {
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+    } else {
+        for (int k=0;k<D;k++) { q->wf.re[k]=1.0/sqrt(D); q->wf.prob[k]=1.0/D; }
+        q->wf.purity=1.0/D; q->wf.entropy=log2(D);
+    }
+    q->running = 1;
+    qvm_init_ops(q);
+    return q;
+}
+
+static void qvm_destroy(QvmCtx *q){
+    if (!q) return;
+    if (q->sdr_ok) sdr_close(q->sdr);
+    free(q->sdr);
+    wf_free(&q->wf);
+    if (q->M) {
+        for (int i=0;i<q->M_dim;i++) free(((double**)q->M)[i]);
+        free(q->M); free(q->Minv);
+    }
+    for (int i=0;i<q->nlines;i++) free(q->lines[i]);
+    free(q->lines); free(q->loop_stack);
+    free(q);
+}
+
+/* ── qvm_run: REPL / script execution ── */
+static int qvm_run(QvmCtx *q, const char *script_path){
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════╗\n");
-    printf("  ║  QUANTUM VM — Ether-native instruction set                   ║\n");
+    printf("  ║  QUANTUM VM — Ether-native instruction set (API v2)          ║\n");
     printf("  ║  D=%d  |  %.1f MHz  |  %.2f MSPS  |  Δf=%.1f Hz            ║\n",
-           D, freq/1e6, rate/1e6, (double)rate/D);
+           q->wf.d, q->freq/1e6, q->rate/1e6, (double)q->rate/q->wf.d);
     printf("  ║  Substrate: %-50s ║\n",
-           sdr_ok ? "PHYSICAL (RTL-SDR + EM field)" : "SIMULATED");
-    printf("  ║  Superposition: DFT of ambient RF across %d bins             ║\n", D);
+           q->sdr_ok ? "PHYSICAL (RTL-SDR + EM field)" : "SIMULATED");
+    printf("  ║  %d instructions registered                                  ║\n", q->n_ops);
     printf("  ╚══════════════════════════════════════════════════════════════╝\n");
+    printf("\n  VM ready. %s\n\n",
+           q->sdr_ok?"Physical ether substrate active.":"No SDR — software fallback.");
+    wf_print(&q->wf, "|ψ⟩ init", -1);
 
-    Wavefunction wf = wf_alloc(D, (uint32_t)freq, (uint32_t)rate);
-
-    if (sdr_ok) { sdr_capture(&sdr); wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf); }
-    else { for (int k=0;k<D;k++) wf.re[k]=1.0/sqrt(D);
-           for (int k=0;k<D;k++) wf.prob[k]=1.0/D;
-           wf.purity=1.0/D; wf.entropy=log2(D); }
-
-    printf("\n  VM ready.  %s\n\n",
-           sdr_ok ? "Physical ether substrate active." : "No SDR — software fallback.");
-    wf_print(&wf, "|ψ⟩ init", -1);
-
-    FILE *script = NULL;
-    int interactive = (!script_path || strcmp(script_path, "-") == 0);
-    if (!interactive) {
-        script = fopen(script_path, "r");
-        if (!script) { fprintf(stderr, "[VM] Cannot open %s\n", script_path); return 1; }
-    }
-    FILE *in = interactive ? stdin : script;
-
-    /* Pre-load script into array for LOOP support */
-    char **lines = NULL;
-    int nlines = 0;
-    if (!interactive) {
+    q->interactive = (!script_path || strcmp(script_path,"-")==0);
+    if (!q->interactive) {
+        FILE *f = fopen(script_path, "r");
+        if (!f) { fprintf(stderr,"[VM] Cannot open %s\n",script_path); return 1; }
         char lbuf[512];
-        lines = malloc(1024 * sizeof(char*));
-        while (fgets(lbuf, sizeof(lbuf), in) && nlines < 1024) {
-            char *nl = strchr(lbuf, '\n'); if (nl) *nl = 0;
-            char *cmt = strchr(lbuf, '#'); if (cmt) *cmt = 0;
-            char *s = lbuf; while (*s==' '||*s=='\t') s++;
-            if (*s) lines[nlines++] = strdup(s);
+        q->lines = malloc(1024*sizeof(char*));
+        while (fgets(lbuf,sizeof(lbuf),f) && q->nlines<1024) {
+            char *nl=strchr(lbuf,'\n');if(nl)*nl=0;
+            char *cmt=strchr(lbuf,'#');if(cmt)*cmt=0;
+            char *s=lbuf; while(*s==' '||*s=='\t')s++;
+            if(*s) q->lines[q->nlines++]=strdup(s);
         }
-        fclose(script); script = NULL;
+        fclose(f);
     }
 
-    int ip = 0;
-    int *loop_stack = NULL;
-    int loop_depth = 0;
-    int running = 1;
-
-    while (running) {
-        char line[512];
-        int lineno;
-
-        if (!interactive) {
-            if (ip >= nlines) break;
-            strcpy(line, lines[ip]);
-            lineno = ip + 1;
-            ip++;
+    while (q->running) {
+        char line[512]={0};
+        if (!q->interactive) {
+            if (q->ip >= q->nlines) break;
+            strcpy(line, q->lines[q->ip++]);
         } else {
-            if (interactive) {
-                printf("\n  qvm> ");
-                fflush(stdout);
-            }
-            if (!fgets(line, sizeof(line), stdin)) break;
-            char *nl = strchr(line, '\n'); if (nl) *nl = 0;
-            char *cmt = strchr(line, '#'); if (cmt) *cmt = 0;
-            lineno = 0;
+            printf("\n  qvm> "); fflush(stdout);
+            if (!fgets(line,sizeof(line),stdin)) break;
+            char *nl=strchr(line,'\n'); if(nl)*nl=0;
+            char *cmt=strchr(line,'#'); if(cmt)*cmt=0;
+            char *s=line; while(*s==' '||*s=='\t')s++;
+            if(*s==0) continue;
+            /* In interactive mode, shift the command to start */
+            if (s != line) memmove(line, s, strlen(s)+1);
         }
-
-        char *cmd = line;
-        while (*cmd == ' ' || *cmd == '\t') cmd++;
-        if (*cmd == 0) continue;
-
-        char op[32] = {0};
-        double arg1 = 0, arg2 = 0;
-        int iarg1 = 0, iarg2 = 0;
-        int nscan = sscanf(cmd, "%31s %lf %lf", op, &arg1, &arg2);
-        iarg1 = (int)arg1; iarg2 = (int)arg2;
-        (void)nscan;
-
-        /* ── Control flow ── */
-        if (strcasecmp(op, "LOOP") == 0) {
-            int count = iarg1 > 0 ? iarg1 : 1;
-            if (!interactive) {
-                loop_stack = realloc(loop_stack, (loop_depth+2)*sizeof(int));
-                loop_stack[loop_depth++] = ip;
-                loop_stack[loop_depth++] = count;
-                printf("  [LOOP] ×%d\n", count);
-            } else {
-                printf("  [LOOP] Not supported in interactive mode\n");
-            }
-            continue;
-        }
-        else if (strcasecmp(op, "END") == 0) {
-            if (loop_depth >= 2 && !interactive) {
-                int count = loop_stack[--loop_depth];
-                int start = loop_stack[--loop_depth];
-                count--;
-                if (count > 0) {
-                    loop_stack[loop_depth++] = start;
-                    loop_stack[loop_depth++] = count;
-                    ip = start;
-                }
-            }
-            continue;
-        }
-
-        if (strcasecmp(op, "INIT") == 0) {
-            if (sdr_ok) { sdr_capture(&sdr);
-                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf); }
-            printf("  [INIT] Fresh capture from ether\n");
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "SUPERPOSE") == 0 || strcasecmp(op, "SP") == 0) {
-            if (sdr_ok) {
-                sdr_capture(&sdr);
-                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
-            }
-            printf("  [SUPERPOSE] %d-level coherent decomposition\n", D);
-            wf_print(&wf, "|ψ⟩ sup", lineno);
-        }
-        else if (strcasecmp(op, "X") == 0) {
-            int shift = iarg1 ? iarg1 : 1;
-            shift = ((shift % D) + D) % D;
-            for (int s = 0; s < shift; s++) gate_X(&wf);
-            printf("  [X] Shift +%d\n", shift);
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "Z") == 0) {
-            double rad = arg1 ? arg1 : M_PI / 4.0;
-            int target = iarg2 ? iarg2 : -1;
-            if (target >= D) target = -1;
-            gate_Z(&wf, rad, target);
-            printf("  [Z] %.3f rad %s\n", rad, target<0?"(all)":"");
-        }
-        else if (strcasecmp(op, "H") == 0) {
-            if (sdr_ok) gate_H(&sdr, &wf);
-            printf("  [H] Hadamard\n");
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "CZ") == 0) {
-            if (sdr_ok) {
-                /* Power-correlation CZ: product of two captures' probabilities.
-                 * This is robust against phase decorrelation in ambient RF. */
-                double *prev_prob = malloc(D * sizeof(double));
-                memcpy(prev_prob, wf.prob, D * sizeof(double));
-                sdr_capture(&sdr);
-                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
-                double *curr_prob = malloc(D * sizeof(double));
-                memcpy(curr_prob, wf.prob, D * sizeof(double));
-                double total = 0;
-                for (int k = 0; k < D; k++) {
-                    wf.prob[k] = prev_prob[k] * curr_prob[k];
-                    wf.re[k] = sqrt(wf.prob[k]);
-                    wf.im[k] = 0;
-                    total += wf.prob[k];
-                }
-                if (total > 1e-15) for (int k=0;k<D;k++) wf.prob[k]/=total;
-                wf.entropy = 0; wf.purity = 0;
-                for (int k=0;k<D;k++) {
-                    if (wf.prob[k]>1e-15) wf.entropy-=wf.prob[k]*log2(wf.prob[k]);
-                    wf.purity += wf.prob[k]*wf.prob[k];
-                }
-                free(prev_prob); free(curr_prob);
-            }
-            printf("  [CZ] Entangle (power correlation)\n");
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "DFT") == 0) {
-            int step = iarg1 ? iarg1 : 1;
-            if (sdr_ok) gate_DFT(&sdr, &wf, step);
-            printf("  [DFT] LO %+d bins\n", step);
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "TX") == 0) {
-            if (sdr_ok) gate_tx_hardware(&sdr, &wf);
-            printf("  [TX] Radiated\n");
-        }
-        else if (strcasecmp(op, "RX") == 0) {
-            if (sdr_ok) { sdr_capture(&sdr);
-                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf); }
-            printf("  [RX] Captured\n");
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "MEASURE") == 0 || strcasecmp(op, "M") == 0) {
-            int outcome;
-            if (sdr_ok) outcome = gate_measure(sdr.iq_raw, sdr.iq_n*2, wf.prob, D);
-            else outcome = rand() % D;
-            printf("  [MEASURE] → |%d⟩\n", outcome);
-            memset(wf.re, 0, D*sizeof(double));
-            memset(wf.im, 0, D*sizeof(double));
-            memset(wf.prob, 0, D*sizeof(double));
-            wf.re[outcome] = 1.0; wf.prob[outcome] = 1.0;
-            wf.entropy = 0; wf.purity = 1.0;
-        }
-        else if (strcasecmp(op, "TICK") == 0) {
-            if (sdr_ok) {
-                gate_tx_hardware(&sdr, &wf);
-                sdr_capture(&sdr);
-                wf_from_iq(sdr.iq_i, sdr.iq_q, sdr.iq_n, &wf);
-            }
-            printf("  [TICK] TX→ether→RX\n");
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "PROB") == 0 || strcasecmp(op, "P") == 0) {
-            printf("  [PROB]");
-            for (int k=0;k<D;k++) printf(" |%d⟩=%.3f", k, wf.prob[k]);
-            printf("  S=%.3f γ=%.4f\n", wf.entropy, wf.purity);
-        }
-        else if (strcasecmp(op, "SHOW") == 0 || strcasecmp(op, "S") == 0) {
-            wf_print(&wf, "|ψ⟩", lineno);
-        }
-        else if (strcasecmp(op, "COHERENT") == 0) {
-            TxBuf tx = tx_alloc(npairs, (uint32_t)freq, (uint32_t)rate);
-            tx_synthesize(&wf, &tx);
-            printf("  [COHERENT] %d-pair OFDM superposition synthesized\n", npairs);
-            tx_write_file(&tx, "/tmp/qvm_coherent.iq");
-            tx_free(&tx);
-        }
-        else if (strcasecmp(op, "WAIT") == 0) {
-            int ms = iarg1 > 0 ? iarg1 : 100;
-            printf("  [WAIT] %d ms — ether computing…\n", ms);
-            usleep(ms * 1000);
-        }
-        else if (strcasecmp(op, "ECHO") == 0) {
-            printf("  %s\n", cmd + 4);
-        }
-        /* ── Extended VM instructions ── */
-        else if (strcasecmp(op, "SET") == 0) {
-            int k = iarg1; if (k<0||k>=D) { printf("  [SET] level out of range\n"); continue; }
-            wf.re[k]=arg2; wf.im[k]=0;
-            double t=0; for(int i=0;i<D;i++) t+=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];
-            if(t>1e-15){double sc=1.0/sqrt(t); for(int i=0;i<D;i++){wf.re[i]*=sc;wf.im[i]*=sc;}}
-            for(int i=0;i<D;i++) wf.prob[i]=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];
-            wf.entropy=0; wf.purity=0;
-            for(int i=0;i<D;i++){if(wf.prob[i]>1e-15)wf.entropy-=wf.prob[i]*log2(wf.prob[i]);wf.purity+=wf.prob[i]*wf.prob[i];}
-            printf("  [SET] |%d⟩ = %.3f\n",k,arg2);
-            wf_print(&wf,"|ψ⟩",lineno);
-        }
-        else if (strcasecmp(op, "RESET") == 0) {
-            for(int i=0;i<D;i++){wf.re[i]=1.0/sqrt(D);wf.im[i]=0;wf.prob[i]=1.0/D;}
-            wf.entropy=log2(D);wf.purity=1.0/D;
-            printf("  [RESET] Uniform superposition\n");
-            wf_print(&wf,"|+⟩",lineno);
-        }
-        else if (strcasecmp(op, "SWAP") == 0) {
-            int a=iarg1,b=iarg2; if(a<0||a>=D||b<0||b>=D){printf("  [SWAP] out of range\n");continue;}
-            double tr=wf.re[a],ti=wf.im[a],tp=wf.prob[a];
-            wf.re[a]=wf.re[b];wf.im[a]=wf.im[b];wf.prob[a]=wf.prob[b];
-            wf.re[b]=tr;wf.im[b]=ti;wf.prob[b]=tp;
-            printf("  [SWAP] |%d⟩ ⇄ |%d⟩\n",a,b);
-            wf_print(&wf,"|ψ⟩",lineno);
-        }
-        else if (strcasecmp(op, "INVERT") == 0) {
-            for(int i=0;i<D;i++) wf.im[i]=-wf.im[i];
-            printf("  [INVERT] Complex conjugate (time reversal)\n");
-        }
-        else if (strcasecmp(op, "SCALE") == 0) {
-            double sc = arg1>1e-15?arg1:1.0; double t=0;
-            for(int i=0;i<D;i++){wf.re[i]*=sc;wf.im[i]*=sc;t+=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];}
-            if(t>1e-15){double ns=1.0/sqrt(t);for(int i=0;i<D;i++){wf.re[i]*=ns;wf.im[i]*=ns;}}
-            for(int i=0;i<D;i++) wf.prob[i]=wf.re[i]*wf.re[i]+wf.im[i]*wf.im[i];
-            printf("  [SCALE] ×%.3f\n",sc);
-        }
-        else if (strcasecmp(op, "PURITY") == 0) {
-            printf("  Purity γ=%.6f  Entropy S=%.4f bits\n",wf.purity,wf.entropy);
-        }
-        else if (strcasecmp(op, "DUMP") == 0) {
-            printf("  State vector:\n");
-            for(int i=0;i<D;i++) printf("    |%d⟩ = %+.6f %+.6fi  |ψ|²=%.6f\n",i,wf.re[i],wf.im[i],wf.prob[i]);
-        }
-        else if (strcasecmp(op, "SAMPLE") == 0) {
-            int n = iarg1>0?iarg1:100, counts[256]={0};
-            for(int s=0;s<n;s++){
-                double r=(double)rand()/RAND_MAX,cum=0; int out=D-1;
-                for(int k=0;k<D;k++){cum+=wf.prob[k];if(r<=cum){out=k;break;}}
-                if(out<256) counts[out]++;
-            }
-            printf("  [SAMPLE] %d Born-rule draws:\n  ",n);
-            for(int i=0;i<D;i++) printf("|%d⟩:%-3d ",i,counts[i]);
-            printf("\n  Expected: ");
-            for(int i=0;i<D;i++) printf("|%d⟩:%.2f ",i,(double)counts[i]/n);
-            printf("\n");
-        }
-        else if (strcasecmp(op, "HELP") == 0 || strcasecmp(op, "?") == 0) {
-            printf("  INIT SUPERPOSE X Z H CZ DFT TX RX MEASURE TICK\n");
-            printf("  SET RESET SWAP INVERT SCALE SAMPLE PURITY DUMP\n");
-            printf("  PROB SHOW COHERENT WAIT ECHO LOOP END HELP QUIT\n");
-        }
-        else if (strcasecmp(op, "QUIT") == 0 || strcasecmp(op, "EXIT") == 0 ||
-                 strcasecmp(op, "Q") == 0) {
-            running = 0;
-        }
-        else {
-            printf("  ? Unknown: %s\n", op);
-        }
-
-        /* ── After each instruction: re-sync state with the ether.
-         * The ether IS the quantum state.  Software wf is a cache.
-         * Mutating instructions dirty the cache; ether_emit+ether_read
-         * projects the state into the EM field and reads it back. */
-        if (sdr_ok && running) {
-            int dirty = (strcasecmp(op,"LOOP") && strcasecmp(op,"END") &&
-                         strcasecmp(op,"WAIT") && strcasecmp(op,"ECHO") &&
-                         strcasecmp(op,"HELP") && strcasecmp(op,"?") &&
-                         strcasecmp(op,"QUIT") && strcasecmp(op,"EXIT") &&
-                         strcasecmp(op,"Q") && strcasecmp(op,"PROB") &&
-                         strcasecmp(op,"P") && strcasecmp(op,"SHOW") &&
-                         strcasecmp(op,"S") && strcasecmp(op,"DUMP") &&
-                         strcasecmp(op,"PURITY") && strcasecmp(op,"SAMPLE"));
-            if (dirty) {
-                ether_emit(&sdr, &wf);
-                ether_read(&sdr, &wf);
-            }
-        }
+        if (line[0]==0) continue;
+        qvm_eval(q, line);
     }
-
-    printf("\n  ★ VM halted.  Ether substrate released. ★\n\n");
-
-    for (int i = 0; i < nlines; i++) free(lines[i]);
-    free(lines);
-    free(loop_stack);
-    wf_free(&wf);
-    if (sdr_ok) sdr_close(&sdr);
+    printf("\n  ★ VM halted. ★\n\n");
     return 0;
+}
+
+/* ── Top-level entry point (replaces run_quantum_vm) ── */
+static int run_quantum_vm(uint32_t freq, uint32_t rate, int gain, int D,
+                           const char *script_path) {
+    QvmCtx *q = qvm_create(freq, rate, D, gain);
+    if (!q) return 1;
+    int rc = qvm_run(q, script_path);
+    qvm_destroy(q);
+    return rc;
 }
 
 /* ═══════════════════════════════════════════════════════════════
