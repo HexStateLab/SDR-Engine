@@ -19,6 +19,8 @@
  *   --loopback    TX→ether channel→RX in software, no hardware needed
  *   --tx-only     Synthesize I/Q, write CU8 to stdout for SDR transmitter
  *   --tx-file F   Synthesize I/Q, write CU8 to file F
+ *   --ofdm        OFDM multi-tone: fixed LO, simultaneous subcarriers
+ *   --ofdm-file F OFDM multi-tone output to file F
  *   --cycles N    Run N TX→ether→RX→gate feedback cycles
  *   --snr-db N    Ether channel SNR for loopback (default 30 dB)
  *   --fading 1    Enable frequency-selective fading in loopback ether
@@ -820,6 +822,56 @@ static void gate_tx_hardware(SdrDev *s, const Wavefunction *wf) {
     int queued = sdr_tx_wavefunction(s, wf->prob, d, base, bw, 15000);
     fprintf(stderr, "  [GATE:TX-HW] Queued %d tones (%.1f ms total)\n",
             queued, queued * 15.0);
+}
+
+/*
+ * GATE: OFDM TX — Simultaneous multi-tone via DMA buffer write-back
+ *
+ * Fixed LO.  Synthesizes OFDM baseband I/Q from wavefunction,
+ * writes CU8 into mmap'd capture buffer, QBUF with TX flag (0x0001).
+ * Custom RTL-SDR firmware reads buffer → DAC → R820T2 upconverts.
+ * All subcarriers radiate simultaneously through the room.
+ */
+static void gate_ofdm_tx(SdrDev *s, const Wavefunction *wf, const char *outfile){
+    int D=wf->d, N=IQ_WINDOW/2;
+    double *tx_i=calloc(N,sizeof(double)),*tx_q=calloc(N,sizeof(double));
+
+    for(int k=0;k<D;k++){
+        double re=wf->re[k],im=wf->im[k];
+        if(re*re+im*im<1e-30)continue;
+        double fn=(double)k/D;
+        for(int n=0;n<N;n++){
+            double ph=2*M_PI*fn*n,c=cos(ph),s=sin(ph);
+            tx_i[n]+=re*c-im*s;tx_q[n]+=re*s+im*c;
+        }
+    }
+    double peak=0;for(int n=0;n<N;n++){double m=fabs(tx_i[n]);if(fabs(tx_q[n])>m)m=fabs(tx_q[n]);if(m>peak)peak=m;}
+    if(peak>1e-15){double sc=0.9/peak;for(int n=0;n<N;n++){tx_i[n]*=sc;tx_q[n]*=sc;}}
+
+    /* Dequeue a capture buffer, write CU8, re-queue with TX flag */
+    struct v4l2_buffer b;memset(&b,0,sizeof(b));
+    b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+    if(ioctl(s->fd,VIDIOC_DQBUF,&b)==0 && b.index<BUF_COUNT && s->bufs[b.index]){
+        int ns=b.bytesused/2;if(ns>N)ns=N;
+        for(int n=0;n<ns;n++){
+            int iv=(int)(tx_i[n]*127.5+127.5);iv=iv<0?0:(iv>255?255:iv);
+            int qv=(int)(tx_q[n]*127.5+127.5);qv=qv<0?0:(qv>255?255:qv);
+            s->bufs[b.index][2*n]=iv;s->bufs[b.index][2*n+1]=qv;
+        }
+        b.flags|=0x0001; /* TX flag for custom firmware */
+        ioctl(s->fd,VIDIOC_QBUF,&b);
+        fprintf(stderr,"  [GATE:OFDM] %d subcarriers → DMA buf %d (%d I/Q)\n",D,b.index,ns);
+    }
+
+    /* Also write to file if requested */
+    if(outfile){
+        uint8_t *cu8=malloc(N*2);
+        for(int n=0;n<N;n++){cu8[2*n]=(uint8_t)(tx_i[n]*127.5+127.5);cu8[2*n+1]=(uint8_t)(tx_q[n]*127.5+127.5);}
+        FILE*fp=(strcmp(outfile,"-")==0)?stdout:fopen(outfile,"wb");
+        if(fp){fwrite(cu8,1,N*2,fp);if(fp!=stdout)fclose(fp);}
+        free(cu8);
+    }
+    free(tx_i);free(tx_q);
 }
 
 /*
@@ -3814,6 +3866,7 @@ int main(int argc, char **argv) {
 
     int    mode_loopback       = 0;
     int    mode_tx_only        = 0;
+    int    mode_ofdm           = 0;
     int    mode_rx_only        = 0;
     int    mode_physical       = 0;
     int    mode_ether_transfer = 0;
@@ -3882,6 +3935,10 @@ int main(int argc, char **argv) {
             mode_rx_only = 1; idx++;
         } else if (strcmp(argv[idx], "--tx-file") == 0 && idx + 1 < argc) {
             mode_tx_only = 1; tx_outfile = argv[idx+1]; idx += 2;
+        } else if (strcmp(argv[idx], "--ofdm") == 0) {
+            mode_ofdm = 1; idx++;
+        } else if (strcmp(argv[idx], "--ofdm-file") == 0 && idx + 1 < argc) {
+            mode_ofdm = 1; tx_outfile = argv[idx+1]; idx += 2;
         } else if (strcmp(argv[idx], "--cycles") == 0 && idx + 1 < argc) {
             g_cycles = atoi(argv[idx+1]); idx += 2;
         } else if (strcmp(argv[idx], "--snr-db") == 0 && idx + 1 < argc) {
@@ -3912,6 +3969,17 @@ int main(int argc, char **argv) {
 
     if (mode_tx_only) {
         return run_tx_only(freq, rate, D, tx_outfile);
+    }
+    if (mode_ofdm) {
+        sdr_find();
+        int has_sdr = (access(g_sdr_dev, R_OK|W_OK) == 0);
+        if (!has_sdr) { fprintf(stderr,"[OFDM] Needs SDR for ambient capture\n"); return 1; }
+        SdrDev sdr; if (sdr_open(&sdr, freq, rate, gain)!=0) return 1;
+        Wavefunction wf=wf_alloc(D,freq,rate);
+        sdr_capture(&sdr); wf_from_iq(sdr.iq_i,sdr.iq_q,sdr.iq_n,&wf);
+        gate_ofdm_tx(&sdr,&wf,tx_outfile);
+        wf_free(&wf); sdr_close(&sdr);
+        return 0;
     }
     if (mode_rx_only) {
         return run_rx_only(freq, rate, gain, D);
