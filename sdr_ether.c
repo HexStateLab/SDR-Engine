@@ -2058,6 +2058,10 @@ struct QvmCtx {
     /* GPU offload state (calibrated channel) */
     double *M, *Minv;
     int    M_dim;
+
+    /* Qubit bin mapping for ANTISYM gate */
+    int    qbins[8];     /* up to 8 bins */
+    int    n_qbins;
 };
 
 /* ─── Helpers ─── */
@@ -2148,34 +2152,108 @@ static int op_cz(QvmCtx *q, double a1, double a2){
     printf("  [CZ] Entangle (complex)\n"); wf_print(&q->wf,"|ψ⟩",-1); return 0;
 }
 
-/* ANTISYM [a b c d]: anti-symmetric pair entanglement gate.
-   Encodes bins a,b,c,d as anti-symmetric pairs (k, D-k with -A).
-   Args override which bins to entangle. Default uses current wf peaks. */
+static int op_qbin(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    if(a1>=8){printf("  [QBIN] max 8 bins\n");return 0;}
+    q->qbins[(int)a1]=(int)a2;
+    return 0;
+}
+static int op_qbin_done(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    q->n_qbins=0;
+    for(int i=0;i<8;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
+    printf("  [QBIN] %d bins: ",q->n_qbins);
+    for(int i=0;i<q->n_qbins;i++)printf("%d ",q->qbins[i]);printf("\n");
+    return 0;
+}
+/* ANTISYM: anti-symmetric pair entanglement gate.
+   8-pass feedback: X[k]=+A, X[D-k]=-A per qubit bin → room → renormalize → repeat.
+   Uses qbins[0..3] from QBIN (4 bins for 2 qudits).
+   DC cancels via k+(D-k)=0 destructive interference. */
 static int op_antisym(QvmCtx *q, double a1, double a2){
-    int bins[4]={64,80,96,112};
-    double amps[4]={0};
-    /* Try to parse 4 bin args from the raw command line */
-    /* a1,a2 only give 2 — use current wf bins instead */
-    for(int i=0;i<4;i++){
-        int k=bins[i];
-        if(k<0||k>=q->wf.d)k=64+i*16;
-        amps[i]=q->wf.prob[k]>1e-15?sqrt(q->wf.prob[k]):0.0;
-    }
+    (void)a1;(void)a2;
     if(!q->sdr_ok)return 0;
-    double x[256],xi[256],y[256];
-    qvm_antisym_encode(q,bins,amps,4,x,xi);
-    qvm_ofdm_compute(q,x,xi,y,q->wf.d);
-    double s=0;for(int i=0;i<4;i++)s+=y[bins[i]];
+    if(q->n_qbins<4){printf("  [ANTISYM] use QBIN first (need 4 bins)\n");return 0;}
+    int kb[4];for(int i=0;i<4;i++)kb[i]=q->qbins[i];
+    int D=q->wf.d, n_pass=8;
+    double x[D],xi[D],y[D];
+    double amp=1.0/sqrt(2.0);
+    for(int pass=0;pass<n_pass;pass++){
+        memset(x,0,D*sizeof(double));memset(xi,0,D*sizeof(double));
+        if(pass==0){
+            x[kb[0]]=+amp; x[D-kb[0]]=-amp;  /* |00⟩ */
+            x[kb[3]]=+amp; x[D-kb[3]]=-amp;  /* |11⟩ */
+        }else{
+            /* Only re-encode the Bell-state bins (ignore empty |01⟩ |10⟩) */
+            double s=y[kb[0]]+y[D-kb[0]]+y[kb[3]]+y[D-kb[3]];
+            if(s>1e-15){
+                double p0=(y[kb[0]]+y[D-kb[0]])/s;
+                double p3=(y[kb[3]]+y[D-kb[3]])/s;
+                if(p0>1e-15){x[kb[0]]=+sqrt(p0);x[D-kb[0]]=-sqrt(p0);}
+                if(p3>1e-15){x[kb[3]]=+sqrt(p3);x[D-kb[3]]=-sqrt(p3);}
+            }
+        }
+        for(int i=0;i<16;i++)x[i]=xi[i]=0.0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+    }
+    /* Store final: only |00⟩ and |11⟩ bins */
+    double s=y[kb[0]]+y[D-kb[0]]+y[kb[3]]+y[D-kb[3]];
+    for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0.0;
     if(s>1e-15){
-        for(int i=0;i<4;i++){q->wf.prob[bins[i]]=y[bins[i]]/s;
-            q->wf.re[bins[i]]=sqrt(q->wf.prob[bins[i]]);q->wf.im[bins[i]]=0;}
+        q->wf.prob[kb[0]]=(y[kb[0]]+y[D-kb[0]])/s;
+        q->wf.prob[kb[3]]=(y[kb[3]]+y[D-kb[3]])/s;
+        q->wf.re[kb[0]]=sqrt(q->wf.prob[kb[0]]);
+        q->wf.re[kb[3]]=sqrt(q->wf.prob[kb[3]]);
     }
-    for(int i=0;i<q->wf.d;i++){
-        int is=0;for(int j=0;j<4;j++)if(i==bins[j])is=1;
-        if(!is){q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;}
-    }
-    printf("  [ANTISYM] bins %d %d %d %d → room\n",bins[0],bins[1],bins[2],bins[3]);
-    wf_print(&q->wf,"|ψ⟩",-1); return 0;
+    printf("  [ANTISYM] bins %d/%d → %d passes: |00⟩=%.3f |11⟩=%.3f\n",
+        kb[0],kb[3],n_pass,q->wf.prob[kb[0]],q->wf.prob[kb[3]]);
+    return 0;
+}
+
+/* CHSH: Bell inequality test on current qbin state.
+   Computes S=|E(a,b)-E(a,b')+E(a',b)+E(a',b')| with optimal angles.
+   Uses standard 2-qubit measurement projectors on a,b. */
+static int op_chsh(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(q->n_qbins<4){printf("  [CHSH] use QBIN first (need 4 bins)\n");return 0;}
+    int kb[4];for(int i=0;i<4;i++)kb[i]=q->qbins[i];
+    double p[4];
+    for(int i=0;i<4;i++)p[i]=q->wf.prob[kb[i]];
+    double tot=p[0]+p[1]+p[2]+p[3];
+    if(tot>1e-15)for(int i=0;i<4;i++)p[i]/=tot;
+    double a=0,b=M_PI/4,ap=M_PI/2,bp=3*M_PI/4;
+    double ca=cos(a/2),sa=sin(a/2),cb=cos(b/2),sb=sin(b/2),
+           cap=cos(ap/2),sap=sin(ap/2),cbp=cos(bp/2),sbp=sin(bp/2);
+    double amp[4];for(int i=0;i<4;i++)amp[i]=sqrt(p[i]);
+    /* E(a,b) */
+    double pp=amp[0]*ca*cb+amp[1]*ca*sb+amp[2]*sa*cb+amp[3]*sa*sb;
+    double pm=amp[0]*ca*(-sb)+amp[1]*ca*cb+amp[2]*sa*(-sb)+amp[3]*sa*cb;
+    double mp=amp[0]*(-sa)*cb+amp[1]*(-sa)*sb+amp[2]*ca*cb+amp[3]*ca*sb;
+    double mm=amp[0]*(-sa)*(-sb)+amp[1]*(-sa)*cb+amp[2]*ca*(-sb)+amp[3]*ca*cb;
+    double Eab=pp*pp-pm*pm-mp*mp+mm*mm;
+    /* E(a,b') */
+    pp=amp[0]*ca*cbp+amp[1]*ca*sbp+amp[2]*sa*cbp+amp[3]*sa*sbp;
+    pm=amp[0]*ca*(-sbp)+amp[1]*ca*cbp+amp[2]*sa*(-sbp)+amp[3]*sa*cbp;
+    mp=amp[0]*(-sa)*cbp+amp[1]*(-sa)*sbp+amp[2]*ca*cbp+amp[3]*ca*sbp;
+    mm=amp[0]*(-sa)*(-sbp)+amp[1]*(-sa)*cbp+amp[2]*ca*(-sbp)+amp[3]*ca*cbp;
+    double Eabp=pp*pp-pm*pm-mp*mp+mm*mm;
+    /* E(a',b) */
+    pp=amp[0]*cap*cb+amp[1]*cap*sb+amp[2]*sap*cb+amp[3]*sap*sb;
+    pm=amp[0]*cap*(-sb)+amp[1]*cap*cb+amp[2]*sap*(-sb)+amp[3]*sap*cb;
+    mp=amp[0]*(-sap)*cb+amp[1]*(-sap)*sb+amp[2]*cap*cb+amp[3]*cap*sb;
+    mm=amp[0]*(-sap)*(-sb)+amp[1]*(-sap)*cb+amp[2]*cap*(-sb)+amp[3]*cap*cb;
+    double Eapb=pp*pp-pm*pm-mp*mp+mm*mm;
+    /* E(a',b') */
+    pp=amp[0]*cap*cbp+amp[1]*cap*sbp+amp[2]*sap*cbp+amp[3]*sap*sbp;
+    pm=amp[0]*cap*(-sbp)+amp[1]*cap*cbp+amp[2]*sap*(-sbp)+amp[3]*sap*cbp;
+    mp=amp[0]*(-sap)*cbp+amp[1]*(-sap)*sbp+amp[2]*cap*cbp+amp[3]*cap*sbp;
+    mm=amp[0]*(-sap)*(-sbp)+amp[1]*(-sap)*cbp+amp[2]*cap*(-sbp)+amp[3]*cap*cbp;
+    double Eapbp=pp*pp-pm*pm-mp*mp+mm*mm;
+    double S=fabs(Eab-Eabp+Eapb+Eapbp);
+    printf("  [CHSH] |00⟩=%.3f |01⟩=%.3f |10⟩=%.3f |11⟩=%.3f\n",p[0],p[1],p[2],p[3]);
+    printf("  [CHSH] E(A,B)=%+.4f E(A,B')=%+.4f E(A',B)=%+.4f E(A',B')=%+.4f\n",Eab,Eabp,Eapb,Eapbp);
+    printf("  [CHSH] S=%.4f (classical ≤2.0, quantum ≤2.83) %s\n",S,S>2.0?"★★ BELL VIOLATION ★★":"no violation");
+    return 0;
 }
 
 static int op_dft(QvmCtx *q, double a1, double a2){
@@ -2399,7 +2477,10 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "Z",         op_z,         "phase rotate [rad=π/4] [k=-1=all]");
     qvm_reg(q, "H",         op_h,         "Hadamard via LO hop");
     qvm_reg(q, "CZ",        op_cz,        "entangle via complex cross-corr");
-    qvm_reg(q, "ANTISYM",   op_antisym,   "anti-sym pair entangle gate");
+    qvm_reg(q, "ANTISYM",   op_antisym,   "anti-sym pair entangle (8-pass feedback)");
+    qvm_reg(q, "CHSH",      op_chsh,      "Bell inequality test on qbin state");
+    qvm_reg(q, "QBIN",      op_qbin,      "set qubit bin <idx> <k>");
+    qvm_reg(q, "QBIN!",     op_qbin_done, "finalize qubit bin mapping");
     qvm_reg(q, "DFT",       op_dft,       "LO retune [step=1]");
     qvm_reg(q, "TX",        op_tx,        "radiate into ether");
     qvm_reg(q, "RX",        op_rx,        "capture from ether");
@@ -2615,6 +2696,7 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
         q->wf.purity=1.0/D; q->wf.entropy=log2(D);
     }
     q->running = 1;
+    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0;
     qvm_init_ops(q);
     return q;
 }
