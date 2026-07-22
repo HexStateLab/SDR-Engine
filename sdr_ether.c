@@ -673,10 +673,10 @@ static void tx_write_file(const TxBuf *tx, const char *path) {
  * into the EM field for the next iteration.
  * ═══════════════════════════════════════════════════════════════ */
 
-/* H: Hadamard-like via LO frequency hop */
+/* H: Hadamard-like via LO shift by Nyquist (folds spectrum) */
 static void gate_H(SdrDev *s, Wavefunction *wf) {
     uint32_t orig = wf->freq;
-    uint32_t hop  = (uint32_t)(orig * 1.5);
+    uint32_t hop  = orig + s->rate / 2;  /* Nyquist fold */
     sdr_retune(s, hop);
     usleep(5000);
     sdr_capture(s);
@@ -2336,6 +2336,7 @@ int qvm_compute(QvmCtx *q, const double *x, double *y, int d){
     /* Feed x into room: LO dwell ∝ x[k] */
     double bw=(double)q->rate/d;
     for (int k=0;k<d;k++){
+        if(fabs(x[k])<1e-10) continue; /* skip silent bins entirely */
         int dw=(int)(fabs(x[k])*1500+30);
         uint32_t f=(uint32_t)q->freq+(uint32_t)(k*bw);
         if(f<24000000)f=24000000; if(f>1750000000)f=1750000000;
@@ -2352,8 +2353,6 @@ int qvm_compute(QvmCtx *q, const double *x, double *y, int d){
             si+=q->sdr->iq_i[n]*c-q->sdr->iq_q[n]*s;
             sq+=q->sdr->iq_i[n]*s+q->sdr->iq_q[n]*c;}
         pwr[k]=(si*si+sq*sq)/((double)np*np);}
-    double rs=0; for(int i=0;i<d;i++) rs+=pwr[i];
-    if(rs>1e-15) for(int i=0;i<d;i++) pwr[i]/=rs;
     for (int i=0;i<d;i++) y[i]=pwr[i];
     free(pwr);
     return 0;
@@ -2371,13 +2370,15 @@ int qvm_eval(QvmCtx *q, const char *cmd){
 
     int rc = fn(q, a1, a2);
 
-    /* Auto-sync with ether after mutating instructions */
+    /* Auto-sync with ether only for operations that NEED the room.
+       Software operations (X,Z,SWAP,SET,etc.) just update the wf representation.
+       The room IS the ground truth — sync before TX/MEASURE/RX reads. */
     if (q->sdr_ok && q->running && rc >= 0) {
-        int nosync = (fn==op_loop||fn==op_end||fn==op_wait||fn==op_echo||
-                      fn==op_help||fn==op_quit||fn==op_prob||fn==op_show||
-                      fn==op_dump||fn==op_purity||fn==op_sample||
-                      fn==op_bench||fn==op_calibrate||fn==op_solve);
-        if (!nosync) qvm_sync(q);
+        int needs_sync = (fn==op_tx||fn==op_rx||fn==op_measure||
+                          fn==op_tick||fn==op_cz||fn==op_h||
+                          fn==op_init||fn==op_superpose||
+                          fn==op_dft);
+        if (needs_sync) qvm_sync(q);
     }
     return rc;
 }
