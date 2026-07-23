@@ -51,6 +51,7 @@
 #include <linux/videodev2.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <fftw3.h>
 
 #include "qvm_api.h"
 
@@ -473,33 +474,43 @@ static void sdr_close(SdrDev *s) {
  * ═══════════════════════════════════════════════════════════════ */
 static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
                         Wavefunction *wf) {
-    memset(wf->re, 0, wf->d * sizeof(double));
-    memset(wf->im, 0, wf->d * sizeof(double));
-    memset(wf->prob, 0, wf->d * sizeof(double));
+    int D = wf->d;
+    if (np < D) return;
+
+    memset(wf->re, 0, D * sizeof(double));
+    memset(wf->im, 0, D * sizeof(double));
+    memset(wf->prob, 0, D * sizeof(double));
     wf->entropy = 0; wf->purity = 0;
 
-    if (np < wf->d) return;
+    /* FFTW3 FFT: O(D log D) — replaces O(D²) brute-force DFT */
+    fftw_complex *in  = fftw_malloc(np * sizeof(fftw_complex));
+    fftw_complex *out = fftw_malloc(np * sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(np, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
 
-    for (int k = 0; k < wf->d; k++) {
-        double freq_norm = (double)k / (double)wf->d;
-        double sum_i = 0, sum_q = 0;
-        for (int n = 0; n < np; n++) {
-            double phase = -2.0 * M_PI * freq_norm * (double)n;
-            double cr = cos(phase), sr = sin(phase);
-            sum_i += iq_i[n] * cr - iq_q[n] * sr;
-            sum_q += iq_i[n] * sr + iq_q[n] * cr;
-        }
-        wf->re[k] = sum_i / (double)np;
-        wf->im[k] = sum_q / (double)np;
+    for (int n = 0; n < np; n++) {
+        in[n][0] = iq_i[n];
+        in[n][1] = iq_q[n];
     }
 
+    fftw_execute(plan);
+
+    double norm = 1.0 / (double)np;
+    for (int k = 0; k < D; k++) {
+        wf->re[k] = out[k][0] * norm;
+        wf->im[k] = out[k][1] * norm;
+    }
+
+    fftw_destroy_plan(plan);
+    fftw_free(in);
+    fftw_free(out);
+
     double total = 0;
-    for (int k = 0; k < wf->d; k++)
+    for (int k = 0; k < D; k++)
         total += wf->re[k]*wf->re[k] + wf->im[k]*wf->im[k];
 
     if (total > 1e-15) {
         double scale = 1.0 / sqrt(total);
-        for (int k = 0; k < wf->d; k++) {
+        for (int k = 0; k < D; k++) {
             wf->re[k] *= scale; wf->im[k] *= scale;
             wf->prob[k] = wf->re[k]*wf->re[k] + wf->im[k]*wf->im[k];
             if (wf->prob[k] > 1e-15)
@@ -522,34 +533,39 @@ static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
  * ═══════════════════════════════════════════════════════════════ */
 static void tx_synthesize(const Wavefunction *wf, TxBuf *tx) {
     int D = wf->d, N = tx->nsamples;
+    if (N < D) N = D;
 
-    memset(tx->i, 0, N * sizeof(double));
-    memset(tx->q, 0, N * sizeof(double));
+    /* FFTW3 IFFT with randomized bin phases to reduce OFDM crest factor.
+       In-phase tones sum to N at n=0; random phases spread peak to ~√N.
+       This gives √N× better per-bin SNR at the capture DFT. */
+    fftw_complex *in  = fftw_malloc(N * sizeof(fftw_complex));
+    fftw_complex *out = fftw_malloc(N * sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(N, in, out, FFTW_BACKWARD, FFTW_ESTIMATE);
 
-    for (int k = 0; k < D; k++) {
-        double re = wf->re[k], im = wf->im[k];
-        if (re*re + im*im < 1e-30) continue;
-        double freq_norm = (double)k / (double)D;
-        for (int n = 0; n < N; n++) {
-            double phase = 2.0 * M_PI * freq_norm * (double)n;
-            double cr = cos(phase), sr = sin(phase);
-            tx->i[n] += re * cr - im * sr;
-            tx->q[n] += re * sr + im * cr;
-        }
+    for (int k = 0; k < N; k++) {
+        double re = (k < D) ? wf->re[k] : 0.0;
+        double im = (k < D) ? wf->im[k] : 0.0;
+        /* Randomize phase to reduce crest factor */
+        double phase = (double)(k * 2654435761ULL) * 2.0 * M_PI / 4294967296.0;
+        double cr = cos(phase), sr = sin(phase);
+        in[k][0] = re * cr - im * sr;
+        in[k][1] = re * sr + im * cr;
     }
 
+    fftw_execute(plan);
+
+    /* Normalize to 8-bit unsigned range */
     double peak = 0;
     for (int n = 0; n < N; n++) {
-        double mag = fabs(tx->i[n]);
-        if (fabs(tx->q[n]) > mag) mag = fabs(tx->q[n]);
+        double mag = fabs(out[n][0]);
+        if (fabs(out[n][1]) > mag) mag = fabs(out[n][1]);
         if (mag > peak) peak = mag;
     }
-    if (peak > 1e-15) {
-        double sc = 0.9 / peak;
-        for (int n = 0; n < N; n++) {
-            tx->i[n] *= sc;
-            tx->q[n] *= sc;
-        }
+    if (peak < 1e-15) peak = 1.0;
+    double sc = 0.9 / peak;
+    for (int n = 0; n < N; n++) {
+        tx->i[n] = out[n][0] * sc;
+        tx->q[n] = out[n][1] * sc;
     }
 
     for (int n = 0; n < N; n++) {
@@ -560,6 +576,10 @@ static void tx_synthesize(const Wavefunction *wf, TxBuf *tx) {
         tx->cu8[2*n]   = (uint8_t)iv;
         tx->cu8[2*n+1] = (uint8_t)qv;
     }
+
+    fftw_destroy_plan(plan);
+    fftw_free(in);
+    fftw_free(out);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -3187,22 +3207,33 @@ static int op_qec_grid(QvmCtx *q, double a1, double a2){
     int nq=q->n_qbins/2;
     if(r*s>nq){printf("  [QEC_GRID] need %d qubits (have %d)\n",r*s,nq);return 0;}
 
-    /* Read outcomes from WF directly (no PROJ — avoids capture trashing WF).
-       The WF was set algebraically by CREATE + XGATE. */
+    /* Use global |0⟩ vs |1⟩ total power for GHZ baseline.
+       Per-bin capture noise creates spurious qubit-level variations;
+       the GHZ guarantees all qubits share the same global state. */
     int *outcomes=calloc(r*s,sizeof(int));
-    int n1=0;
+    double tot_p0=0, tot_p1=0;
+    for(int i=0;i<r*s;i++){
+        tot_p0+=q->wf.prob[q->qbins[2*i]];
+        tot_p1+=q->wf.prob[q->qbins[2*i+1]];
+    }
+    int expected=(tot_p1>tot_p0)?1:0;
+    int nerr=0, n1=0;
+    double gap=(tot_p0+tot_p1)/(r*s)*0.1; /* 10% of per-qubit power as threshold */
     for(int i=0;i<r*s;i++){
         double p0=q->wf.prob[q->qbins[2*i]], p1=q->wf.prob[q->qbins[2*i+1]];
-        outcomes[i]=(p1>p0)?1:0;
-        n1+=outcomes[i];
+        /* Only mark as divergent if the per-qubit gap exceeds GHZ spread.
+           XGATE swaps p0↔p1 completely, creating a large deviation. */
+        if(fabs(p1-p0) > gap && ((p1>p0)!=expected))
+            outcomes[i]=!expected;
+        else
+            outcomes[i]=expected;
+        n1+=(outcomes[i]==1);
+        if(outcomes[i]!=expected) nerr++;
     }
-    int expected=(n1>r*s/2)?1:0;
     printf("  [QEC_GRID] expected=%d (|1>=%d/%d=%.1f%%)\n",
            expected,n1,r*s,100.0*n1/(double)(r*s));
 
     /* Error pattern: qubits that disagree with expected */
-    int nerr=0;
-    for(int i=0;i<r*s;i++) if(outcomes[i]!=expected) nerr++;
     printf("  [QEC_GRID] raw errors=%d/%.1f%%\n",nerr,100.0*nerr/(double)(r*s));
 
     /* Use stored noise_pct from QEC_NOISE command */
@@ -3259,23 +3290,27 @@ static int op_qec_grid(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* Coherent capture: N rounds, average DFT power. Signal×N, noise×√N. */
+/* Coherent capture: N rounds, average DFT power. Signal×N, noise×√N.
+   Uses FFTW3 FFT — O(D log D) per round instead of O(D²). */
 static int qvm_coh_capture(QvmCtx *q, double *avg_prob, int N){
     if(!q->sdr_ok||N<1)return -1;
     int D=q->wf.d;
     memset(avg_prob,0,D*sizeof(double));
     for(int n=0;n<N;n++){
         sdr_capture(q->sdr);
-        double *I=q->sdr->iq_i, *Q=q->sdr->iq_q;
         int np=q->sdr->iq_n; if(np<D)np=D;
+
+        fftw_complex *fin  = fftw_malloc(np*sizeof(fftw_complex));
+        fftw_complex *fout = fftw_malloc(np*sizeof(fftw_complex));
+        fftw_plan plan = fftw_plan_dft_1d(np, fin, fout, FFTW_FORWARD, FFTW_ESTIMATE);
+        for(int m=0;m<np;m++){fin[m][0]=q->sdr->iq_i[m];fin[m][1]=q->sdr->iq_q[m];}
+        fftw_execute(plan);
+        double nrm=1.0/np;
         for(int k=0;k<D;k++){
-            double fn=(double)k/D,si=0,sq=0;
-            for(int m=0;m<np;m++){
-                double ph=-2*M_PI*fn*m,c=cos(ph),s=sin(ph);
-                si+=I[m]*c-Q[m]*s;sq+=I[m]*s+Q[m]*c;
-            }
-            avg_prob[k]+=(si*si+sq*sq)/((double)np*np);
+            double si=fout[k][0]*nrm, sq=fout[k][1]*nrm;
+            avg_prob[k]+=si*si+sq*sq;
         }
+        fftw_destroy_plan(plan);fftw_free(fin);fftw_free(fout);
     }
     for(int k=0;k<D;k++) avg_prob[k]/=N;
     memcpy(q->wf.prob,avg_prob,D*sizeof(double));
@@ -3530,14 +3565,19 @@ int qvm_ofdm_complex(QvmCtx *q, const double *re, const double *im,
     for(int i=0;i<d;i++){q->wf.re[i]=re[i];q->wf.im[i]=im[i];
         q->wf.prob[i]=re[i]*re[i]+im[i]*im[i];}
     gate_ofdm_tx(q->sdr,&q->wf,NULL);
-    usleep(80000); /* 80ms → DMA fills ~5 buffers, TX buffer rotated out */
+    usleep(80000);
     sdr_capture(q->sdr);
     int np=q->sdr->iq_n;if(np<d)np=d;
-    for(int k=0;k<d;k++){double fn=(double)k/d,si=0,sq=0;
-        for(int n=0;n<np;n++){double ph=-2*M_PI*fn*n,c=cos(ph),s=sin(ph);
-            si+=q->sdr->iq_i[n]*c-q->sdr->iq_q[n]*s;
-            sq+=q->sdr->iq_i[n]*s+q->sdr->iq_q[n]*c;}
-        I_out[k]=si/np;Q_out[k]=sq/np;}
+
+    /* FFTW3 FFT */
+    fftw_complex *fin  = fftw_malloc(np*sizeof(fftw_complex));
+    fftw_complex *fout = fftw_malloc(np*sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(np, fin, fout, FFTW_FORWARD, FFTW_ESTIMATE);
+    for(int n=0;n<np;n++){fin[n][0]=q->sdr->iq_i[n];fin[n][1]=q->sdr->iq_q[n];}
+    fftw_execute(plan);
+    double norm=1.0/np;
+    for(int k=0;k<d;k++){I_out[k]=fout[k][0]*norm;Q_out[k]=fout[k][1]*norm;}
+    fftw_destroy_plan(plan);fftw_free(fin);fftw_free(fout);
     return 0;
 }
 int qvm_ofdm_compute(QvmCtx *q, const double *re, const double *im, double *y, int d){
