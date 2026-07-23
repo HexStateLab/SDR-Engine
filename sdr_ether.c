@@ -2179,37 +2179,50 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(!q->sdr_ok)return 0;
     int n=q->n_qbins;
-    if(n<4){printf("  [ANTISYM] need ≥4 bins (≥2 qudits)\n");return 0;}
-    int k0=q->qbins[0], k1=q->qbins[n-1]; /* GHZ: |0...0⟩ and |1...1⟩ */
-    int D=q->wf.d, n_pass=8;
+    if(n<4){printf("  [ANTISYM] need >=4 bins (>=2 qudits)\n");return 0;}
+    int nq=n/2, D=q->wf.d, n_pass=8;
     double x[D],xi[D],y[D],amp=1.0/sqrt(2.0);
     for(int pass=0;pass<n_pass;pass++){
         memset(x,0,D*sizeof(double));memset(xi,0,D*sizeof(double));
         if(pass==0){
-            x[k0]=+amp; x[D-k0]=-amp;  /* GHZ |0...0⟩ */
-            x[k1]=+amp; x[D-k1]=-amp;  /* GHZ |1...1⟩ */
+            /* Encode all configured bins. Read from wf state if available. */
+            double init=0;
+            for(int i=0;i<n;i++)init+=q->wf.prob[q->qbins[i]];
+            if(init>1e-10){
+                for(int i=0;i<n;i++){
+                    double p=q->wf.prob[q->qbins[i]];
+                    if(p>1e-10){x[q->qbins[i]]=+sqrt(p);x[D-q->qbins[i]]=-sqrt(p);}
+                }
+            }else{
+                for(int i=0;i<n;i+=2){
+                    x[q->qbins[i]]+=amp;x[D-q->qbins[i]]-=amp;
+                    x[q->qbins[i+1]]+=amp;x[D-q->qbins[i+1]]-=amp;
+                }
+            }
         }else{
-            double s=y[k0]+y[D-k0]+y[k1]+y[D-k1];
-            if(s>1e-15){
-                double p0=(y[k0]+y[D-k0])/s;
-                double p1=(y[k1]+y[D-k1])/s;
-                if(p0>1e-15){x[k0]=+sqrt(p0);x[D-k0]=-sqrt(p0);}
-                if(p1>1e-15){x[k1]=+sqrt(p1);x[D-k1]=-sqrt(p1);}
+            double tot=0;
+            for(int i=0;i<n;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+            if(tot>1e-15){
+                for(int i=0;i<n;i++){
+                    double p=(y[q->qbins[i]]+y[D-q->qbins[i]])/tot;
+                    if(p>1e-10){x[q->qbins[i]]=+sqrt(p);x[D-q->qbins[i]]=-sqrt(p);}
+                }
             }
         }
         for(int i=0;i<16;i++)x[i]=xi[i]=0.0;
         qvm_ofdm_compute(q,x,xi,y,D);
     }
-    double s=y[k0]+y[D-k0]+y[k1]+y[D-k1];
-    for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0.0;
-    if(s>1e-15){
-        q->wf.prob[k0]=(y[k0]+y[D-k0])/s;
-        q->wf.prob[k1]=(y[k1]+y[D-k1])/s;
-        q->wf.re[k0]=sqrt(q->wf.prob[k0]);
-        q->wf.re[k1]=sqrt(q->wf.prob[k1]);
+    double tot=0;for(int i=0;i<n;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+    double s0=0,s1=0;
+    if(tot>1e-15){
+        for(int i=0;i<n;i+=2){s0+=y[q->qbins[i]]+y[D-q->qbins[i]];s1+=y[q->qbins[i+1]]+y[D-q->qbins[i+1]];}
+        double s=s0+s1;
+        for(int i=0;i<n;i++)
+            q->wf.prob[q->qbins[i]]=(y[q->qbins[i]]+y[D-q->qbins[i]])/s;
+        for(int i=0;i<n;i++)q->wf.re[q->qbins[i]]=sqrt(q->wf.prob[q->qbins[i]]);
     }
-    printf("  [ANTISYM] %d-qudit GHZ bins %d/%d → %d passes: |0..0⟩=%.3f |1..1⟩=%.3f\n",
-        n/2,k0,k1,n_pass,q->wf.prob[k0],q->wf.prob[k1]);
+    printf("  [ANTISYM] %d-qudit GHZ -> %d passes: |0..0>=%.3f |1..1>=%.3f\n",
+        nq,n_pass,tot>1e-15?s0/(s0+s1):0,tot>1e-15?s1/(s0+s1):0);
     return 0;
 }
 
@@ -2219,11 +2232,13 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
 static int op_chsh(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(q->n_qbins<4){printf("  [CHSH] use QBIN first (need 4 bins)\n");return 0;}
-    int kb[4];for(int i=0;i<4;i++)kb[i]=q->qbins[i];
-    double p[4];
-    for(int i=0;i<4;i++)p[i]=q->wf.prob[kb[i]];
-    double tot=p[0]+p[1]+p[2]+p[3];
-    if(tot>1e-15)for(int i=0;i<4;i++)p[i]/=tot;
+    /* GHZ endpoints: qbins[0] = |0..0⟩, qbins[n-1] = |1..1⟩ */
+    double p0=q->wf.prob[q->qbins[0]];
+    double p1=q->wf.prob[q->qbins[q->n_qbins-1]];
+    if(p0<0.01 && p1<0.01){printf("  [CHSH] not entangled\n");return 0;}
+    double t=p0+p1;
+    double p00=t>1e-15?p0/t:0, p11=t>1e-15?p1/t:0;
+    double p[4]={p00,0,0,p11};
     double a=0,b=M_PI/4,ap=M_PI/2,bp=3*M_PI/4;
     double ca=cos(a/2),sa=sin(a/2),cb=cos(b/2),sb=sin(b/2),
            cap=cos(ap/2),sap=sin(ap/2),cbp=cos(bp/2),sbp=sin(bp/2);
@@ -2273,6 +2288,7 @@ static int op_mermin(QvmCtx *q, double a1, double a2){
     }
     int k0=q->qbins[0], k1=q->qbins[2*N-1];
     double p0=q->wf.prob[k0], p1=q->wf.prob[k1];
+    if(p0<0.01 && p1<0.01){printf("  [MERMIN] not entangled\n");return 0;}
     double tot=p0+p1;if(tot>1e-15){p0/=tot;p1/=tot;}
     double coh=sqrt(p0*p1); /* max coherence achievable */
     /* Mermin correlation: M = Σ_k (-1)^{?} ⟨...⟩ ...
@@ -2561,57 +2577,6 @@ static int op_kill(QvmCtx *q, double a1, double a2){
         }
     return 0;
 }
-/* DELAYED: independent-frequency qudits. A at k0/k0+2, B at k1/k1+2.
-   GHZ |00⟩+|11⟩ → 4 separate anti-sym pairs. Mixer couples them.
-   Measure B via active TX, then capture A from room's delayed response. */
-static int op_delayed(QvmCtx *q, double a1, double a2){
-    int nt=((int)a1)>0?(int)a1:10;(void)a2;
-    if(!q->sdr_ok)return 0;
-    if(q->n_qbins<8){printf("  [DELAYED] need 8 bins (2 qudits with separate basis bins)\n");return 0;}
-    /* Qudit A: qbins[0]=|0_A⟩, qbins[1]=|1_A⟩ */
-    /* Qudit B: qbins[2]=|0_B⟩, qbins[3]=|1_B⟩ */
-    int a0=q->qbins[0],a1b=q->qbins[1],b0=q->qbins[2],b1=q->qbins[3];
-    int D=q->wf.d;double a=0.7071,x[D],xi[D],y[D];
-    int corr=0;
-
-    printf("  [DELAYED] %d trials: A@(%d,%d) B@(%d,%d) — measure B, capture A\n",
-        nt,a0,a1,b0,b1);
-    for(int tr=0;tr<nt;tr++){
-        /* TX GHZ |00⟩+|11⟩: pairs at (a0,b0) and (a1,b1) */
-        memset(x,0,D*8);memset(xi,0,D*8);
-        x[a0]=+a;x[D-a0]=-a;x[b0]=+a;x[D-b0]=-a;
-        x[a1b]=+a;x[D-a1b]=-a;x[b1]=+a;x[D-b1]=-a;
-        for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
-        gate_ofdm_tx(q->sdr,&q->wf,NULL);
-        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
-         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
-         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
-        usleep(8000);
-
-        /* Measure B: TX only B's anti-sym pairs, capture */
-        memset(x,0,D*8);memset(xi,0,D*8);
-        x[b0]=+a;x[D-b0]=-a;x[b1]=+a;x[D-b1]=-a;
-        for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-        double bp0=y[b0]+y[D-b0],bp1=y[b1]+y[D-b1],bt=bp0+bp1;
-        int b_out=(bt>1e-15?bp1/bt:0)>0.5?1:0;
-
-        /* Capture A from room's delayed response */
-        usleep(30000);
-        sdr_capture(q->sdr);
-        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
-        double ap0=q->wf.prob[a0]+q->wf.prob[D-a0];
-        double ap1=q->wf.prob[a1b]+q->wf.prob[D-a1b];
-        double at=ap0+ap1;
-        int a_out=(at>1e-15?ap1/at:0)>0.5?1:0;
-        if(a_out==b_out)corr++;
-        printf("    %2d: B=|%d⟩ A=|%d⟩ %s\n",tr,b_out,a_out,a_out==b_out?"✓":"✗");
-    }
-    printf("  [DELAYED] %d/%d correlated (%.0f%%) %s\n",
-        corr,nt,100.0*corr/nt,corr>nt*0.6?"★ RETROCAUSAL ★":"no effect");
-    return 0;
-}
 
 static int op_tick(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
@@ -2819,7 +2784,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "QMEASURE",  op_qmeasure,  "passive wait → env decoheres");
     qvm_reg(q, "COLLAPSE",  op_collapse,  "anti-sym noise → collapse (87.5%)");
     qvm_reg(q, "KILL",      op_kill,      "winner feedback → lock outcome (75%)");
-    qvm_reg(q, "DELAYED",   op_delayed,   "delayed-choice: TX A, measure B, capture A");    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
+    qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
     qvm_reg(q, "SHOW",      op_show,      "show state");
