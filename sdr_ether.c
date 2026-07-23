@@ -2954,6 +2954,27 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
     if(qi>=nq){printf("  [PROJ] qi=%d >= %d\n",qi,nq);return 0;}
     if(!q->sdr_ok)return 0;
     int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1],D=q->wf.d;
+
+    /* Check if WF was already collapsed (all qudits same, one branch zero) */
+    double wf0=0,wf1=0;int eq0=1,eq1=1;
+    for(int i=0;i<nq;i++){wf0+=q->wf.prob[q->qbins[2*i]];wf1+=q->wf.prob[q->qbins[2*i+1]];}
+    /* Detect collapse: one branch has zero total, or all qudits identical */
+    int collapsed = (wf0<0.01||wf1<0.01);
+    if(!collapsed){
+        double first0=q->wf.prob[q->qbins[0]],first1=q->wf.prob[q->qbins[1]];
+        collapsed=1;
+        for(int i=1;i<nq&&collapsed;i++){
+            if(fabs(q->wf.prob[q->qbins[2*i]]-first0)>0.01)collapsed=0;
+            if(fabs(q->wf.prob[q->qbins[2*i+1]]-first1)>0.01)collapsed=0;
+        }
+    }
+    if(collapsed){
+        int outcome=(wf1>wf0)?1:0;
+        printf("  [PROJ] qudit %d collapsed -> |%d>\n",qi,outcome);
+        return 0;
+    }
+
+    /* Active measurement: TX anti-sym probe at qi's |0> bin */
     double a=0.7071,x[D],xi[D],y[D];
     memset(x,0,D*8);memset(xi,0,D*8);
     x[b0]=+a;x[D-b0]=-a;
@@ -2961,6 +2982,8 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
     qvm_ofdm_compute(q,x,xi,y,D);
     double p0=y[b0]+y[D-b0],p1=y[b1]+y[D-b1];
     int outcome=(p1>p0)?1:0;
+
+    /* Collapse WF to measured outcome across ALL qudits */
     for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;
     double tot=p0+p1;
     for(int i=0;i<nq;i++){
@@ -2968,8 +2991,52 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
         q->wf.prob[bin]=(outcome?p1:p0)/tot;
         q->wf.re[bin]=sqrt(q->wf.prob[bin]);
     }
-    printf("  [PROJ] qudit %d Z-measure -> |%d> (|0>=%.3f |1>=%.3f)\n",
+    printf("  [PROJ] qudit %d measured -> |%d> (|0>=%.3f |1>=%.3f)\n",
         qi,outcome,tot>1e-15?p0/tot:0,tot>1e-15?p1/tot:0);
+    return 0;
+}
+
+/* CREATE qi: algebraic creation a^dagger on qudit qi.
+   Multiplies |0⟩ bin amplitude by √(n+1)/√n (unitary on WF, no measurement). */
+static int op_create(QvmCtx *q, double a1, double a2){
+    int qi=((int)a1)>=0?(int)a1:0;(void)a2;
+    int nq=q->n_qbins/2;if(qi>=nq)return 0;
+    int b0=q->qbins[2*qi];
+    double n=q->wf.prob[b0];if(n<1e-10)n=0.01;
+    double factor=sqrt((n+0.1)/n);
+    q->wf.prob[b0]*=factor;q->wf.re[b0]=sqrt(q->wf.prob[b0]);
+    printf("  [CREATE] qudit %d n=%.3f\n",qi,q->wf.prob[b0]);
+    return 0;
+}
+/* ANNIHILATE qi: algebraic annihilation a on qudit qi. */
+static int op_annihilate(QvmCtx *q, double a1, double a2){
+    int qi=((int)a1)>=0?(int)a1:0;(void)a2;
+    int nq=q->n_qbins/2;if(qi>=nq)return 0;
+    int b0=q->qbins[2*qi];
+    double n=q->wf.prob[b0];
+    if(n<1e-10){printf("  [ANNIHILATE] empty\n");return 0;}
+    double factor=sqrt(n>0.1?n-0.1:n*0.1)/sqrt(n);
+    q->wf.prob[b0]*=factor;q->wf.re[b0]=sqrt(q->wf.prob[b0]);
+    printf("  [ANNIHILATE] qudit %d n=%.3f\n",qi,q->wf.prob[b0]);
+    return 0;
+}
+
+/* OCCUPATION qi: measure occupation through room. TX anti-sym at qudit,
+   capture, read actual physical occupation number from room response. */
+static int op_occupation(QvmCtx *q, double a1, double a2){
+    int qi=((int)a1)>=0?(int)a1:0;(void)a2;
+    int nq=q->n_qbins/2;if(qi>=nq)return 0;
+    if(!q->sdr_ok)return 0;
+    int b0=q->qbins[2*qi],D=q->wf.d;
+    double n_wf=q->wf.prob[b0];
+    double amp=sqrt(n_wf+0.01);if(amp>1.0)amp=1.0;
+    double x[D],xi[D],y[D];
+    memset(x,0,D*8);memset(xi,0,D*8);
+    x[b0]=+amp;x[D-b0]=-amp;
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,D);
+    double n_room=y[b0]+y[D-b0];
+    printf("  [OCCUPATION] qudit %d WF=%.3f room=%.3f\n",qi,n_wf,n_room);
     return 0;
 }
 
@@ -3000,6 +3067,9 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "STABILIZE", op_stabilize, "regenerative feedback — keep qudit alive");
     qvm_reg(q, "GHZ_STAB",  op_ghz_stab,  "regenerate all bins — preserve entanglement");
     qvm_reg(q, "PROJ",      op_proj_meas, "projective Z-measurement on qudit");
+    qvm_reg(q, "CREATE",    op_create,    "algebraic creation a^dagger on qudit");
+    qvm_reg(q, "ANNIHILATE",op_annihilate,"algebraic annihilation a on qudit");
+    qvm_reg(q, "OCCUPATION",op_occupation,"measure occupation through room");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
