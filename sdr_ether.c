@@ -2955,17 +2955,7 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
     if(!q->sdr_ok)return 0;
     int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1],D=q->wf.d;
 
-    /* Check if WF was already collapsed (all qudits same, one branch zero) */
-    double wf0=0,wf1=0;int eq0=1,eq1=1;
-    for(int i=0;i<nq;i++){wf0+=q->wf.prob[q->qbins[2*i]];wf1+=q->wf.prob[q->qbins[2*i+1]];}
-    /* Detect collapse: one branch has zero total across all qudits */
-    if(wf0<0.01||wf1<0.01){
-        int outcome=(wf1>wf0)?1:0;
-        printf("  [PROJ] qudit %d collapsed -> |%d>\n",qi,outcome);
-        return 0;
-    }
-
-    /* Active measurement: TX anti-sym probe at qi's |0> bin */
+    /* Always active TX measurement */
     double a=0.7071,x[D],xi[D],y[D];
     memset(x,0,D*8);memset(xi,0,D*8);
     x[b0]=+a;x[D-b0]=-a;
@@ -3098,6 +3088,28 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "ANNIHILATE",op_annihilate,"algebraic annihilation a on qudit");
     qvm_reg(q, "OCCUPATION",op_occupation,"measure occupation through room");
     qvm_reg(q, "CZ",        op_cz_gate,   "controlled-Z gate on two qubits");
+
+    /* X qi: Pauli-X (NOT) gate. Swaps |0> and |1> amplitudes. */
+    { static int op_x_gate(QvmCtx *q, double a1, double a2){
+        int qi=((int)a1)>=0?(int)a1:0;(void)a2;
+        int nq=q->n_qbins/2;if(qi>=nq)return 0;
+        int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1];
+        double t0=q->wf.prob[b0],t1=q->wf.prob[b1];
+        q->wf.prob[b0]=t1;q->wf.re[b0]=sqrt(t1);
+        q->wf.prob[b1]=t0;q->wf.re[b1]=sqrt(t0);
+        printf("  [X] qudit %d flipped\n",qi);return 0;
+    } qvm_reg(q, "XGATE", op_x_gate, "Pauli-X (NOT) gate"); }
+
+    /* H qi: Hadamard gate. Equal superposition. */
+    { static int op_h_gate(QvmCtx *q, double a1, double a2){
+        int qi=((int)a1)>=0?(int)a1:0;(void)a2;
+        int nq=q->n_qbins/2;if(qi>=nq)return 0;
+        int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1];
+        double amp=0.5;
+        q->wf.prob[b0]=amp;q->wf.re[b0]=sqrt(amp);
+        q->wf.prob[b1]=amp;q->wf.re[b1]=sqrt(amp);
+        printf("  [H] qudit %d superposition\n",qi);return 0;
+    } qvm_reg(q, "HGATE", op_h_gate, "Hadamard gate"); }
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
