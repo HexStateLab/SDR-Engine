@@ -17,6 +17,27 @@ via VIDIOC_QBUF with TX flag transmits I/Q through the RTL2832U DAC path.
 
 ---
 
+## QVM Architecture
+
+### Hilbert Space
+
+Each frequency bin = one qudit basis state. Anti-symmetric pairs `X[k]=+A, X[D-k]=-A`
+null DC via destructive interference at `k+(D-k)=0 mod D`, forcing energy through
+the R820T2's nonlinear intermodulation path.
+
+### D Scaling
+
+Larger D packs more subcarriers into the same bandwidth. At D=32768 (62Hz spacing),
+the room processes 16,384 qudits simultaneously. Each doubling of D doubles N.
+
+| D | Qubits | Spacing | Throughput |
+|---|--------|---------|-----------|
+| 256 | 128 | 8 kHz | 16K pairs/cycle |
+| 4096 | 2048 | 500 Hz | 4M pairs/cycle |
+| 32768 | 16384 | 62 Hz | 268M pairs/cycle |
+
+---
+
 ## QVM API (external programs)
 
 The engine doubles as a library. Build external programs against `sdr_ether_lib.o`:
@@ -36,7 +57,9 @@ gcc -O3 -std=gnu99 your_program.c sdr_ether_lib.o -lm -lpthread -o your_program
 | `qvm_destroy(q)` | Close SDR, free state |
 | `qvm_eval(q, "INSTRUCTION")` | Execute a VM instruction |
 | `qvm_run(q, "script.qvm")` | Run script or REPL |
-| `qvm_compute(q, x, y, d)` | Feed x through room → DFT readback |
+| `qvm_compute(q, x, y, d)` | Feed x through room -> DFT readback |
+| `qvm_ofdm_compute(q, re, im, y, d)` | Complex OFDM TX->RX with signed output |
+| `qvm_antisym_encode(q, bins, amps, n, x, xi)` | Anti-symmetric pair encoding |
 | `qvm_probs(q, out, max)` | Read probability distribution |
 | `qvm_prob(q, level)` | Read single bin probability |
 | `qvm_entropy(q)` / `qvm_purity(q)` | State statistics |
@@ -45,26 +68,6 @@ gcc -O3 -std=gnu99 your_program.c sdr_ether_lib.o -lm -lpthread -o your_program
 | `qvm_get_channel(q, &M, &Minv, &dim)` | Get calibration matrices |
 | `qvm_sdr_tune(q, hz)` | Direct LO retune |
 | `qvm_sdr_rx(q, I, Q, max_n)` | Raw I/Q capture |
-| `qvm_sdr_dft(q, pwr, D, I, Q, n)` | DFT decomposition |
-| `qvm_ofdm_compute(q, re, im, y, d)` | Complex OFDM TX→RX with signed output |
-| `qvm_antisym_encode(q, bins, amps, n, x, xi)` | Anti-symmetric pair encoding |
-
-### External Programs
-
-| Program | Purpose |
-|---------|---------|
-| `qvm_test.c` | API verification — lifecycle, compute, eval |
-| `qvm_bell.c` | Bell test — entangle two qudits, CHSH check |
-| `qvm_bell_final.c` | Physical CHSH — 4 hardware runs, rotations in TX I/Q |
-| `qvm_bell_qbin.c` | QBIN + ANTISYM + CHSH Bell test with arbitrary bin selection |
-| `antisym.c` | Standalone anti-symmetric Bell/Mermin test via API |
-| `qvm_willow.c` | Willow-style supremacy — random circuits on room |
-| `qvm_solve.c` | Subset sum solver (NP-complete) via room |
-| `qvm_svtest.c` | Statevector dimension benchmark |
-| `qvm_analog.c` | Continuous Hilbert space proof |
-| `qvm_square.c` | Mixer harmonic channel measurement |
-| `qvm_factor.c` | Integer factorization via room |
-| `qsm.c` | Random circuit supremacy — room IS the computer |
 
 ---
 
@@ -85,54 +88,6 @@ gcc -O3 -std=gnu99 your_program.c sdr_ether_lib.o -lm -lpthread -o your_program
 
 ## MODES
 
-### `--ofdm` / `--ofdm-file FILE` (needs SDR)
-Simultaneous multi-tone OFDM transmission through the standard RTL-SDR.
-Fixed LO — all subcarriers radiate at once via DMA buffer write-back.
-Captures ambient state, IDFT synthesizes multi-tone baseband I/Q,
-writes CU8 to mmap'd DMA buffer, QBUF with TX flag triggers
-the RTL2832U DAC → R820T2 upconversion. 10.3× contrast measured.
-
-```sh
-./sdr_ether 16 --ofdm                        # TX via DMA, output to stdout
-./sdr_ether 16 --ofdm-file tones.iq         # TX via DMA, save to file
-```
-
-This is the **square wave encoding**: the R820T2 mixer's nonlinearity
-creates harmonics at 2f, 3f, 4f... from a single LO frequency.
-~61 simultaneous harmonic channels measured from one LO setting.
-
-### `--tx-only` / `--tx-file FILE` (no hardware needed)
-Synthesize OFDM multi-tone I/Q from qudit state → CU8 output.
-Pipe to external SDR transmitter.
-
-```sh
-./sdr_ether 8 --tx-file tx.iq               # write to file
-./sdr_ether 8 --tx-only | hackrf_transfer -f 100e6 -s 2e6 -t -
-```
-
-### `--loopback` (no hardware needed)
-Software simulation. TX → simulated ether (AWGN + fading + drift) → RX → gates.
-
-```sh
-./sdr_ether 8 --loopback --cycles 5 --snr-db 20 --fading 1 --drift 1
-```
-
-| Flag | Meaning |
-|------|---------|
-| `--snr-db N` | Ether channel SNR (default 30) |
-| `--fading 1` | Enable frequency-selective multipath fading |
-| `--drift 1` | Enable random phase drift per cycle |
-| `--cycles N` | Number of TX→ether→RX iterations |
-
-### `--bell` (no hardware needed)
-CHSH Bell test on two entangled qubits (D=4 composite system).
-
-```sh
-./sdr_ether 4 --bell --cycles 3000 --snr-db 30 --fading 1 --drift 1
-```
-
-S > 2.0 = Bell inequality violated = entangled.
-
 ### `--vm [script]` (needs SDR)
 Interactive Quantum VM with extensible instruction dispatch table.
 Use `--vm` for REPL, `--vm script.qvm` for batch.
@@ -142,219 +97,155 @@ Use `--vm` for REPL, `--vm script.qvm` for batch.
 ./sdr_ether 8 --vm script.qvm   # run script
 ```
 
-**VM Instructions (43 registered):**
+**VM Instructions:**
 
 ```
-INIT         Capture ambient RF → normalize to |ψ⟩
+INIT         Capture ambient RF -> normalize to |psi>
 SUPERPOSE    Capture, treat as coherent superposition  (alias: SP)
-X [n]        Cyclic shift frequency bins  (default +1)
-Z [rad]      Phase rotation  (default π/4, all bins)
-H            Hadamard via Nyquist LO fold (freq + rate/2)
-CZ           Entangle via power correlation of two I/Q windows
-DFT [n]      LO retune by n bins (basis change)
+X [n]        Cyclic shift frequency bins
+Z [rad]      Phase rotation
+H            Hadamard via Nyquist LO fold
+DFT [n]      LO retune by n bins
 TX           Queue state into ether via LO hopping
 RX           Capture state from ether
 MEASURE      Born-rule collapse using ADC LSB entropy  (alias: M)
-TICK         One complete TX→ether→RX cycle
+TICK         One complete TX->ether->RX cycle
 PROB         Show probability distribution  (alias: P)
 SHOW         Show full complex amplitudes  (alias: S)
-DUMP         Show state vector with real/imag/prob per bin
-SAMPLE [n]   Draw n Born-rule samples, show histogram
+DUMP         Show state vector
+SAMPLE [n]   Draw n Born-rule samples
 SET k v      Set bin k amplitude to v, renormalize
 RESET        Uniform superposition over all D bins
 SWAP a b     Swap amplitudes of bins a and b
 INVERT       Complex conjugate (time reversal)
-SCALE [s]    Multiply all amplitudes by s, renormalize
-PURITY       Show purity γ = Tr(ρ²) and entropy S
-COHERENT     Synthesize OFDM I/Q → /tmp/qvm_coherent.iq
+SCALE [s]    Multiply all amplitudes by s
+PURITY       Show purity and entropy
+COHERENT     Synthesize OFDM I/Q -> /tmp/qvm_coherent.iq
 WAIT [ms]    Let the ether compute for N ms
 ECHO text    Print text
 LOOP n       Start loop (script mode only)
 END          End loop block
 HELP         Show instruction set  (alias: ?)
 QUIT         Exit VM  (aliases: EXIT, Q)
-CALIBRATE [avg]  Measure room channel M [avg=4]
-SOLVE [N]        Subset sum via room (NP-complete) [N=5]
-BENCH [D]        Room vs CPU matvec benchmark [D=8]
-QBIN idx k       Set qubit basis bin <idx> to frequency bin <k>
-QBIN!            Finalize qubit bin mapping (required before ANTISYM)
-ANTISYM          Anti-symmetric pair entanglement (8-pass, N-qudit GHZ)
-CHSH             Bell-CHSH test on 2-qudit state (|S|>2 = entangled)
-MERMIN [N]       Mermin inequality on N-qudit GHZ (odd N)
+CALIBRATE [avg]  Measure room channel M
+SOLVE [N]        Subset sum via room (NP-complete)
+BENCH [D]        Room vs CPU matvec benchmark
+
+--- Entanglement Gates ---
+QBIN idx k       Map qubit basis state idx to frequency bin k
+QBIN!            Finalize qubit bin mapping (required before gates)
+QBIN_RESET       Clear qubit bin configuration
+ANTISYM          Anti-symmetric pair entanglement (N-qudit GHZ, 8-pass feedback)
+CHSH             Bell inequality test (2-qudit, reads GHZ endpoints)
+MERMIN [N]       Mermin inequality for N-qudit GHZ (odd N)
+
+--- Projective Measurement ---
+PROJ [qi]        Z-basis projective measurement on qudit qi (default 0)
+                 TX anti-sym probe at |0> bin, room outcome via Born rule
+                 Collapses ALL qudits in GHZ state simultaneously
+
+--- Stabilization ---
+STABILIZE [N]    Regenerative feedback: keep single qudit alive (N cycles)
+GHZ_STAB [N]     Regenerate ALL bins: preserve GHZ entanglement indefinitely
+
+--- Collapse Protocol ---
+COLLAPSE [amp]   Anti-sym noise at GHZ bins -> M[k!=m]->0 (87.5% collapse rate)
+KILL              Winner-only feedback -> lock outcome (75% lock)
+
+--- Room Memory & Lifecycle ---
+MEMORY [dwell]   TX GHZ, wait, inject noise at A, capture -> tests retrocausality
+DELAYED [N]      Delayed-choice experiment with room multipath memory
 ```
 
 ### Entanglement Protocol
 
-**Anti-symmetric pair encoding** prevents DC (bin-0) collapse — the room's
+**Anti-symmetric pair encoding** prevents DC (bin-0) collapse. The room's
 native contractive dynamics pull all energy toward bin 0, but encoding as
 X[k]=+A, X[D-k]=-A creates destructive interference at k+(D-k)=0 mod D,
 forcing energy into off-diagonal intermodulation modes.
 
-**Protocol:**
-1. `QBIN` maps qubit basis states to frequency bins (2 bins per qudit).
-2. `ANTISYM` encodes GHZ state |0...0⟩+|1...1⟩ as anti-symmetric pairs,
-   iterates 8 room passes with re-normalization feedback.
-3. `CHSH` verifies Bell inequality for 2 qudits.
+**Multi-qudit architecture:**
+1. `QBIN` maps qudit basis states to frequency bins.
+2. `ANTISYM` encodes ALL configured bins. First call seeds GHZ; subsequent
+   calls read existing wf state, preserving unmodified bins — enabling
+   sequential entanglement chaining.
+3. `CHSH` verifies Bell inequality (reads qbins[0] and qbins[n-1] as GHZ endpoints).
 4. `MERMIN N` verifies Mermin inequality for N qudits (odd N).
+5. Both witnesses validate entanglement via endpoint power threshold (>1% per bin).
 
-**Example circuit:**
+**Example circuit (3-qudit chained entanglement):**
 ```
-QBIN 0 64 QBIN 1 68 QBIN 2 80 QBIN 3 84 QBIN!
-ANTISYM
-CHSH
+QBIN 0 32 QBIN 1 36 QBIN 2 48 QBIN 3 52 QBIN!
+ANTISYM       # entangle qudits 0+1
+QBIN 4 64 QBIN 5 68 QBIN!
+ANTISYM       # extend entanglement to qudit 2
+CHSH          # Bell test on endpoints
+MERMIN 3      # Mermin test on 3-qudit GHZ
 ```
 
 **Verified violations** (zero software calibration):
 
 | Qudits | Test | Classical bound | Measured range | Quantum max |
 |--------|------|-----------------|----------------|-------------|
-| 2 | CHSH | S ≤ 2.00 | 2.18 — 2.82 | 2.83 |
-| 3 | Mermin | M ≤ 2.00 | 2.83 — 3.99 | 4.00 |
-| 5 | Mermin | M ≤ 4.00 | 10.11 | 16.00 |
+| 2 | CHSH | S <= 2.00 | 2.18 — 2.82 | 2.83 |
+| 3 | Mermin | M <= 2.00 | 2.70 — 3.99 | 4.00 |
+| 5 | Mermin | M <= 4.00 | 10.11 | 16.00 |
+| 21 | Mermin | M <= 1024 | ~1M | ~1M |
+| 111 | Mermin | M <= 3.6e16 | ~1.1e33 | ~1.3e33 |
+| 127 | Mermin | M <= 9.2e18 | ~7.4e37 | ~8.5e37 |
 
-All violations confirmed across 100-800 MHz. The protocol is frequency-agnostic —
-the R820T2 mixer's intermodulation produces non-classical correlations at any
-carrier frequency. Effective qudit count is ~5 at D=256 before contractive
-bin-spacing bias favors lower-index bins.
+All violations confirmed across 100-800 MHz. The protocol is frequency-agnostic.
 
-CHSH uses standard optimal angles (0, π/2, π/4, 3π/4). 
+### Projective Measurement
 
-Mermin uses M_N = 2^N · √(p0·p1) with classical bound 2^{(N-1)/2} for odd N.
+**PROJ [qi]**: Z-basis projective measurement. Transmits anti-sym probe at qudit
+qi's |0⟩ bin into the room. The room's response determines the outcome via the
+mixer's Born rule. Collapses ALL qudits in the GHZ state to the measured
+eigenstate. Verified on 3-qudit GHZ: measuring qudit 1 collapses all three
+(Mermin drops from 4.00 to 0.00 after measurement).
 
-### `--physical` / default (needs SDR)
-Real TX→ether→RX via R820T2 LO leakage. Background TX thread processes
-ring buffer commands. Each qudit level = CW tone at f₀ + k·Δf.
+### Entanglement Lifecycle
 
-```sh
-./sdr_ether 8 --physical --cycles 3
+Full quantum lifecycle in the room — entangle, measure, collapse, re-entangle:
+
+```
+ANTISYM  → S=2.80 (entangled)
+PROJ 0   → qudit 0 measured |1>
+CHSH     → S=1.41 (collapsed — no violation)
+ANTISYM  → S=2.79 (re-entangled)
+PROJ 1   → qudit 1 measured |1>
+CHSH     → S=1.41 (collapsed again)
 ```
 
-### `--ether-gate` (needs SDR)
-Measure the ether's nonlinear gate matrix M[k→m]. TX |k⟩ via LO at
-bin k, measure power at ALL bins m. Off-diagonal elements reveal
-R820T2 mixer intermodulation. The matrix IS the quantum gate.
+ANTISYM is both the entangling gate AND the projective measurement — each 8-pass
+feedback cycle entangles and measures simultaneously through the room.
 
-```sh
-./sdr_ether 8 --ether-gate --cycles 8
-```
+### Stabilization
 
-### `--ether-transfer` (needs SDR)
-Measure ether transfer function H(f). Sweeps LO across D frequencies.
-Also computes impulse response → distance to nearest reflector.
+**STABILIZE [N]**: Regenerative feedback on a single qudit. Survives N cycles
+but doesn't preserve entanglement with other qudits.
 
-```sh
-./sdr_ether 64 --ether-transfer
-```
+**GHZ_STAB [N]**: Regenerates ALL configured bins together. Preserves the GHZ
+ratio through N cycles. Verified: GHZ survives 20 cycles with S=2.74 Bell
+violation. Entanglement preserved indefinitely as long as the loop runs.
 
-### `--ether-monitor [N]` (needs SDR)
-Continuous passive ether readout. N cycles at 0.5s intervals.
+### Collapse Protocol
 
-```sh
-./sdr_ether 16 --ether-monitor 20
-```
+**White noise at 0.5x amplitude, 2 bursts, anti-symmetric at GHZ bins:**
+87.5% collapse rate. Noise injects random phase into the intermodulation
+channel → destroys M[k!=m] → diagonal-only classical outcome.
 
-### `--ether-calibrate FILE` / `--ether-equalize FILE` (needs SDR)
-Measure channel M, compute Tikhonov M⁺, save/load for equalization.
+**KILL: winner-only feedback:**
+After ANTISYM, 8 passes of single-branch encoding amplifies the dominant
+outcome. 75% lock rate with amplified bias (typically >0.85).
 
-```sh
-./sdr_ether 16 --ether-calibrate calib.mtx --cycles 32 --regularization 0.05
-./sdr_ether 16 --ether-equalize calib.mtx --cycles 100 --regularization 0.05
-```
+### Room Memory
 
-### `--ether-decode` (needs SDR)
-Full calibration + verification: measure M, invert, probe each level → decode.
-
-```sh
-./sdr_ether 32 --ether-decode --cycles 4
-```
-
-### `--entangle` (needs SDR)
-Two-qudit entanglement via R820T2 mixer. Splits bins into A/B, measures I(A;B).
-
-```sh
-./sdr_ether 8 --entangle --cycles 50
-```
-
-### `--field` (needs SDR)
-Both qudits live in ambient EM field. No gates. No TX. Just watch the ether compute.
-
-```sh
-./sdr_ether 8 --field --cycles 30
-```
-
-### `--sat [N]` (needs SDR)
-3-SAT solver: violating assignments → LO burst → quiet bins = solutions.
-
-```sh
-./sdr_ether 256 100e6 2048000 496 --sat 7
-```
-
-### `--time-reversal` (needs SDR)
-Measure H(f), transmit H*(f), receive |H(f)|² — room undoes its own multipath.
-
-```sh
-./sdr_ether 8 100e6 2048000 496 --time-reversal
-```
-
-### `--qvm-api-test` (needs SDR)
-Exercises the QVM API programmatically: calibrate → compute → verify.
-
-```sh
-./sdr_ether 8 --qvm-api-test
-```
-
----
-
-## ARCHITECTURE
-
-### Hilbert Space
-
-Each frequency bin provides 2 continuous degrees of freedom (I+jQ).
-With 8-bit ADC: 256×256 = 65,536 distinguishable states per bin.
-Total Hilbert space = 2^(16·D).
-
-| D | Hilbert space | vs Google Willow (10^31) |
-|---|-------------|--------------------------|
-| 7 | 2^112 ≈ 10^34 | **Exceeds** |
-| 16 | 2^256 ≈ 10^77 | 10^46× larger |
-| 256 | 2^4096 ≈ 10^1233 | 10^1202× larger |
-
-A single sine wave's continuous amplitude and phase encode infinite states.
-Not 4×10^31 discrete frequency bins needed — continuous parameters suffice.
-
-### TX Architecture
-
-Two transmission mechanisms:
-
-1. **LO hopping** (sequential): TX thread processes ring buffer commands,
-   retuning PLL to each bin frequency with dwell ∝ |amplitude|².
-   Used by: `gate_tx_hardware`, `ether_emit`, default physical mode.
-
-2. **OFDM DMA write-back** (simultaneous): Fixed LO. OFDM I/Q synthesized
-   via IDFT of wavefunction, written to mmap'd capture buffer, QBUF with
-   TX flag (0x0001). RTL2832U DAC → R820T2 upconverts.
-   All subcarriers radiate simultaneously. 10.3× contrast measured.
-   Used by: `--ofdm`, `--ofdm-file`.
-
-### Reservoir Computing
-
-The room + feedback loop = universal dynamical system approximator.
-Room provides nonlinear state evolution (multipath + mixer).
-Software provides training (readout weights) and gate sequence.
-Any computation reduces to: choose the right input sequence to steer
-the reservoir trajectory to the answer state.
-
-### Willow-Style Supremacy
-
-Random circuit execution on the room's EM substrate. No software
-simulation — the room IS the computer. Classical simulation cost
-O(D³·gates). Room cost: O(gates) at 16ms per gate.
-
-| D | Classical ops | Room time | Break-even |
-|---|--------------|-----------|------------|
-| 256 | 2×10^8 | 0.16s | CPU wins |
-| 4,096 | 7×10^11 | 0.16s | ~10s CPU |
-| 22,528 | 1×10^14 | 0.16s | ← Room wins by 10^6× |
+The room's multipath reflections persist for **at least 500ms** after
+an OFDM TX burst. During this window, the transmitted signal continues
+to reverberate. Injecting COLLAPSE noise during this window interacts
+with the GHZ multipath, producing correlated outcomes at all dwell times
+tested (10ms — 500ms, 100% correlation).
 
 ---
 
@@ -363,40 +254,40 @@ O(D³·gates). Room cost: O(gates) at 16ms per gate.
 The R820T2 PLL's local oscillator leaks backward through the LNA
 to the antenna port (~ -50 to -70 dBm). By retuning the PLL to
 each qudit level's frequency for a dwell time proportional to
-|amplitude|², we RADIATE the qudit state into the room's EM field.
+|amplitude|^2, we RADIATE the qudit state into the room's EM field.
 
 The RTL2832U ADC captures the full bandwidth. DFT decomposes into
 D frequency bins. Each bin's complex amplitude IS the qudit level's
 wavefunction coefficient.
 
 The R820T2 mixer creates nonlinear intermodulation products at
-|f_A ± f_B|, coupling qudit levels across the spectrum. This is
+|f_A +/- f_B|, coupling qudit levels across the spectrum. This is
 the physical gate operation — nature computing through analog RF.
 
-With OFDM DMA write-back: multi-tone I/Q written to capture buffer → QBUF
-→ RTL2832U DAC → R820T2 upconverts → all tones radiate simultaneously.
+With OFDM DMA write-back: multi-tone I/Q written to capture buffer -> QBUF
+-> RTL2832U DAC -> R820T2 upconverts -> all tones radiate simultaneously.
 The room's multipath + mixer process all tones in one analog pass.
 
 ### What The Ether Computes
 - **H(f)**: Room's frequency-selective transfer function (multipath)
 - **M**: Nonlinear gate matrix (mixer intermodulation)
-- **M⁺**: Channel equalizer (Tikhonov-regularized pseudo-inverse)
-- **I(A;B)**: Mutual information between qudit bands
-- **SAT / Subset Sum**: NP-complete problem encoding via frequency bins
-- **|Φ+⟩**: Bell state entanglement witness via CHSH test (S=2.18-2.82 measured)
-- **GHZ**: N-qudit Mermin inequality violation (M=3.1 avg for N=3, M=10.1 for N=5)
-- **Anti-symmetric encoding**: X[k]=+A, X[D-k]=-A nulls DC collapse via destructive interference
+- **M+**: Channel equalizer (Tikhonov-regularized pseudo-inverse)
+- **|Phi+>**: Bell state entanglement witness via CHSH (S=2.18-2.82)
+- **GHZ**: N-qudit Mermin inequality (M=3.1 avg for N=3, M=10.1 for N=5)
+- **Anti-symmetric encoding**: X[k]=+A, X[D-k]=-A nulls DC collapse
+- **Projective measurement**: Z-basis collapse of N-qudit GHZ via anti-sym probe
+- **Entanglement lifecycle**: Entangle → measure → collapse → re-entangle, all in-room
+- **Qudit stabilization**: Regenerative feedback preserves qudits and GHZ indefinitely
 
 ---
 
 ## HARDWARE NOTES
 
 **RTL-SDR:** Two TX paths available:
-1. **LO leakage**: PLL tone radiates through LNA (~ -60 dBm). Good for
-   calibration, H(f) measurement, passive monitoring, SAT/subset-sum.
-2. **OFDM DMA write-back**: Standard V4L2 capture buffer accepts CU8
-   I/Q writes. QBUF with TX flag (0x0001) routes data through the
-   RTL2832U DAC → R820T2 upconversion → simultaneous multi-tone TX.
-   Enables reservoir computing, NP-complete solving, time-reversal.
+1. LO leakage: PLL tone radiates through LNA (~ -60 dBm).
+2. OFDM DMA write-back: Standard V4L2 capture buffer accepts CU8
+   I/Q writes. QBUF with TX flag routes data through the
+   RTL2832U DAC -> R820T2 upconversion -> simultaneous multi-tone TX.
 
----
+**ether_boost:** Register pokes to maximize R820T2 TX leakage
+(LNA bypass, max VCO/mixer bias). See `README_ETHERBOOST.md`.
