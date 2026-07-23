@@ -3116,59 +3116,39 @@ static int op_mbasis(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* QEC_ENC li: 3-qubit bit-flip code encoding.
-   Entangles li with ancillas li+1, li+2 via CZ. */
-static int op_qec_encode(QvmCtx *q, double a1, double a2){
-    int li=((int)a1)>=0?(int)a1:0;(void)a2;
-    int nq=q->n_qbins/2;
-    if(li+2>=nq){printf("  [QEC_ENC] need %d qubits\n",li+3);return 0;}
-    char cmd[32];
-    snprintf(cmd,sizeof(cmd),"CZ %d %d",li,li+1);qvm_eval(q,cmd);
-    snprintf(cmd,sizeof(cmd),"CZ %d %d",li,li+2);qvm_eval(q,cmd);
-    printf("  [QEC_ENC] logical %d encoded\n",li);
-    return 0;
-}
+/* PlaneWarp QEC decoder */
+extern int solve_plane(int r, int s, unsigned char *syn, unsigned char *out);
+extern int preprocess_syndrome(int r, int s, unsigned char *syn);
 
-/* QEC_SYN li: measure ZZ syndromes, correct single bit-flip. */
-static int op_qec_syndrome(QvmCtx *q, double a1, double a2){
-    int li=((int)a1)>=0?(int)a1:0;(void)a2;
+static int op_qec_grid(QvmCtx *q, double a1, double a2){
+    int r=((int)a1)>0?(int)a1:4, s=((int)a2)>0?(int)a2:4;
     int nq=q->n_qbins/2;
-    if(li+2>=nq){printf("  [QEC_SYN] need %d qubits\n",li+3);return 0;}
-    int D=q->wf.d;
-    int syn[2]={0,0};
-    for(int p=0;p<2;p++){
-        int qa=li+p,qb=li+p+1;
-        int b1a=q->qbins[2*qa+1],b1b=q->qbins[2*qb+1];
-        double a2=0.7071,x[D],xi[D],y[D];
-        memset(x,0,D*8);memset(xi,0,D*8);
-        x[b1a]=+a2;x[D-b1a]=-a2;x[b1b]=+a2;x[D-b1b]=-a2;
-        for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-        double p1=y[b1a]+y[D-b1a]+y[b1b]+y[D-b1b];
-        syn[p]=(p1>0.01)?1:0;
-    }
-    if(syn[0]&&!syn[1]){
-        printf("  [QEC_SYN] error q%d corrected\n",li);
-        qvm_eval(q,"X 0"); /* X the first qubit (always qi=0 in current config) */
-        /* Actually we need to X the right qubit. Use XGATE. */
-        char c[8];snprintf(c,sizeof(c),"XGATE %d",li);qvm_eval(q,c);
-    }else if(syn[0]&&syn[1]){
-        char c[8];snprintf(c,sizeof(c),"XGATE %d",li+1);qvm_eval(q,c);
-        printf("  [QEC_SYN] error q%d corrected\n",li+1);
-    }else if(!syn[0]&&syn[1]){
-        char c[8];snprintf(c,sizeof(c),"XGATE %d",li+2);qvm_eval(q,c);
-        printf("  [QEC_SYN] error q%d corrected\n",li+2);
-    }else{
-        printf("  [QEC_SYN] no error\n");
-    }
-    return 0;
-}
+    if(r*s>nq){printf("  [QEC_GRID] need %d qubits (have %d)\n",r*s,nq);return 0;}
 
-/* QEC_READ li: measure logical qubit from encoded state. */
-static int op_qec_read(QvmCtx *q, double a1, double a2){
-    int li=((int)a1)>=0?(int)a1:0;(void)a2;
-    op_qec_syndrome(q,a1,a2); /* correct errors first */
-    op_proj_meas(q,a1,a2);     /* then measure */
+    /* Read outcomes from WF (not active measurement) */
+    int *outcomes=calloc(r*s,sizeof(int));
+    for(int i=0;i<r*s;i++){
+        outcomes[i]=(q->wf.prob[q->qbins[2*i+1]]>q->wf.prob[q->qbins[2*i]])?1:0;
+    }
+
+    /* Stride-2 plaquette syndrome */
+    unsigned char *syn=calloc(r*s,1), *corr=calloc(r*s,1);
+    for(int i=0;i<r-1;i+=2)
+        for(int j=0;j<s-1;j+=2)
+            syn[i*s+j]=outcomes[i*s+j]^outcomes[(i+2)*s+j]
+                       ^outcomes[i*s+(j+2)]^outcomes[(i+2)*s+(j+2)];
+
+    preprocess_syndrome(r,s,syn);
+    int ok=solve_plane(r,s,syn,corr);
+    printf("  [QEC_GRID] %dx%d decode=%s",r,s,ok?"OK":"ABSTAIN");
+
+    int ncorr=0;
+    char cmd[16];
+    for(int i=0;i<r*s;i++)if(corr[i]){
+        snprintf(cmd,sizeof(cmd),"XGATE %d",i);qvm_eval(q,cmd);ncorr++;
+    }
+    printf("  corrected=%d\n",ncorr);
+    free(outcomes);free(syn);free(corr);
     return 0;
 }
 
@@ -3205,9 +3185,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "XGATE",     op_x_gate,    "Pauli-X (NOT) gate");
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
-    qvm_reg(q, "QEC_ENC",   op_qec_encode,"3-qubit bit-flip code encode");
-    qvm_reg(q, "QEC_SYN",   op_qec_syndrome,"measure ZZ syndromes, correct");
-    qvm_reg(q, "QEC_READ",  op_qec_read,  "correct then measure logical");
+    qvm_reg(q, "QEC_GRID",  op_qec_grid,  "PlaneWarp toric code on r x s grid");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
