@@ -2076,6 +2076,26 @@ static void qvm_norm(Wavefunction *w) {
         w->purity+=w->prob[i]*w->prob[i];}
 }
 
+/* ── Spectral whitening ──
+   Clips high-amplitude narrowband interferers (e.g. military airband,
+   FM BCB bleed-through) that would otherwise dominate the wavefunction.
+   Any bin exceeding avg_power * max_snr is scaled down, then the WF
+   is re-normalized.  Use before INIT / ANTISYM to flatten the noise floor. */
+static void ether_whiten_spectrum(Wavefunction *wf, double max_snr){
+    double avg=0; int D=wf->d;
+    for(int k=0;k<D;k++) avg+=wf->re[k]*wf->re[k]+wf->im[k]*wf->im[k];
+    avg/=D;
+    for(int k=0;k<D;k++){
+        double p=wf->re[k]*wf->re[k]+wf->im[k]*wf->im[k];
+        if(p>avg*max_snr){
+            double sc=sqrt((avg*max_snr)/p);
+            wf->re[k]*=sc; wf->im[k]*=sc;
+        }
+    }
+    qvm_norm(wf);
+    printf("  [WHITEN] max_snr=%.0f×  D=%d\n",max_snr,D);
+}
+
 static void qvm_sync(QvmCtx *q) {
     if (!q->sdr_ok) return;
     ether_emit(q->sdr, &q->wf);
@@ -2102,8 +2122,15 @@ static QvmOp qvm_lookup(QvmCtx *q, const char *name){
 static int op_init(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(q->sdr_ok){sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
-    printf("  [INIT] Capture from ether\n");
+    ether_whiten_spectrum(&q->wf,3.0);
+    printf("  [INIT] Capture from ether (whitened)\n");
     wf_print(&q->wf,"|ψ⟩",-1); return 0;
+}
+
+static int op_whiten(QvmCtx *q, double a1, double a2){
+    double snr=(a1>0)?a1:3.0;(void)a2;
+    ether_whiten_spectrum(&q->wf,snr);
+    return 0;
 }
 
 static int op_superpose(QvmCtx *q, double a1, double a2){
@@ -3337,7 +3364,8 @@ static int op_qec_coh(QvmCtx *q, double a1, double a2){
 
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
-    qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
+    qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
+    qvm_reg(q, "WHITEN",    op_whiten,    "spectral whitening [max_snr=3.0]");
     qvm_reg(q, "SUPERPOSE", op_superpose, "coherent decomposition");
     qvm_reg(q, "SP",        op_superpose, "alias for SUPERPOSE");
     qvm_reg(q, "X",         op_x,         "cyclic shift [n=1]");
