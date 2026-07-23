@@ -3087,7 +3087,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "X",         op_x,         "cyclic shift [n=1]");
     qvm_reg(q, "Z",         op_z,         "phase rotate [rad=π/4] [k=-1=all]");
     qvm_reg(q, "H",         op_h,         "Hadamard via LO hop");
-    qvm_reg(q, "CZ",        op_cz,        "entangle via complex cross-corr");
+    qvm_reg(q, "CZ",        op_cz_gate,   "controlled-Z gate on two qubits");
     qvm_reg(q, "ANTISYM",   op_antisym,   "anti-sym pair entangle (8-pass feedback)");
     qvm_reg(q, "CHSH",      op_chsh,      "Bell inequality test on qbin state");
     qvm_reg(q, "MERMIN",    op_mermin,    "Mermin inequality for N-qudit GHZ");
@@ -3109,7 +3109,6 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "CREATE",    op_create,    "algebraic creation a^dagger on qudit");
     qvm_reg(q, "ANNIHILATE",op_annihilate,"algebraic annihilation a on qudit");
     qvm_reg(q, "OCCUPATION",op_occupation,"measure occupation through room");
-    qvm_reg(q, "CZ",        op_cz_gate,   "controlled-Z gate on two qubits");
     qvm_reg(q, "XGATE",     op_x_gate,    "Pauli-X (NOT) gate");
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
