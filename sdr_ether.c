@@ -2060,7 +2060,8 @@ struct QvmCtx {
     int    M_dim;
 
     /* Qubit bin mapping for ANTISYM gate (up to 128 qudits = 256 bins) */
-    int    qbins[2048];
+    int    qbins[32768];
+    int    noise_pct; /* QEC noise injection level */
     int    n_qbins;
 };
 
@@ -2154,14 +2155,14 @@ static int op_cz(QvmCtx *q, double a1, double a2){
 
 static int op_qbin(QvmCtx *q, double a1, double a2){
     (void)a2;
-    if(a1>=2048){printf("  [QBIN] max 2048 bins (1024 qudits)\n");return 0;}
+    if(a1>=32768){printf("  [QBIN] max 32768 bins (16384 qudits)\n");return 0;}
     q->qbins[(int)a1]=(int)a2;
     return 0;
 }
 static int op_qbin_done(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     q->n_qbins=0;
-        for(int i=0;i<1024;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
+        for(int i=0;i<32768;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
     printf("  [QBIN] %d bins (%d qudits): ",q->n_qbins,q->n_qbins/2);
     for(int i=0;i<q->n_qbins && i<20;i++)printf("%d ",q->qbins[i]);
     if(q->n_qbins>20)printf("...");
@@ -2992,10 +2993,8 @@ static int op_create(QvmCtx *q, double a1, double a2){
     int qi=((int)a1)>=0?(int)a1:0;(void)a2;
     int nq=q->n_qbins/2;if(qi>=nq)return 0;
     int b0=q->qbins[2*qi];
-    double n=q->wf.prob[b0];if(n<1e-10)n=0.01;
-    double factor=sqrt((n+0.1)/n);
-    q->wf.prob[b0]*=factor;q->wf.re[b0]=sqrt(q->wf.prob[b0]);
-    printf("  [CREATE] qudit %d n=%.3f\n",qi,q->wf.prob[b0]);
+    q->wf.prob[b0]=1.0;q->wf.re[b0]=1.0;
+    q->wf.prob[q->qbins[2*qi+1]]=0.0;q->wf.re[q->qbins[2*qi+1]]=0.0;
     return 0;
 }
 /* ANNIHILATE qi: algebraic annihilation a on qudit qi. */
@@ -3125,51 +3124,82 @@ static int op_qec_grid(QvmCtx *q, double a1, double a2){
     int nq=q->n_qbins/2;
     if(r*s>nq){printf("  [QEC_GRID] need %d qubits (have %d)\n",r*s,nq);return 0;}
 
-    /* GHZ collapse: single PROJ measurement sets the expected value.
-       Then for each qubit, PROJ gives a room measurement.
-       But PROJ-per-qubit is slow. Compare WF directly; ambiguous (~0.02 margin)
-       qubits get the expected outcome (soft-decision). */
-    qvm_eval(q,"PROJ 0");
-    int expected = (q->wf.prob[q->qbins[1]] > q->wf.prob[q->qbins[0]]) ? 1 : 0;
-    printf("  [QEC_GRID] PROJ(0)=%d (%d qubits)\n",expected,r*s);
-
-    /* All qubits tracked to expected. WF per-qubit differences are small
-       (~0.008), so use ratio p1/p0 > 1.0 to detect XGATE flips. */
+    /* Read outcomes from WF directly (no PROJ — avoids capture trashing WF).
+       The WF was set algebraically by CREATE + XGATE. */
     int *outcomes=calloc(r*s,sizeof(int));
-    int nerr=0;
+    int n1=0;
     for(int i=0;i<r*s;i++){
         double p0=q->wf.prob[q->qbins[2*i]], p1=q->wf.prob[q->qbins[2*i+1]];
-        int raw=(p1>p0)?1:0;
-        outcomes[i]=raw;
-        if(raw!=expected) nerr++;
+        outcomes[i]=(p1>p0)?1:0;
+        n1+=outcomes[i];
     }
-    printf("  [QEC_GRID] WF errors=%d (expected=%d)\n",nerr,expected);
+    int expected=(n1>r*s/2)?1:0;
+    printf("  [QEC_GRID] expected=%d (|1>=%d/%d=%.1f%%)\n",
+           expected,n1,r*s,100.0*n1/(double)(r*s));
 
-    /* Stride-2 plus syndrome: (1+x²)(1+y²) with torus wrap */
+    /* Error pattern: qubits that disagree with expected */
+    int nerr=0;
+    for(int i=0;i<r*s;i++) if(outcomes[i]!=expected) nerr++;
+    printf("  [QEC_GRID] raw errors=%d/%.1f%%\n",nerr,100.0*nerr/(double)(r*s));
+
+    /* Use stored noise_pct from QEC_NOISE command */
+    int noise_pct=q->noise_pct;
+
+    /* Build error pattern */
     unsigned char *syn_bytes=calloc(r*s,1), *corr=calloc(r*s,1);
     uint8_t *err_pat=calloc(r*s,1);
-    for(int i=0;i<r*s;i++) err_pat[i]=(outcomes[i]!=expected)?1:0;
+    if(noise_pct>0){
+        srand(42);
+        int n_noisy=0;
+        for(int i=0;i<r*s;i++){
+            if((rand()%100)<noise_pct){
+                if(err_pat[i]) err_pat[i]=0; else err_pat[i]=1;
+                n_noisy++;
+            }
+        }
+        printf("  [QEC_GRID] +%d noisy flips (%d%%)\n",n_noisy,noise_pct);
+    }
+    for(int i=0;i<r*s;i++)
+        err_pat[i]^=(outcomes[i]!=expected)?1:0;
+
     syndrome_of(r,s,err_pat,syn_bytes);
-    free(err_pat);
-
-    /* Print syndrome for debugging */
-    printf("  [QEC_GRID] syn (%dx%d):",r,s);
-    for(int i=0;i<r*s;i++){if(i%s==0)printf(" ");printf("%d",syn_bytes[i]);}
-    printf("\n");
-
     preprocess_syndrome(r,s,syn_bytes);
     solve_plane(r,s,syn_bytes,corr);
-    printf("  [QEC_GRID] corr:");
-    for(int i=0;i<r;i++){printf(" ");for(int j=0;j<s;j++)printf("%d",corr[i*s+j]);}
-    printf("\n");
+
+    /* Verify: remaining = err_pat ^ corr should be a stabilizer */
+    uint8_t *remaining=calloc(r*s,1);
+    for(int i=0;i<r*s;i++) remaining[i]=err_pat[i]^corr[i];
+    uint8_t *residue=calloc(r*s,1);
+    syndrome_of(r,s,remaining,residue);
+    int resid_cnt=0;
+    for(int i=0;i<r*s;i++) if(residue[i]) resid_cnt++;
+    free(remaining);free(residue);
+
+    int errors_before=0, errors_after=0, hits=0, fp=0;
+    for(int i=0;i<r*s;i++){
+        if(err_pat[i]) errors_before++;
+        if(err_pat[i]^corr[i]) errors_after++;
+        if(corr[i]&&err_pat[i]) hits++;
+        if(corr[i]&&!err_pat[i]) fp++;
+    }
+    int net=errors_before-errors_after;
 
     int ncorr=0;
     char cbuf[16];
     for(int i=0;i<r*s;i++)if(corr[i]){
         snprintf(cbuf,sizeof(cbuf),"XGATE %d",i);qvm_eval(q,cbuf);ncorr++;
     }
-    printf("  corrected=%d\n",ncorr);
-    free(outcomes);free(syn_bytes);free(corr);
+    printf("  [QEC_GRID] before=%d corrected=%d after=%d residue=%d | net=%+d  hits=%d fp=%d\n",
+           errors_before,ncorr,errors_after,resid_cnt,net,hits,fp);
+
+    free(outcomes);free(syn_bytes);free(corr);free(err_pat);
+    return 0;
+}
+
+/* QEC_NOISE pct: set noise injection level for QEC_GRID */
+static int op_qec_noise(QvmCtx *q, double a1, double a2){
+    q->noise_pct=(a1>=0)?(int)a1:0;(void)a2;
+    printf("  [QEC] noise level = %d%%\n",q->noise_pct);
     return 0;
 }
 
@@ -3207,6 +3237,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
     qvm_reg(q, "QEC_GRID",  op_qec_grid,  "PlaneWarp toric code on r x s grid");
+    qvm_reg(q, "QEC_NOISE", op_qec_noise, "set noise injection % for QEC");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
@@ -3417,7 +3448,7 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
         q->wf.purity=1.0/D; q->wf.entropy=log2(D);
     }
     q->running = 1;
-    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0;
+    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0;
     qvm_init_ops(q);
     return q;
 }
@@ -3456,8 +3487,8 @@ int qvm_run(QvmCtx *q, const char *script_path){
         FILE *f = fopen(script_path, "r");
         if (!f) { fprintf(stderr,"[VM] Cannot open %s\n",script_path); return 1; }
         char lbuf[512];
-        q->lines = malloc(1024*sizeof(char*));
-        while (fgets(lbuf,sizeof(lbuf),f) && q->nlines<1024) {
+        q->lines = malloc(131072*sizeof(char*));
+        while (fgets(lbuf,sizeof(lbuf),f) && q->nlines<131072) {
             char *nl=strchr(lbuf,'\n');if(nl)*nl=0;
             char *cmt=strchr(lbuf,'#');if(cmt)*cmt=0;
             char *s=lbuf; while(*s==' '||*s=='\t')s++;
