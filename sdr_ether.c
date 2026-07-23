@@ -2958,17 +2958,8 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
     /* Check if WF was already collapsed (all qudits same, one branch zero) */
     double wf0=0,wf1=0;int eq0=1,eq1=1;
     for(int i=0;i<nq;i++){wf0+=q->wf.prob[q->qbins[2*i]];wf1+=q->wf.prob[q->qbins[2*i+1]];}
-    /* Detect collapse: one branch has zero total, or all qudits identical */
-    int collapsed = (wf0<0.01||wf1<0.01);
-    if(!collapsed){
-        double first0=q->wf.prob[q->qbins[0]],first1=q->wf.prob[q->qbins[1]];
-        collapsed=1;
-        for(int i=1;i<nq&&collapsed;i++){
-            if(fabs(q->wf.prob[q->qbins[2*i]]-first0)>0.01)collapsed=0;
-            if(fabs(q->wf.prob[q->qbins[2*i+1]]-first1)>0.01)collapsed=0;
-        }
-    }
-    if(collapsed){
+    /* Detect collapse: one branch has zero total across all qudits */
+    if(wf0<0.01||wf1<0.01){
         int outcome=(wf1>wf0)?1:0;
         printf("  [PROJ] qudit %d collapsed -> |%d>\n",qi,outcome);
         return 0;
@@ -3040,6 +3031,42 @@ static int op_occupation(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* CZ qa qb: controlled-Z gate. Entangles two qubits via anti-sym pair
+   at their |1⟩ bins only, leaving all other qubits untouched. */
+static int op_cz_gate(QvmCtx *q, double a1, double a2){
+    int qa=((int)a1)>=0?(int)a1:0, qb=((int)a2)>=0?(int)a2:1;
+    int nq=q->n_qbins/2;
+    if(qa>=nq||qb>=nq){printf("  [CZ] bad qubits\n");return 0;}
+    if(!q->sdr_ok)return 0;
+    int b1a=q->qbins[2*qa+1], b1b=q->qbins[2*qb+1]; /* |1⟩ bins */
+    int D=q->wf.d;
+    double amp=0.7071,x[D],xi[D],y[D];
+
+    /* Read existing WF state for these two qubits */
+    double pa0=q->wf.prob[q->qbins[2*qa]],pa1=q->wf.prob[b1a];
+    double pb0=q->wf.prob[q->qbins[2*qb]],pb1=q->wf.prob[b1b];
+    double ta=pa0+pa1,tb=pb0+pb1;
+    if(ta<1e-10||tb<1e-10)ta=tb=1;
+
+    /* TX anti-sym at both |1⟩ bins with existing amplitudes */
+    memset(x,0,D*8);memset(xi,0,D*8);
+    if(pa1>1e-10){x[b1a]=+sqrt(pa1/ta);x[D-b1a]=-sqrt(pa1/ta);}
+    else{x[b1a]=+amp;x[D-b1a]=-amp;}
+    if(pb1>1e-10){x[b1b]=+sqrt(pb1/tb);x[D-b1b]=-sqrt(pb1/tb);}
+    else{x[b1b]=+amp;x[D-b1b]=-amp;}
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,D);
+
+    /* Update only these two qubits, preserve others */
+    double s=y[b1a]+y[D-b1a]+y[b1b]+y[D-b1b];
+    if(s>1e-15){
+        q->wf.prob[b1a]=(y[b1a]+y[D-b1a])/s;
+        q->wf.prob[b1b]=(y[b1b]+y[D-b1b])/s;
+    }
+    printf("  [CZ] qudits %d-%d entangled\n",qa,qb);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
@@ -3070,6 +3097,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "CREATE",    op_create,    "algebraic creation a^dagger on qudit");
     qvm_reg(q, "ANNIHILATE",op_annihilate,"algebraic annihilation a on qudit");
     qvm_reg(q, "OCCUPATION",op_occupation,"measure occupation through room");
+    qvm_reg(q, "CZ",        op_cz_gate,   "controlled-Z gate on two qubits");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
