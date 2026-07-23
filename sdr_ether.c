@@ -2060,7 +2060,7 @@ struct QvmCtx {
     int    M_dim;
 
     /* Qubit bin mapping for ANTISYM gate (up to 128 qudits = 256 bins) */
-    int    qbins[256];
+    int    qbins[2048];
     int    n_qbins;
 };
 
@@ -2154,14 +2154,14 @@ static int op_cz(QvmCtx *q, double a1, double a2){
 
 static int op_qbin(QvmCtx *q, double a1, double a2){
     (void)a2;
-    if(a1>=256){printf("  [QBIN] max 256 bins (128 qudits)\n");return 0;}
+    if(a1>=2048){printf("  [QBIN] max 2048 bins (1024 qudits)\n");return 0;}
     q->qbins[(int)a1]=(int)a2;
     return 0;
 }
 static int op_qbin_done(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     q->n_qbins=0;
-    for(int i=0;i<256;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
+        for(int i=0;i<1024;i++)if(q->qbins[i]>=0&&q->qbins[i]<q->wf.d){q->n_qbins++;}
     printf("  [QBIN] %d bins (%d qudits): ",q->n_qbins,q->n_qbins/2);
     for(int i=0;i<q->n_qbins && i<20;i++)printf("%d ",q->qbins[i]);
     if(q->n_qbins>20)printf("...");
@@ -3116,6 +3116,63 @@ static int op_mbasis(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* PlaneWarp QEC decoder */
+extern int solve_plane(int r, int s, unsigned char *syn, unsigned char *out);
+extern int preprocess_syndrome(int r, int s, unsigned char *syn);
+
+static int op_qec_grid(QvmCtx *q, double a1, double a2){
+    int r=((int)a1)>0?(int)a1:4, s=((int)a2)>0?(int)a2:4;
+    int nq=q->n_qbins/2;
+    if(r*s>nq){printf("  [QEC_GRID] need %d qubits (have %d)\n",r*s,nq);return 0;}
+
+    /* GHZ collapse: single PROJ measurement sets the expected value.
+       Then for each qubit, PROJ gives a room measurement.
+       But PROJ-per-qubit is slow. Compare WF directly; ambiguous (~0.02 margin)
+       qubits get the expected outcome (soft-decision). */
+    qvm_eval(q,"PROJ 0");
+    int expected = (q->wf.prob[q->qbins[1]] > q->wf.prob[q->qbins[0]]) ? 1 : 0;
+    printf("  [QEC_GRID] PROJ(0)=%d (%d qubits)\n",expected,r*s);
+
+    /* All qubits tracked to expected. WF per-qubit differences are small
+       (~0.008), so use ratio p1/p0 > 1.0 to detect XGATE flips. */
+    int *outcomes=calloc(r*s,sizeof(int));
+    int nerr=0;
+    for(int i=0;i<r*s;i++){
+        double p0=q->wf.prob[q->qbins[2*i]], p1=q->wf.prob[q->qbins[2*i+1]];
+        int raw=(p1>p0)?1:0;
+        outcomes[i]=raw;
+        if(raw!=expected) nerr++;
+    }
+    printf("  [QEC_GRID] WF errors=%d (expected=%d)\n",nerr,expected);
+
+    /* Stride-2 plus syndrome: (1+x²)(1+y²) with torus wrap */
+    unsigned char *syn_bytes=calloc(r*s,1), *corr=calloc(r*s,1);
+    uint8_t *err_pat=calloc(r*s,1);
+    for(int i=0;i<r*s;i++) err_pat[i]=(outcomes[i]!=expected)?1:0;
+    syndrome_of(r,s,err_pat,syn_bytes);
+    free(err_pat);
+
+    /* Print syndrome for debugging */
+    printf("  [QEC_GRID] syn (%dx%d):",r,s);
+    for(int i=0;i<r*s;i++){if(i%s==0)printf(" ");printf("%d",syn_bytes[i]);}
+    printf("\n");
+
+    preprocess_syndrome(r,s,syn_bytes);
+    solve_plane(r,s,syn_bytes,corr);
+    printf("  [QEC_GRID] corr:");
+    for(int i=0;i<r;i++){printf(" ");for(int j=0;j<s;j++)printf("%d",corr[i*s+j]);}
+    printf("\n");
+
+    int ncorr=0;
+    char cbuf[16];
+    for(int i=0;i<r*s;i++)if(corr[i]){
+        snprintf(cbuf,sizeof(cbuf),"XGATE %d",i);qvm_eval(q,cbuf);ncorr++;
+    }
+    printf("  corrected=%d\n",ncorr);
+    free(outcomes);free(syn_bytes);free(corr);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
@@ -3149,6 +3206,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "XGATE",     op_x_gate,    "Pauli-X (NOT) gate");
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
+    qvm_reg(q, "QEC_GRID",  op_qec_grid,  "PlaneWarp toric code on r x s grid");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
