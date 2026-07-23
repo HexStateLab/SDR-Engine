@@ -2973,13 +2973,22 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
     double p0=y[b0]+y[D-b0],p1=y[b1]+y[D-b1];
     int outcome=(p1>p0)?1:0;
 
-    /* Collapse WF to measured outcome across ALL qudits */
-    for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;
+    /* Collapse: only the measured qubit, rotate its neighbors */
+    q->wf.re[b0]=q->wf.im[b0]=q->wf.prob[b0]=0;
+    q->wf.re[b1]=q->wf.im[b1]=q->wf.prob[b1]=0;
     double tot=p0+p1;
+    int obin=outcome?b1:b0;
+    q->wf.prob[obin]=(outcome?p1:p0)/tot;
+    q->wf.re[obin]=sqrt(q->wf.prob[obin]);
+
+    /* Feed-forward phase on all remaining qubits: if outcome=1, apply Z rotation */
     for(int i=0;i<nq;i++){
-        int bin=q->qbins[2*i+outcome];
-        q->wf.prob[bin]=(outcome?p1:p0)/tot;
-        q->wf.re[bin]=sqrt(q->wf.prob[bin]);
+        if(i==qi)continue;
+        if(outcome==1){
+            /* Z gate on neighbor: negate |1> amplitude */
+            int bi1=q->qbins[2*i+1];
+            q->wf.re[bi1]=-q->wf.re[bi1];q->wf.im[bi1]=-q->wf.im[bi1];
+        }
     }
     printf("  [PROJ] qudit %d measured -> |%d> (|0>=%.3f |1>=%.3f)\n",
         qi,outcome,tot>1e-15?p0/tot:0,tot>1e-15?p1/tot:0);
@@ -3088,6 +3097,34 @@ static int op_h_gate(QvmCtx *q, double a1, double a2){
     printf("  [H] qudit %d -> |+>\n",qi);return 0;
 }
 
+/* MBASIS qi angle: measure qudit in basis |0> +/- e^{i*angle}|1>.
+   Sets WF to rotated basis, then PROJ measures. */
+static int op_mbasis(QvmCtx *q, double a1, double a2){
+    int qi=((int)a1)>=0?(int)a1:0;
+    double angle=a2;
+    int nq=q->n_qbins/2;
+    if(qi>=nq||!q->sdr_ok)return 0;
+    int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1],D=q->wf.d;
+
+    /* Rotate WF: apply H * R_z(angle) to the qubit's bins.
+       |0> -> (|0> + |1>)/√2, |1> -> e^{i*angle}(|0> - |1>)/√2 */
+    double ca=cos(angle/2),sa=sin(angle/2);
+    double r0=q->wf.re[b0],i0=q->wf.im[b0];
+    double r1=q->wf.re[b1],i1=q->wf.im[b1];
+
+    /* New superposed amplitudes */
+    q->wf.re[b0]=(r0*ca - i0*sa + r1*sa + i1*ca)/sqrt(2);
+    q->wf.im[b0]=(i0*ca + r0*sa - r1*ca + i1*sa)/sqrt(2);
+    q->wf.re[b1]=(r0*ca - i0*sa - r1*sa - i1*ca)/sqrt(2);
+    q->wf.im[b1]=(i0*ca + r0*sa + r1*ca - i1*sa)/sqrt(2);
+    q->wf.prob[b0]=q->wf.re[b0]*q->wf.re[b0]+q->wf.im[b0]*q->wf.im[b0];
+    q->wf.prob[b1]=q->wf.re[b1]*q->wf.re[b1]+q->wf.im[b1]*q->wf.im[b1];
+
+    /* Now measure in Z via PROJ */
+    op_proj_meas(q,a1,0);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
@@ -3120,6 +3157,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "OCCUPATION",op_occupation,"measure occupation through room");
     qvm_reg(q, "XGATE",     op_x_gate,    "Pauli-X (NOT) gate");
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
+    qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
