@@ -2062,6 +2062,7 @@ struct QvmCtx {
     /* Qubit bin mapping for ANTISYM gate (up to 128 qudits = 256 bins) */
     int    qbins[32768];
     int    noise_pct; /* QEC noise injection level */
+    int    coh_rounds; /* QEC coherent capture rounds */
     int    n_qbins;
 };
 
@@ -2949,40 +2950,75 @@ static int op_ghz_stab(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ── Selective projective measurement ──
+   TX only qubit qi, capture, update ONLY that qubit's bins.
+   Restores non-measured WF to prevent noise thrash (the 50% error source). */
+static int qvm_selective_proj(QvmCtx *q, int qi){
+    int nq=q->n_qbins/2,D=q->wf.d;
+    if(qi>=nq||!q->sdr_ok)return -1;
+    int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1];
+
+    /* Save WF snapshot (on heap — D can be 32768) */
+    double *sprob=malloc(D*sizeof(double));
+    double *sre=malloc(D*sizeof(double));
+    double *sim=malloc(D*sizeof(double));
+    if(!sprob||!sre||!sim){free(sprob);free(sre);free(sim);return -1;}
+    memcpy(sprob,q->wf.prob,D*sizeof(double));
+    memcpy(sre,q->wf.re,D*sizeof(double));
+    memcpy(sim,q->wf.im,D*sizeof(double));
+
+    /* TX only |0⟩ bin of measured qubit (anti-symmetric pair) */
+    double x[D],xi[D],y[D];
+    memset(x,0,D*8);memset(xi,0,D*8);
+    x[b0]=0.7071;x[D-b0]=-0.7071;
+    for(int i=0;i<16;i++)x[i]=0;
+
+    qvm_ofdm_compute(q,x,xi,y,D);
+
+    double p0=y[b0]+y[D-b0],p1=y[b1]+y[D-b1];
+    int outcome=(p1>p0)?1:0;
+
+    /* Collapse only the measured qubit */
+    q->wf.re[b0]=q->wf.im[b0]=q->wf.prob[b0]=0;
+    q->wf.re[b1]=q->wf.im[b1]=q->wf.prob[b1]=0;
+    double tot=p0+p1;
+    int ob=outcome?b1:b0;
+    q->wf.prob[ob]=(outcome?p1:p0)/tot;
+    q->wf.re[ob]=sqrt(q->wf.prob[ob]);
+
+    /* Restore all non-measured bins from snapshot */
+    for(int k=0;k<D;k++){
+        if(k==b0||k==b1||k==ob||k==D-b0||k==D-b1||k==D-ob) continue;
+        q->wf.prob[k]=sprob[k];
+        q->wf.re[k]=sre[k];
+        q->wf.im[k]=sim[k];
+    }
+    free(sprob);free(sre);free(sim);
+    return outcome;
+}
+
 static int op_proj_meas(QvmCtx *q, double a1, double a2){
     int qi=((int)a1)>=0?(int)a1:0;(void)a2;
     int nq=q->n_qbins/2;
     if(qi>=nq){printf("  [PROJ] qi=%d >= %d\n",qi,nq);return 0;}
     if(!q->sdr_ok)return 0;
-    int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1],D=q->wf.d;
+    int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1];
 
-    /* Active TX measurement on this qubit */
-    double a=0.7071,x[D],xi[D],y[D];
-    memset(x,0,D*8);memset(xi,0,D*8);
-    x[b0]=+a;x[D-b0]=-a;
-    for(int i=0;i<16;i++)x[i]=xi[i]=0;
-    qvm_ofdm_compute(q,x,xi,y,D);
-    double p0=y[b0]+y[D-b0],p1=y[b1]+y[D-b1];
-    int outcome=(p1>p0)?1:0;
+    int outcome=qvm_selective_proj(q,qi);
+    if(outcome<0)return 0;
 
-    /* Collapse: only the measured qubit, rotate its neighbors */
-    q->wf.re[b0]=q->wf.im[b0]=q->wf.prob[b0]=0;
-    q->wf.re[b1]=q->wf.im[b1]=q->wf.prob[b1]=0;
+    double p0=q->wf.prob[b0],p1=q->wf.prob[b1];
     double tot=p0+p1;
-    int obin=outcome?b1:b0;
-    q->wf.prob[obin]=(outcome?p1:p0)/tot;
-    q->wf.re[obin]=sqrt(q->wf.prob[obin]);
 
-    /* Feed-forward phase on all remaining qubits: if outcome=1, apply Z rotation */
+    /* Feed-forward Z on neighbors if outcome=1 (MBQC phase correction) */
     for(int i=0;i<nq;i++){
         if(i==qi)continue;
         if(outcome==1){
-            /* Z gate on neighbor: negate |1> amplitude */
             int bi1=q->qbins[2*i+1];
             q->wf.re[bi1]=-q->wf.re[bi1];q->wf.im[bi1]=-q->wf.im[bi1];
         }
     }
-    printf("  [PROJ] qudit %d measured -> |%d> (|0>=%.3f |1>=%.3f)\n",
+    printf("  [PROJ] qudit %d -> |%d> (|0>=%.3f |1>=%.3f)\n",
         qi,outcome,tot>1e-15?p0/tot:0,tot>1e-15?p1/tot:0);
     return 0;
 }
@@ -3196,10 +3232,106 @@ static int op_qec_grid(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* Coherent capture: N rounds, average DFT power. Signal×N, noise×√N. */
+static int qvm_coh_capture(QvmCtx *q, double *avg_prob, int N){
+    if(!q->sdr_ok||N<1)return -1;
+    int D=q->wf.d;
+    memset(avg_prob,0,D*sizeof(double));
+    for(int n=0;n<N;n++){
+        sdr_capture(q->sdr);
+        double *I=q->sdr->iq_i, *Q=q->sdr->iq_q;
+        int np=q->sdr->iq_n; if(np<D)np=D;
+        for(int k=0;k<D;k++){
+            double fn=(double)k/D,si=0,sq=0;
+            for(int m=0;m<np;m++){
+                double ph=-2*M_PI*fn*m,c=cos(ph),s=sin(ph);
+                si+=I[m]*c-Q[m]*s;sq+=I[m]*s+Q[m]*c;
+            }
+            avg_prob[k]+=(si*si+sq*sq)/((double)np*np);
+        }
+    }
+    for(int k=0;k<D;k++) avg_prob[k]/=N;
+    memcpy(q->wf.prob,avg_prob,D*sizeof(double));
+    for(int k=0;k<D;k++)
+        q->wf.re[k]=sqrt(avg_prob[k]);
+    return 0;
+}
+
+/* QEC_ROOM r s [averaging]: physical room QEC.
+   a2>1 → coherent capture rounds; default 4 for √2 SNR gain.
+   TX current WF → coherent capture → read outcomes → decode. */
+static int op_qec_room(QvmCtx *q, double a1, double a2){
+    int r=((int)a1)>0?(int)a1:4, s=((int)a2)>0?(int)a2:4;
+    int nq=q->n_qbins/2;
+    if(r*s>nq){printf("  [QEC_ROOM] need %d qubits (have %d)\n",r*s,nq);return 0;}
+    if(!q->sdr_ok){printf("  [QEC_ROOM] no SDR\n");return 0;}
+
+    /* TX current WF to refresh room → coherent averaging capture */
+    gate_tx_hardware(q->sdr,&q->wf);
+    usleep(40000);
+    double *avg_prob=malloc(q->wf.d*sizeof(double));
+    if(!avg_prob)return 0;
+    int coh=q->coh_rounds;
+    qvm_coh_capture(q,avg_prob,coh);
+
+    printf("  [QEC_ROOM] %dx%d coh=%d\n",r,s,coh);
+    int *outcomes=calloc(r*s,sizeof(int));
+    int n1=0;
+    for(int i=0;i<r*s;i++){
+        double p0=avg_prob[q->qbins[2*i]], p1=avg_prob[q->qbins[2*i+1]];
+        outcomes[i]=(p1>p0)?1:0;
+        n1+=outcomes[i];
+    }
+    free(avg_prob);
+    int expected=(n1>r*s/2)?1:0;
+    int nerr=0;
+    for(int i=0;i<r*s;i++) if(outcomes[i]!=expected) nerr++;
+    printf("  [QEC_ROOM] expected=%d errors=%d/%d=%.1f%%\n",
+           expected,nerr,r*s,100.0*nerr/(double)(r*s));
+
+    uint8_t *err_pat=calloc(r*s,1);
+    for(int i=0;i<r*s;i++) err_pat[i]=(outcomes[i]!=expected)?1:0;
+
+    unsigned char *syn_bytes=calloc(r*s,1), *corr=calloc(r*s,1);
+    syndrome_of(r,s,err_pat,syn_bytes);
+    preprocess_syndrome(r,s,syn_bytes);
+    solve_plane(r,s,syn_bytes,corr);
+
+    uint8_t *remaining=calloc(r*s,1);
+    for(int i=0;i<r*s;i++) remaining[i]=err_pat[i]^corr[i];
+    uint8_t *residue=calloc(r*s,1);
+    syndrome_of(r,s,remaining,residue);
+    int resid_cnt=0;
+    for(int i=0;i<r*s;i++) if(residue[i]) resid_cnt++;
+
+    int errors_before=0, errors_after=0;
+    for(int i=0;i<r*s;i++){
+        if(err_pat[i]) errors_before++;
+        if(err_pat[i]^corr[i]) errors_after++;
+    }
+    int net=errors_before-errors_after;
+
+    int ncorr=0;
+    char cbuf[16];
+    for(int i=0;i<r*s;i++)if(corr[i]){
+        snprintf(cbuf,sizeof(cbuf),"XGATE %d",i);qvm_eval(q,cbuf);ncorr++;
+    }
+    printf("  [QEC_ROOM] before=%d corrected=%d after=%d residue=%d | net=%+d\n",
+           errors_before,ncorr,errors_after,resid_cnt,net);
+
+    free(outcomes);free(err_pat);free(syn_bytes);free(corr);free(remaining);free(residue);
+    return 0;
+}
+
 /* QEC_NOISE pct: set noise injection level for QEC_GRID */
 static int op_qec_noise(QvmCtx *q, double a1, double a2){
     q->noise_pct=(a1>=0)?(int)a1:0;(void)a2;
     printf("  [QEC] noise level = %d%%\n",q->noise_pct);
+    return 0;
+}
+static int op_qec_coh(QvmCtx *q, double a1, double a2){
+    q->coh_rounds=(a1>=1)?(int)a1:4;(void)a2;
+    printf("  [QEC] coherent rounds = %d\n",q->coh_rounds);
     return 0;
 }
 
@@ -3237,7 +3369,9 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
     qvm_reg(q, "QEC_GRID",  op_qec_grid,  "PlaneWarp toric code on r x s grid");
+    qvm_reg(q, "QEC_ROOM",  op_qec_room,  "room-measured QEC (coherent capture)");
     qvm_reg(q, "QEC_NOISE", op_qec_noise, "set noise injection % for QEC");
+    qvm_reg(q, "QEC_COH",   op_qec_coh,   "set coherent capture rounds for QEC_ROOM");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
@@ -3448,7 +3582,7 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
         q->wf.purity=1.0/D; q->wf.entropy=log2(D);
     }
     q->running = 1;
-    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0;
+    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0; q->coh_rounds=4;
     qvm_init_ops(q);
     return q;
 }
