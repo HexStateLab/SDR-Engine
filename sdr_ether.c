@@ -2955,16 +2955,7 @@ static int op_proj_meas(QvmCtx *q, double a1, double a2){
     if(!q->sdr_ok)return 0;
     int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1],D=q->wf.d;
 
-    /* If state was already collapsed (one branch zero), just read */
-    double wf0=0,wf1=0;
-    for(int i=0;i<nq;i++){wf0+=q->wf.prob[q->qbins[2*i]];wf1+=q->wf.prob[q->qbins[2*i+1]];}
-    if(wf0<0.01||wf1<0.01){
-        int outcome=(wf1>wf0)?1:0;
-        printf("  [PROJ] qudit %d collapsed -> |%d>\n",qi,outcome);
-        return 0;
-    }
-
-    /* Active TX measurement */
+    /* Active TX measurement on this qubit */
     double a=0.7071,x[D],xi[D],y[D];
     memset(x,0,D*8);memset(xi,0,D*8);
     x[b0]=+a;x[D-b0]=-a;
