@@ -3116,42 +3116,6 @@ static int op_mbasis(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* PlaneWarp QEC decoder */
-extern int solve_plane(int r, int s, unsigned char *syn, unsigned char *out);
-extern int preprocess_syndrome(int r, int s, unsigned char *syn);
-
-static int op_qec_grid(QvmCtx *q, double a1, double a2){
-    int r=((int)a1)>0?(int)a1:4, s=((int)a2)>0?(int)a2:4;
-    int nq=q->n_qbins/2;
-    if(r*s>nq){printf("  [QEC_GRID] need %d qubits (have %d)\n",r*s,nq);return 0;}
-
-    /* Read outcomes from WF (not active measurement) */
-    int *outcomes=calloc(r*s,sizeof(int));
-    for(int i=0;i<r*s;i++){
-        outcomes[i]=(q->wf.prob[q->qbins[2*i+1]]>q->wf.prob[q->qbins[2*i]])?1:0;
-    }
-
-    /* Stride-2 plaquette syndrome */
-    unsigned char *syn=calloc(r*s,1), *corr=calloc(r*s,1);
-    for(int i=0;i<r-1;i+=2)
-        for(int j=0;j<s-1;j+=2)
-            syn[i*s+j]=outcomes[i*s+j]^outcomes[(i+2)*s+j]
-                       ^outcomes[i*s+(j+2)]^outcomes[(i+2)*s+(j+2)];
-
-    preprocess_syndrome(r,s,syn);
-    int ok=solve_plane(r,s,syn,corr);
-    printf("  [QEC_GRID] %dx%d decode=%s",r,s,ok?"OK":"ABSTAIN");
-
-    int ncorr=0;
-    char cmd[16];
-    for(int i=0;i<r*s;i++)if(corr[i]){
-        snprintf(cmd,sizeof(cmd),"XGATE %d",i);qvm_eval(q,cmd);ncorr++;
-    }
-    printf("  corrected=%d\n",ncorr);
-    free(outcomes);free(syn);free(corr);
-    return 0;
-}
-
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
@@ -3185,7 +3149,6 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "XGATE",     op_x_gate,    "Pauli-X (NOT) gate");
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
-    qvm_reg(q, "QEC_GRID",  op_qec_grid,  "PlaneWarp toric code on r x s grid");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
