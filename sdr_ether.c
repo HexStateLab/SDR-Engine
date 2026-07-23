@@ -2967,15 +2967,15 @@ static int qvm_selective_proj(QvmCtx *q, int qi){
     memcpy(sre,q->wf.re,D*sizeof(double));
     memcpy(sim,q->wf.im,D*sizeof(double));
 
-    /* TX only |0⟩ bin of measured qubit (anti-symmetric pair) */
+    /* TX only |0⟩ bin of measured qubit (single tone, no anti-sym) */
     double x[D],xi[D],y[D];
     memset(x,0,D*8);memset(xi,0,D*8);
-    x[b0]=0.7071;x[D-b0]=-0.7071;
+    x[b0]=0.7071;
     for(int i=0;i<16;i++)x[i]=0;
 
     qvm_ofdm_compute(q,x,xi,y,D);
 
-    double p0=y[b0]+y[D-b0],p1=y[b1]+y[D-b1];
+    double p0=y[b0],p1=y[b1];
     int outcome=(p1>p0)?1:0;
 
     /* Collapse only the measured qubit */
