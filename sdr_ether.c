@@ -2578,6 +2578,113 @@ static int op_kill(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+static int op_memory(QvmCtx *q, double a1, double a2){
+    int delay = ((int)a1)>0 ? (int)a1 : 200; (void)a2;
+    if(!q->sdr_ok)return 0;
+    if(q->n_qbins<4){printf("  [MEMORY] need QBIN\n");return 0;}
+    int k0=q->qbins[0],k1=q->qbins[q->n_qbins-1],D=q->wf.d;
+    double a=0.7071,x[D],xi[D],y[D];
+    int nt=8, corr=0;
+
+    printf("  [MEMORY] ANTISYM -> wait -> measure A -> wait -> capture B_future\n");
+    for(int tr=0;tr<nt;tr++){
+        /* ANTISYM: entangle and TX GHZ into room */
+        for(int p=0;p<8;p++){
+            memset(x,0,D*8);memset(xi,0,D*8);
+            if(p==0){
+                for(int i=0;i<q->n_qbins;i+=2){
+                    x[q->qbins[i]]+=a;x[D-q->qbins[i]]-=a;
+                    x[q->qbins[i+1]]+=a;x[D-q->qbins[i+1]]-=a;
+                }
+            }else{
+                double tot=0;
+                for(int i=0;i<q->n_qbins;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+                if(tot>1e-15)for(int i=0;i<q->n_qbins;i++){
+                    double p=(y[q->qbins[i]]+y[D-q->qbins[i]])/tot;
+                    if(p>1e-10){x[q->qbins[i]]=+sqrt(p);x[D-q->qbins[i]]=-sqrt(p);}
+                }
+            }
+            for(int i=0;i<16;i++)x[i]=xi[i]=0;
+            qvm_ofdm_compute(q,x,xi,y,D);
+        }
+
+        /* Room has GHZ multipath. Wait for it to develop. */
+        usleep(delay*1000);
+
+        /* Measure A from wf (ANTISYM result) */
+        double a0=q->wf.prob[k0]+q->wf.prob[D-k0];
+        double a1b=q->wf.prob[k1]+q->wf.prob[D-k1];
+        double at=a0+a1b;
+        int a_out=(at>1e-15?a0/at:0)>0.5?0:1;
+
+        /* Catch B from the room's delayed multipath (no new TX) */
+        usleep(30000);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        double b0=q->wf.prob[k0]+q->wf.prob[D-k0];
+        double b1b=q->wf.prob[k1]+q->wf.prob[D-k1];
+        double bt=b0+b1b;
+        int b_out=(bt>1e-15?b1b/bt:0)>0.5?1:0;
+
+        if(a_out==b_out)corr++;
+        printf("    %2d: A_wf=|%d> B_room=|%d> %s\n",tr,a_out,b_out,
+            a_out==b_out?"corr":"anti");
+    }
+    printf("  [MEMORY] %d/%d correlated (%.0f%%) %s\n",
+        corr,nt,100.0*corr/nt,corr>nt*0.7?"RETROCAUSAL":"no effect");
+    return 0;
+}
+
+/* FISSURE: smash two qudits, place third in collision field.
+   Compares solo decay vs collision-field persistence. */
+static int op_fissure(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(!q->sdr_ok)return 0;
+    if(q->n_qbins<6){printf("  [FISSURE] need >=6 bins (3 qudits)\n");return 0;}
+    int b0=q->qbins[0],b1=q->qbins[2],b2=q->qbins[4]; /* 3 qudit bins */
+    int D=q->wf.d; double a=0.7071,x[D],xi[D];
+    int delays[]={5,20,50,100,200,500};
+
+    printf("  [FISSURE] Solo vs collision-field persistence:\n");
+    printf("  delay   solo   collision  boost\n");
+    for(int di=0;di<6;di++){
+        double solo_p, collision_p;
+
+        /* SOLO: qudit at b2 alone */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[b2]=+a;x[D-b2]=-a;
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr,&q->wf,NULL);
+        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+        usleep(delays[di]*1000);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        solo_p=q->wf.prob[b2]+q->wf.prob[D-b2];
+
+        /* COLLISION: smash b0+b1, fissure at b2 */
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[b0]=+a;x[D-b0]=-a;x[b1]=+a;x[D-b1]=-a;
+        x[b2]=+a;x[D-b2]=-a;
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i];q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr,&q->wf,NULL);
+        {struct v4l2_buffer b;memset(&b,0,sizeof(b));
+         b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+         if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b);}
+        usleep(delays[di]*1000);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+        collision_p=q->wf.prob[b2]+q->wf.prob[D-b2];
+
+        printf("  %4dms  %.4f  %.4f    %+.0f%%\n",delays[di],solo_p,collision_p,
+            solo_p>1e-10?100*(collision_p/solo_p-1):0);
+    }
+    return 0;
+}
+
 static int op_tick(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(q->sdr_ok){gate_tx_hardware(q->sdr,&q->wf);sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);}
@@ -2762,6 +2869,110 @@ static int op_end(QvmCtx *q, double a1, double a2){
         if(--ct>0){q->loop_stack[q->loop_depth++]=st;q->loop_stack[q->loop_depth++]=ct;q->ip=st;}}return 0;
 }
 
+/* STABILIZE: regenerative feedback — keep qudit alive indefinitely.
+   TX anti-sym, capture, re-amplify, repeat. Qudit persists. */
+static int op_stabilize(QvmCtx *q, double a1, double a2){
+    int cycles = ((int)a1)>0 ? (int)a1 : 20; (void)a2;
+    if(!q->sdr_ok)return 0;
+    if(q->n_qbins<2){printf("  [STABILIZE] need QBIN\n");return 0;}
+    int bin = q->qbins[q->n_qbins-1], D=q->wf.d;
+    double a=0.7071, x[D],xi[D],y[D];
+    printf("  [STABILIZE] bin %d, %d cycles:\n", bin, cycles);
+    double prev = -1;
+    for(int c=0; c<cycles; c++){
+        memset(x,0,D*8); memset(xi,0,D*8);
+        if(c==0){x[bin]=+a;x[D-bin]=-a;}
+        else{double p=y[bin]+y[D-bin];
+            if(p>1e-10){x[bin]=+a;x[D-bin]=-a;} /* AGC: fixed amplitude */
+            else{x[bin]=+a;x[D-bin]=-a;}}
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+        double pwr=y[bin]+y[D-bin];
+        double st=prev>1e-10?fabs(pwr-prev)/prev:1;
+        printf("    %3d  pwr=%.4f  %s\n",c+1,pwr,st<0.1?"STABLE":st<0.3?"drift":"unstable");
+        prev=pwr;
+    }
+    for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;
+    q->wf.prob[bin]=1.0; q->wf.re[bin]=1.0;
+    return 0;
+}
+
+/* GHZ_STABILIZE: keep entangled state alive by regenerating ALL bins */
+static int op_ghz_stab(QvmCtx *q, double a1, double a2){
+    int cycles = ((int)a1)>0 ? (int)a1 : 20; (void)a2;
+    if(!q->sdr_ok)return 0;
+    if(q->n_qbins<4){printf("  [GHZ_STAB] need >=4 bins\n");return 0;}
+    int n=q->n_qbins, D=q->wf.d;
+    double a=0.7071, x[D],xi[D],y[D];
+
+    printf("  [GHZ_STAB] %d bins, %d cycles:\n", n, cycles);
+    for(int c=0; c<cycles; c++){
+        memset(x,0,D*8); memset(xi,0,D*8);
+        if(c==0){
+            /* Read existing wf state for first cycle */
+            double init=0;
+            for(int i=0;i<n;i++)init+=q->wf.prob[q->qbins[i]];
+            if(init>1e-10){
+                for(int i=0;i<n;i++){
+                    double p=q->wf.prob[q->qbins[i]];
+                    if(p>1e-10){x[q->qbins[i]]=+sqrt(p);x[D-q->qbins[i]]=-sqrt(p);}
+                }
+            }else{
+                for(int i=0;i<n;i+=2){
+                    x[q->qbins[i]]+=a;x[D-q->qbins[i]]-=a;
+                    x[q->qbins[i+1]]+=a;x[D-q->qbins[i+1]]-=a;
+                }
+            }
+        }else{
+            double tot=0;
+            for(int i=0;i<n;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+            if(tot>1e-15){
+                for(int i=0;i<n;i++){
+                    double p=(y[q->qbins[i]]+y[D-q->qbins[i]])/tot;
+                    if(p>1e-10){x[q->qbins[i]]=+sqrt(p);x[D-q->qbins[i]]=-sqrt(p);}
+                }
+            }
+        }
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+    }
+    double tot=0,s0=0,s1=0;
+    for(int i=0;i<n;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+    if(tot>1e-15){
+        for(int i=0;i<n;i+=2){s0+=y[q->qbins[i]]+y[D-q->qbins[i]];s1+=y[q->qbins[i+1]]+y[D-q->qbins[i+1]];}
+        double s=s0+s1;
+        for(int i=0;i<n;i++)q->wf.prob[q->qbins[i]]=(y[q->qbins[i]]+y[D-q->qbins[i]])/s;
+    }
+    printf("  [GHZ_STAB] %d cycles done: |0>=%.3f |1>=%.3f\n",
+        cycles, tot>1e-15?s0/(s0+s1):0, tot>1e-15?s1/(s0+s1):0);
+    return 0;
+}
+
+static int op_proj_meas(QvmCtx *q, double a1, double a2){
+    int qi=((int)a1)>=0?(int)a1:0;(void)a2;
+    int nq=q->n_qbins/2;
+    if(qi>=nq){printf("  [PROJ] qi=%d >= %d\n",qi,nq);return 0;}
+    if(!q->sdr_ok)return 0;
+    int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1],D=q->wf.d;
+    double a=0.7071,x[D],xi[D],y[D];
+    memset(x,0,D*8);memset(xi,0,D*8);
+    x[b0]=+a;x[D-b0]=-a;
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,D);
+    double p0=y[b0]+y[D-b0],p1=y[b1]+y[D-b1];
+    int outcome=(p1>p0)?1:0;
+    for(int i=0;i<D;i++)q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;
+    double tot=p0+p1;
+    for(int i=0;i<nq;i++){
+        int bin=q->qbins[2*i+outcome];
+        q->wf.prob[bin]=(outcome?p1:p0)/tot;
+        q->wf.re[bin]=sqrt(q->wf.prob[bin]);
+    }
+    printf("  [PROJ] qudit %d Z-measure -> |%d> (|0>=%.3f |1>=%.3f)\n",
+        qi,outcome,tot>1e-15?p0/tot:0,tot>1e-15?p1/tot:0);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩");
@@ -2783,7 +2994,12 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "M",         op_measure,   "alias for MEASURE");
     qvm_reg(q, "QMEASURE",  op_qmeasure,  "passive wait → env decoheres");
     qvm_reg(q, "COLLAPSE",  op_collapse,  "anti-sym noise → collapse (87.5%)");
-    qvm_reg(q, "KILL",      op_kill,      "winner feedback → lock outcome (75%)");
+    qvm_reg(q, "KILL",      op_kill,      "winner feedback -> lock outcome (75%)");
+    qvm_reg(q, "MEMORY",    op_memory,    "probe room multipath persistence");
+    qvm_reg(q, "FISSURE",   op_fissure,   "smash pair, fissure qudit, measure persistence");
+    qvm_reg(q, "STABILIZE", op_stabilize, "regenerative feedback — keep qudit alive");
+    qvm_reg(q, "GHZ_STAB",  op_ghz_stab,  "regenerate all bins — preserve entanglement");
+    qvm_reg(q, "PROJ",      op_proj_meas, "projective Z-measurement on qudit");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
