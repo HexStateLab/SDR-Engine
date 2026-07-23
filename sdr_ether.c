@@ -3397,6 +3397,33 @@ static int op_qec_coh(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* QFT [range]: Quantum Fourier Transform on WF amplitudes via FFTW3.
+   If range not given, uses full D. Result stored in wf.re/wf.im. */
+static int op_qft(QvmCtx *q, double a1, double a2){
+    int n=((int)a1)>0?(int)a1:q->wf.d;(void)a2;
+    if(n>q->wf.d)n=q->wf.d;
+
+    fftw_complex *in  = fftw_malloc(n*sizeof(fftw_complex));
+    fftw_complex *out = fftw_malloc(n*sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+
+    for(int k=0;k<n;k++){in[k][0]=q->wf.re[k];in[k][1]=q->wf.im[k];}
+    fftw_execute(plan);
+
+    double norm=1.0/sqrt(n);
+    for(int k=0;k<n;k++){
+        q->wf.re[k]=out[k][0]*norm;q->wf.im[k]=out[k][1]*norm;
+        q->wf.prob[k]=q->wf.re[k]*q->wf.re[k]+q->wf.im[k]*q->wf.im[k];
+    }
+    for(int k=n;k<q->wf.d;k++){
+        q->wf.re[k]=q->wf.im[k]=q->wf.prob[k]=0;
+    }
+
+    printf("  [QFT] %d-point Fourier transform\n",n);
+    fftw_destroy_plan(plan);fftw_free(in);fftw_free(out);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
@@ -3455,7 +3482,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "END",       op_end,       "end loop block");
     qvm_reg(q, "HELP",      op_help,      "this list");
     qvm_reg(q, "?",         op_help,      "alias for HELP");
-    qvm_reg(q, "QUIT",      op_quit,      "exit VM");
+    qvm_reg(q, "QFT",       op_qft,       "Quantum Fourier Transform on WF [n=D]");
     qvm_reg(q, "EXIT",      op_quit,      "alias for QUIT");
     qvm_reg(q, "Q",         op_quit,      "alias for QUIT");
     qvm_reg(q, "CALIBRATE", op_calibrate, "measure room channel M [avg=4]");
