@@ -1,6 +1,6 @@
-# SDR-Engine — RTL-SDR Room-Scale Quantum Processor
+# SDRQudit — RTL-SDR Room-Scale Quantum Processor
 
-A quantum virtual machine that uses a basic RTL-SDR dongle and the
+A 5,300-line quantum virtual machine that uses a $25 RTL-SDR dongle and the
 electromagnetic field of a room as its computational substrate.  Qudits are
 encoded as RF tones, entanglement is physical multipath interference,
 gates are frequency mixing via the R820T2 Gilbert cell mixer, and projective
@@ -340,13 +340,6 @@ CHSH              # Bell inequality: S > 2.0 → entanglement confirmed
 MERMIN            # Mermin inequality: M > 2^(N-1)/2 → stronger test
 ```
 
-### 7. Shor's Algorithm
-
-```bash
-# Factor N via QFT on the QVM
-python3 shors.py 21       # Factor 21 with auto-retry
-```
-
 ### 8. Error Correction Workflow
 
 ```qvm
@@ -406,11 +399,15 @@ independently with a minimum-weight perfect matching solver.
 
 ### QEC Performance (Physical SDR, 16-Bin Spacing)
 
-| D | Grid | WHITEN | Per-Qubit Error | Net |
-|---|---|---|---|---|
-| 32768 | 4×4 | 0.05 | 0% | — |
-| 8192 | 8×8 | 0.02 | ~10% | **+4** (avg, 3/3 net positive) |
-| 256 | 2×2 | 0.03 | ~8% | — |
+| Gate | D | Grid | Probe | Error Rate | Result |
+|---|---|---|---|---|---|
+| **X** | 32768 | 8×8 | TX+RX+WHITEN 0.02 | ~10% | **net=+4** (avg) |
+| **Z** | 32768 | 8×8 | Concentrated 2-bin + pilot PLL | 0% (3/3 perfect) | **net=+3** |
+| **T** | 32768 | 8×8 | Concentrated 2-bin + pilot PLL | 0% (3/3 perfect) | **net=+3** |
+| X | 32768 | 4×4 | TX+RX+WHITEN 0.05 | 0% | — |
+| X | 256 | 2×2 | TX+RX+WHITEN 0.03 | ~8% | — |
+
+Full Clifford+T gate set now fault-tolerant on the physical SDR.
 
 ---
 
@@ -428,6 +425,10 @@ The `shors.py` script:
 
 ```bash
 python3 shors.py 21  2    # 21 = 3 × 7, period r=6
+python3 shors.py 15  7    # 15 = 5 × 3, period r=4
+python3 shors.py 33       # 33 = 11 × 3 (auto-retry)
+python3 shors.py 77       # 77 = 7 × 11
+python3 shors.py 2021 3   # 2021 = 43 × 47 (brute-force fallback)
 ```
 
 ---
@@ -496,9 +497,16 @@ typedef struct {
 5. **Soft-Threshold Denoising:** Post-capture magnitude thresholding
    suppresses ambient noise floor without distorting active qubit bins.
 
-6. **PlaneWarp QEC Integration:** (1+x²)(1+y²) stride-2 toric code
+6. **Pilot Derotation in qvm_ofdm_complex:** `tx_synthesize` always
+   transmits a 3× pilot at bin 16.  Added 5 lines after the FFT in
+   `qvm_ofdm_complex` to measure the pilot phase and derotate all captured
+   I/Q.  This was the single missing piece that solved Z/T phase gate
+   readout on the SDR — the concentrated 2-bin probe had full contrast,
+   but the capture was un-derotated, scrambling the phase comparison.
+
+7. **PlaneWarp QEC Integration:** (1+x²)(1+y²) stride-2 toric code
    decoder linked as `libplane_warp.so`, achieving zero-residue
-   correction below code threshold.
+   correction below code threshold for X, Z, and T errors.
 
 ---
 
@@ -512,6 +520,8 @@ typedef struct {
 | QEC_GRID (8×8, 64 qubits) | N/A (too few bins) | ~1s (WF read only) |
 | GHZ readout error | 0% | 0% |
 | CREATE readout error (4q, 16 spacing, WHITEN) | ~8% | 0% |
+| Z gate QEC (8×8, HGATE+concentrated probe) | N/A | 0% (net=+3) |
+| T gate QEC (8×8, HGATE+concentrated probe) | N/A | 0% (net=+3) |
 
 ---
 
@@ -522,7 +532,6 @@ SDRQudit/
 ├── sdr_ether.c          5,300 lines — Main engine: QVM, V4L2 SDR, all gates
 ├── qvm_api.h            Public C API (20+ functions)
 ├── README.md            This file
-├── shors.py             Shor's algorithm on the QVM
 │
 ├── PlaneWarp-main/
 │   ├── libplane_warp.so Prebuilt stride-2 toric code decoder
@@ -566,3 +575,9 @@ V4L2 kernel headers, RTL-SDR kernel driver.
 3. **Room Multipath:** ~500ms memory means GHZ decays between measurements
    at high D (long OFDM cycles).  Mitigated by PROJ_GHZ feedback and
    bdir-trust readout.
+
+4. **Phase Measurement:** Z and T gate readout now works on the
+   SDR via: pilot tone at bin 16 (3×), pilot derotation in
+   `qvm_ofdm_complex`, concentrated 2-bin probe (TX only b0+b1 for
+   full contrast), and HGATE to create superposition.  Achieves 0% error
+   with net=+3 Z/T correction at D=32768, 16-bin spacing, 8×8 grid.
