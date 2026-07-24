@@ -2186,6 +2186,16 @@ static int op_z(QvmCtx *q, double a1, double a2){
     printf("  [Z] %.3f rad\n",rad); return 0;
 }
 
+static int op_t_gate(QvmCtx *q, double a1, double a2){
+    (void)a2;int qi=((int)a1)>=0?(int)a1:0;
+    if(qi>=q->n_qbins/2)return 0;
+    int b1=q->qbins[2*qi+1]; /* phase-rotate |1⟩ by π/4 */
+    double c=cos(M_PI/8),s=sin(M_PI/8);
+    double r=q->wf.re[b1],i=q->wf.im[b1];
+    q->wf.re[b1]=r*c-i*s;q->wf.im[b1]=r*s+i*c;
+    printf("  [T] qudit %d → |1⟩ *= e^{iπ/4}\n",qi);return 0;
+}
+
 static int op_h(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(q->sdr_ok) gate_H(q->sdr, &q->wf);
@@ -3076,13 +3086,25 @@ static int op_proj_ghz(QvmCtx *q, double a1, double a2){
         gate_tx_hardware(q->sdr,&q->wf);usleep(15000);
         sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
     }
-    /* Feedback inverts via R820T2 IM2: boosting bdir creates power
-       at opposite bins. Trust pre-feedback GHZ direction, not capture. */
-    int out=bdir;int ag=0;
+    /* Phase-coherence readout: after feedback + pilot derotation,
+       compute complex mean vector of all |0⟩ bins and all |1⟩ bins.
+       Coherent branch (same phase) → long vector. Random → short.
+       Uses full I/Q — the RTL2832U captures phase. */
+    double r0=0,i0=0,r1=0,i1=0;
+    for(int i=0;i<nq;i++){
+        int b0=q->qbins[2*i],b1=q->qbins[2*i+1];
+        r0+=q->wf.re[b0];i0+=q->wf.im[b0];
+        r1+=q->wf.re[b1];i1+=q->wf.im[b1];
+    }
+    double coh0=sqrt(r0*r0+i0*i0)/nq,coh1=sqrt(r1*r1+i1*i1)/nq;
+    int phase_out=(coh1>coh0)?1:0;
+    int out=bdir;int ag=0,ag_ph=0;
     for(int i=0;i<nq;i++){double p0=q->wf.prob[q->qbins[2*i]],p1=q->wf.prob[q->qbins[2*i+1]];
-        if(((p1>p0)?1:0)==out)ag++;}
-    printf("  [PROJ_GHZ] bdir=|%d⟩ out=|%d⟩ agree=%d/%d (%.0f%%)\n",
-           bdir,out,ag,nq,100.0*ag/nq);
+        if(((p1>p0)?1:0)==out)ag++;
+        if(((p1>p0)?1:0)==phase_out)ag_ph++;
+    }
+    printf("  [PROJ_GHZ] amp:|%d⟩(%d/%d)  phase:|%d⟩(%d/%d)  coh0=%.3f coh1=%.3f\n",
+           out,ag,nq,phase_out,ag_ph,nq,coh0,coh1);
     return out;
 }
 
@@ -3332,8 +3354,58 @@ static int op_qec_grid(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* Coherent capture: N rounds, average DFT power. Signal×N, noise×√N.
-   Uses FFTW3 FFT — O(D log D) per round instead of O(D²). */
+/* QEC_GRIDZ r s: PlaneWarp Z-error (phase) correction.
+   Reads phase: qubit is error if |1⟩ bin has negative real amplitude
+   (Z flip = π phase shift on |1⟩, detectable in X basis). */
+static int op_qec_gridz(QvmCtx *q, double a1, double a2){
+    int r=((int)a1)>0?(int)a1:4,s=((int)a2)>0?(int)a2:4;
+    int nq=q->n_qbins/2;
+    if(r*s>nq){printf("  [QEC_GRIDZ] need %d qubits (have %d)\n",r*s,nq);return 0;}
+    int *outcomes=calloc(r*s,sizeof(int));
+    int expected=0,nerr=0; /* HGATE makes |+⟩ = expected |0⟩ in X basis */
+    for(int i=0;i<r*s;i++){
+        int b1=q->qbins[2*i+1];
+        outcomes[i]=(q->wf.re[b1]<0)?1:0; /* negative = phase flipped = error */
+        if(outcomes[i])nerr++;
+    }
+    printf("  [QEC_GRIDZ] expected=%d raw_errors=%d/%.1f%%\n",expected,nerr,100.0*nerr/(r*s));
+    int noise_pct=q->noise_pct;
+    uint8_t *err_pat=calloc(r*s,1);
+    if(noise_pct>0){srand(42);for(int i=0;i<r*s;i++)if((rand()%100)<noise_pct)err_pat[i]=!err_pat[i];}
+    for(int i=0;i<r*s;i++)err_pat[i]^=(outcomes[i]!=expected)?1:0;
+    unsigned char *syn=calloc(r*s,1),*corr=calloc(r*s,1);
+    syndrome_of(r,s,err_pat,syn);preprocess_syndrome(r,s,syn);solve_plane(r,s,syn,corr);
+    uint8_t *rem=calloc(r*s,1);
+    for(int i=0;i<r*s;i++)rem[i]=err_pat[i]^corr[i];
+    int eb=0,ea=0;for(int i=0;i<r*s;i++){if(err_pat[i])eb++;if(rem[i])ea++;}
+    int ncorr=0;char cbuf[16];
+    for(int i=0;i<r*s;i++)if(corr[i]){
+        snprintf(cbuf,sizeof(cbuf),"Z 3.14159 %d",i);qvm_eval(q,cbuf);ncorr++;
+    }
+    printf("  [QEC_GRIDZ] before=%d corrected=%d after=%d | net=%+d\n",eb,ncorr,ea,eb-ea);
+    free(outcomes);free(err_pat);free(syn);free(corr);free(rem);return 0;
+}
+
+/* QEC_GRIDT r s: PlaneWarp T-error (π/8) correction. */
+static int op_qec_gridt(QvmCtx *q, double a1, double a2){
+    int r=((int)a1)>0?(int)a1:4,s=((int)a2)>0?(int)a2:4,nq=q->n_qbins/2;
+    if(r*s>nq){printf("  [QEC_GRIDT] need %d qubits (have %d)\n",r*s,nq);return 0;}
+    int *out=calloc(r*s,sizeof(int));
+    double th=0.1;int ne=0;
+    for(int i=0;i<r*s;i++){out[i]=(fabs(q->wf.im[q->qbins[2*i+1]])>th)?1:0;if(out[i])ne++;}
+    printf("  [QEC_GRIDT] raw=%d/%.1f%%\n",ne,100.0*ne/(r*s));
+    uint8_t *ep=calloc(r*s,1);
+    for(int i=0;i<r*s;i++)ep[i]=out[i];
+    unsigned char *sy=calloc(r*s,1),*co=calloc(r*s,1);
+    syndrome_of(r,s,ep,sy);preprocess_syndrome(r,s,sy);solve_plane(r,s,sy,co);
+    int eb=0,ea=0;for(int i=0;i<r*s;i++){if(ep[i])eb++;if(ep[i]^co[i])ea++;}
+    int nc=0;char cb[16];
+    for(int i=0;i<r*s;i++)if(co[i]){snprintf(cb,sizeof(cb),"T %d",i);qvm_eval(q,cb);nc++;}
+    printf("  [QEC_GRIDT] before=%d corrected=%d after=%d | net=%+d\n",eb,nc,ea,eb-ea);
+    free(out);free(ep);free(sy);free(co);return 0;
+}
+
+/* Coherent capture: N rounds, average DFT power */
 static int qvm_coh_capture(QvmCtx *q, double *avg_prob, int N){
     if(!q->sdr_ok||N<1)return -1;
     int D=q->wf.d;
@@ -3474,6 +3546,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "SP",        op_superpose, "alias for SUPERPOSE");
     qvm_reg(q, "X",         op_x,         "cyclic shift [n=1]");
     qvm_reg(q, "Z",         op_z,         "phase rotate [rad=π/4] [k=-1=all]");
+    qvm_reg(q, "T",         op_t_gate,    "T gate: |1> *= e^{iM-OM-^@/8}");
     qvm_reg(q, "H",         op_h,         "Hadamard via LO hop");
     qvm_reg(q, "CZ",        op_cz_gate,   "controlled-Z gate on two qubits");
     qvm_reg(q, "ANTISYM",   op_antisym,   "anti-sym pair entangle (8-pass feedback)");
@@ -3485,6 +3558,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "TX",        op_tx,        "radiate into ether");
     qvm_reg(q, "RX",        op_rx,        "capture from ether");
     qvm_reg(q, "MEASURE",   op_measure,   "Born-rule collapse");
+    qvm_reg(q, "QEC_GRIDT", op_qec_gridt, "PlaneWarp T-error (pi/8) correction on r x s grid");
     qvm_reg(q, "M",         op_measure,   "alias for MEASURE");
     qvm_reg(q, "QMEASURE",  op_qmeasure,  "passive wait → env decoheres");
     qvm_reg(q, "COLLAPSE",  op_collapse,  "anti-sym noise → collapse (87.5%)");
@@ -3502,6 +3576,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "HGATE",     op_h_gate,    "Hadamard gate");
     qvm_reg(q, "MBASIS",    op_mbasis,    "measure in rotated basis M(angle)");
     qvm_reg(q, "QEC_GRID",  op_qec_grid,  "PlaneWarp toric code on r x s grid");
+    qvm_reg(q, "QEC_GRIDZ", op_qec_gridz, "PlaneWarp Z-error (phase) correction on r x s grid");
     qvm_reg(q, "QEC_ROOM",  op_qec_room,  "room-measured QEC (coherent capture)");
     qvm_reg(q, "QEC_NOISE", op_qec_noise, "set noise injection % for QEC");
     qvm_reg(q, "QEC_COH",   op_qec_coh,   "set coherent capture rounds for QEC_ROOM");
