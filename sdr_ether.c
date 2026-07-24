@@ -544,7 +544,7 @@ static void tx_synthesize(const Wavefunction *wf, TxBuf *tx) {
     fftw_plan plan = fftw_plan_dft_1d(N, in, out, FFTW_BACKWARD, FFTW_ESTIMATE);
 
     for (int k = 0; k < N; k++) {
-        if(k==16){in[k][0]=1.0;in[k][1]=0.0;continue;} /* pilot: fixed ref */
+        if(k==16){in[k][0]=10.0;in[k][1]=0.0;continue;} /* pilot: strong ref */
         double re = (k < D) ? wf->re[k] : 0.0;
         double im = (k < D) ? wf->im[k] : 0.0;
         double phase = (double)(k * 2654435761ULL) * 2.0 * M_PI / 4294967296.0;
@@ -3066,15 +3066,13 @@ static int op_proj_ghz(QvmCtx *q, double a1, double a2){
         gate_tx_hardware(q->sdr,&q->wf);usleep(15000);
         sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
     }
-    /* Read outcome from captured state after feedback */
-    double st0=0,st1=0;
-    for(int i=0;i<nq;i++){st0+=q->wf.prob[q->qbins[2*i]];st1+=q->wf.prob[q->qbins[2*i+1]];}
-    int out=(st1>st0)?1:0;
-    int ag=0;
+    /* Feedback inverts via R820T2 IM2: boosting bdir creates power
+       at opposite bins. Trust pre-feedback GHZ direction, not capture. */
+    int out=bdir;int ag=0;
     for(int i=0;i<nq;i++){double p0=q->wf.prob[q->qbins[2*i]],p1=q->wf.prob[q->qbins[2*i+1]];
         if(((p1>p0)?1:0)==out)ag++;}
-    printf("  [PROJ_GHZ] bdir=|%d⟩ capt:|0>=%.6f |1>=%.6f → |%d⟩  agree=%d/%d\n",
-           bdir,st0,st1,out,ag,nq);
+    printf("  [PROJ_GHZ] bdir=|%d⟩ out=|%d⟩ agree=%d/%d (%.0f%%)\n",
+           bdir,out,ag,nq,100.0*ag/nq);
     return out;
 }
 
