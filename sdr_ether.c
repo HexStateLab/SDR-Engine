@@ -3722,6 +3722,15 @@ int qvm_ofdm_complex(QvmCtx *q, const double *re, const double *im,
     fftw_execute(plan);
     double norm=1.0/np;
     for(int k=0;k<d;k++){I_out[k]=fout[k][0]*norm;Q_out[k]=fout[k][1]*norm;}
+
+    /* Pilot derotation: bin 16 is TX'd at 10× in tx_synthesize.
+       Derotate all captured I/Q by inverse pilot phase. */
+    double pr=I_out[16],pi=Q_out[16],pm=sqrt(pr*pr+pi*pi);
+    if(pm>1e-15){double cr=pr/pm,sr=-pi/pm;
+        for(int k=0;k<d;k++){double i=I_out[k],q=Q_out[k];
+            I_out[k]=i*cr-q*sr;Q_out[k]=i*sr+q*cr;}
+    }
+
     fftw_destroy_plan(plan);fftw_free(fin);fftw_free(fout);
     return 0;
 }
