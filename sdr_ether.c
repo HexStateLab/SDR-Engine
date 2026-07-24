@@ -3380,7 +3380,7 @@ static int op_qec_gridz(QvmCtx *q, double a1, double a2){
     int eb=0,ea=0;for(int i=0;i<r*s;i++){if(err_pat[i])eb++;if(rem[i])ea++;}
     int ncorr=0;char cbuf[16];
     for(int i=0;i<r*s;i++)if(corr[i]){
-        snprintf(cbuf,sizeof(cbuf),"Z 3.14159 %d",i);qvm_eval(q,cbuf);ncorr++;
+        snprintf(cbuf,sizeof(cbuf),"Z 3.14159 %d",q->qbins[2*i+1]);qvm_eval(q,cbuf);ncorr++;
     }
     printf("  [QEC_GRIDZ] before=%d corrected=%d after=%d | net=%+d\n",eb,ncorr,ea,eb-ea);
     free(outcomes);free(err_pat);free(syn);free(corr);free(rem);return 0;
@@ -3400,7 +3400,7 @@ static int op_qec_gridt(QvmCtx *q, double a1, double a2){
     syndrome_of(r,s,ep,sy);preprocess_syndrome(r,s,sy);solve_plane(r,s,sy,co);
     int eb=0,ea=0;for(int i=0;i<r*s;i++){if(ep[i])eb++;if(ep[i]^co[i])ea++;}
     int nc=0;char cb[16];
-    for(int i=0;i<r*s;i++)if(co[i]){snprintf(cb,sizeof(cb),"T %d",i);qvm_eval(q,cb);nc++;}
+    for(int i=0;i<r*s;i++)if(co[i]){snprintf(cb,sizeof(cb),"T %d",q->qbins[2*i+1]);qvm_eval(q,cb);nc++;}
     printf("  [QEC_GRIDT] before=%d corrected=%d after=%d | net=%+d\n",eb,nc,ea,eb-ea);
     free(out);free(ep);free(sy);free(co);return 0;
 }
