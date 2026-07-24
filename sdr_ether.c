@@ -3014,16 +3014,17 @@ static int qvm_selective_proj(QvmCtx *q, int qi){
     memcpy(sre,q->wf.re,D*sizeof(double));
     memcpy(sim,q->wf.im,D*sizeof(double));
 
-    /* TX only |0⟩ bin of measured qubit (single tone, no anti-sym) */
-    double x[D],xi[D],y[D];
+    /* DPSK phase-demodulated readout */
+    double x[D],xi[D],I[D],Q[D];
     memset(x,0,D*8);memset(xi,0,D*8);
-    x[b0]=0.7071;
-    for(int i=0;i<16;i++)x[i]=0;
+    x[b0]=0.7071;for(int i=0;i<16;i++)x[i]=0;
+    qvm_ofdm_complex(q,x,xi,I,Q,D);
 
-    qvm_ofdm_compute(q,x,xi,y,D);
-
-    double p0=y[b0],p1=y[b1];
-    int outcome=(p1>p0)?1:0;
+    double I0=I[b0],Q0=Q[b0],I1=I[b1],Q1=Q[b1];
+    double dphi=I1*I0+Q1*Q0;
+    int outcome=(dphi<0)?1:0;
+    double p0=I0*I0+Q0*Q0;
+    double p1=I1*I1+Q1*Q1;
 
     /* Collapse only the measured qubit */
     q->wf.re[b0]=q->wf.im[b0]=q->wf.prob[b0]=0;
@@ -3042,6 +3043,38 @@ static int qvm_selective_proj(QvmCtx *q, int qi){
     }
     free(sprob);free(sre);free(sim);
     return outcome;
+}
+
+/* PROJ_GHZ: Null-balance interferometric readout.
+   Round A: TX boosted-GHZ, capture. Round B: TX negated, capture.
+   If GHZ=expected, B cancels → low power (linear RX noise floor).
+   If GHZ=opposite, B adds constructively → high power. */
+static int op_proj_ghz(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;int nq=q->n_qbins/2,D=q->wf.d;
+    if(nq<2||!q->sdr_ok){printf("  [PROJ_GHZ] need ≥2 qubits+SDR\n");return 0;}
+
+    double t0=0,t1=0;
+    for(int i=0;i<nq;i++){t0+=q->wf.prob[q->qbins[2*i]];t1+=q->wf.prob[q->qbins[2*i+1]];}
+    int bdir=(t1>t0)?1:0;
+    for(int r=0;r<4;r++){
+        for(int i=0;i<nq;i++){
+            int bb=q->qbins[2*i+bdir];
+            q->wf.re[bb]*=2.0;q->wf.im[bb]*=2.0;
+            q->wf.prob[bb]=q->wf.re[bb]*q->wf.re[bb]+q->wf.im[bb]*q->wf.im[bb];
+        }
+        gate_tx_hardware(q->sdr,&q->wf);usleep(15000);
+        sdr_capture(q->sdr);wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    }
+    /* Read outcome from captured state after feedback */
+    double st0=0,st1=0;
+    for(int i=0;i<nq;i++){st0+=q->wf.prob[q->qbins[2*i]];st1+=q->wf.prob[q->qbins[2*i+1]];}
+    int out=(st1>st0)?1:0;
+    int ag=0;
+    for(int i=0;i<nq;i++){double p0=q->wf.prob[q->qbins[2*i]],p1=q->wf.prob[q->qbins[2*i+1]];
+        if(((p1>p0)?1:0)==out)ag++;}
+    printf("  [PROJ_GHZ] bdir=|%d⟩ capt:|0>=%.6f |1>=%.6f → |%d⟩  agree=%d/%d\n",
+           bdir,st0,st1,out,ag,nq);
+    return out;
 }
 
 static int op_proj_meas(QvmCtx *q, double a1, double a2){
@@ -3452,6 +3485,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "STABILIZE", op_stabilize, "regenerative feedback — keep qudit alive");
     qvm_reg(q, "GHZ_STAB",  op_ghz_stab,  "regenerate all bins — preserve entanglement");
     qvm_reg(q, "PROJ",      op_proj_meas, "projective Z-measurement on qudit");
+    qvm_reg(q, "PROJ_GHZ",  op_proj_ghz,  "null-balance interferometric GHZ collapse");
     qvm_reg(q, "CREATE",    op_create,    "algebraic creation a^dagger on qudit");
     qvm_reg(q, "ANNIHILATE",op_annihilate,"algebraic annihilation a on qudit");
     qvm_reg(q, "OCCUPATION",op_occupation,"measure occupation through room");
