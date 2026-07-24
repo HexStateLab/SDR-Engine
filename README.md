@@ -1,8 +1,9 @@
 # SDR-Engine — RTL-SDR Room-Scale Quantum Processor
 
-A 5,300-line quantum virtual machine that uses a $25 RTL-SDR dongle and the
-electromagnetic field of a room as its computational substrate.  Qudits are
-encoded as RF tones, entanglement is physical multipath interference,
+A quantum virtual machine that uses a cheap RTL-SDR dongle and the
+electromagnetic field of a room as its computational substrate.  
+
+Qudits are encoded as RF tones, entanglement is physical multipath interference,
 gates are frequency mixing via the R820T2 Gilbert cell mixer, and projective
 measurement is power capture at each subcarrier.
 
