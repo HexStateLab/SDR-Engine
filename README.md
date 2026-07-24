@@ -1,4 +1,4 @@
-# SDRQudit — RTL-SDR Room-Scale Quantum Processor
+# SDR-Engine — RTL-SDR Room-Scale Quantum Processor
 
 A 5,300-line quantum virtual machine that uses a $25 RTL-SDR dongle and the
 electromagnetic field of a room as its computational substrate.  Qudits are
