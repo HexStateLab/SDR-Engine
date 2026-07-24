@@ -501,6 +501,16 @@ static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
             wf->re[k]=re*cr-im*sr;wf->im[k]=re*sr+im*cr;}}
     else{for(int k=0;k<D;k++){wf->re[k]=out[k][0]*norm;wf->im[k]=out[k][1]*norm;}}
 
+    /* Soft-threshold denoising: squeeze empty bins toward zero. */
+    double mean=0;for(int k=0;k<D;k++)mean+=sqrt(wf->re[k]*wf->re[k]+wf->im[k]*wf->im[k]);
+    mean/=D;double tau=mean*0.5;
+    for(int k=0;k<D;k++){
+        double m=sqrt(wf->re[k]*wf->re[k]+wf->im[k]*wf->im[k]);
+        if(m<1e-15)continue;
+        double w=(m>tau)?(1.0-tau/m):0.0;
+        wf->re[k]*=w;wf->im[k]*=w;
+    }
+
     fftw_destroy_plan(plan);
     fftw_free(in);
     fftw_free(out);
@@ -544,7 +554,7 @@ static void tx_synthesize(const Wavefunction *wf, TxBuf *tx) {
     fftw_plan plan = fftw_plan_dft_1d(N, in, out, FFTW_BACKWARD, FFTW_ESTIMATE);
 
     for (int k = 0; k < N; k++) {
-        if(k==16){in[k][0]=10.0;in[k][1]=0.0;continue;} /* pilot: strong ref */
+        if(k==16){in[k][0]=3.0;in[k][1]=0.0;continue;} /* pilot: strong ref */
         double re = (k < D) ? wf->re[k] : 0.0;
         double im = (k < D) ? wf->im[k] : 0.0;
         double phase = (double)(k * 2654435761ULL) * 2.0 * M_PI / 4294967296.0;
