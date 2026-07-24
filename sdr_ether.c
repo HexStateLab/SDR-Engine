@@ -2094,6 +2094,7 @@ struct QvmCtx {
     int    qbins[32768];
     int    noise_pct; /* QEC noise injection level */
     int    coh_rounds; /* QEC coherent capture rounds */
+    int    parallel;   /* 1 = use surface reality (D-k bins) for doubled qubit count */
     int    n_qbins;
 };
 
@@ -2249,7 +2250,7 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     if(!q->sdr_ok)return 0;
     int n=q->n_qbins;
-    if(n<4){printf("  [ANTISYM] need >=4 bins (>=2 qudits)\n");return 0;}
+    if(n<2){printf("  [ANTISYM] need >=2 bins (>=2 qudits)\n");return 0;}
     int nq=n/2, D=q->wf.d, n_pass=8;
     double x[D],xi[D],y[D],amp=1.0/sqrt(2.0);
     for(int pass=0;pass<n_pass;pass++){
@@ -2301,7 +2302,7 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
    Uses standard 2-qubit measurement projectors on a,b. */
 static int op_chsh(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
-    if(q->n_qbins<4){printf("  [CHSH] use QBIN first (need 4 bins)\n");return 0;}
+    if(q->n_qbins<2){printf("  [CHSH] use QBIN first (need 4 bins)\n");return 0;}
     /* GHZ endpoints: qbins[0] = |0..0⟩, qbins[n-1] = |1..1⟩ */
     double p0=q->wf.prob[q->qbins[0]];
     double p1=q->wf.prob[q->qbins[q->n_qbins-1]];
@@ -3281,12 +3282,16 @@ static int op_qec_grid(QvmCtx *q, double a1, double a2){
         tot_p1+=q->wf.prob[q->qbins[2*i+1]];
     }
     int expected=(tot_p1>tot_p0)?1:0;
-    int nerr=0, n1=0;
-    double gap=(tot_p0+tot_p1)/(r*s)*0.1; /* 10% of per-qubit power as threshold */
+    int nerr=0, n1=0, D=q->wf.d;
+    double gap=(tot_p0+tot_p1)/(r*s)*0.1;
     for(int i=0;i<r*s;i++){
-        double p0=q->wf.prob[q->qbins[2*i]], p1=q->wf.prob[q->qbins[2*i+1]];
-        /* Only mark as divergent if the per-qubit gap exceeds GHZ spread.
-           XGATE swaps p0↔p1 completely, creating a large deviation. */
+        int b0=q->qbins[2*i], b1=q->qbins[2*i+1];
+        double p0=q->wf.prob[b0], p1=q->wf.prob[b1];
+        /* Parallel reality: average space + surface bins for √2 SNR */
+        if(q->parallel){
+            p0=(p0+q->wf.prob[D-b0])*0.5;
+            p1=(p1+q->wf.prob[D-b1])*0.5;
+        }
         if(fabs(p1-p0) > gap && ((p1>p0)!=expected))
             outcomes[i]=!expected;
         else
@@ -3511,6 +3516,15 @@ static int op_qec_coh(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* PARALLEL [0|1]: enable/disable parallel reality (surface bins at D-k).
+   When enabled, QEC reads both space and surface bins for redundancy.
+   Doubles effective qubit count via negative-frequency mapping. */
+static int op_parallel(QvmCtx *q, double a1, double a2){
+    q->parallel=((int)a1)!=0?1:0;(void)a2;
+    printf("  [PARALLEL] surface reality %s\n",q->parallel?"ENABLED":"disabled");
+    return 0;
+}
+
 /* QFT [range]: Quantum Fourier Transform on WF amplitudes via FFTW3.
    If range not given, uses full D. Result stored in wf.re/wf.im. */
 static int op_qft(QvmCtx *q, double a1, double a2){
@@ -3580,6 +3594,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "QEC_ROOM",  op_qec_room,  "room-measured QEC (coherent capture)");
     qvm_reg(q, "QEC_NOISE", op_qec_noise, "set noise injection % for QEC");
     qvm_reg(q, "QEC_COH",   op_qec_coh,   "set coherent capture rounds for QEC_ROOM");
+    qvm_reg(q, "PARALLEL",  op_parallel,  "enable parallel reality (surface bins at D-k)");
     qvm_reg(q, "TICK",      op_tick,      "TX→ether→RX cycle");
     qvm_reg(q, "PROB",      op_prob,      "show probabilities");
     qvm_reg(q, "P",         op_prob,      "alias for PROB");
@@ -3804,7 +3819,7 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
         q->wf.purity=1.0/D; q->wf.entropy=log2(D);
     }
     q->running = 1;
-    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0; q->coh_rounds=4;
+    memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0; q->coh_rounds=4; q->parallel=0;
     qvm_init_ops(q);
     return q;
 }
