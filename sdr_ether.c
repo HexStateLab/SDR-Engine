@@ -493,12 +493,13 @@ static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
     }
 
     fftw_execute(plan);
-
-    double norm = 1.0 / (double)np;
-    for (int k = 0; k < D; k++) {
-        wf->re[k] = out[k][0] * norm;
-        wf->im[k] = out[k][1] * norm;
-    }
+    double norm=1.0/np;
+    double p_re=out[16][0]*norm,p_im=out[16][1]*norm;
+    double p_mag=sqrt(p_re*p_re+p_im*p_im);
+    if(p_mag>1e-15){double cr=p_re/p_mag,sr=-p_im/p_mag;
+        for(int k=0;k<D;k++){double re=out[k][0]*norm,im=out[k][1]*norm;
+            wf->re[k]=re*cr-im*sr;wf->im[k]=re*sr+im*cr;}}
+    else{for(int k=0;k<D;k++){wf->re[k]=out[k][0]*norm;wf->im[k]=out[k][1]*norm;}}
 
     fftw_destroy_plan(plan);
     fftw_free(in);
@@ -543,9 +544,9 @@ static void tx_synthesize(const Wavefunction *wf, TxBuf *tx) {
     fftw_plan plan = fftw_plan_dft_1d(N, in, out, FFTW_BACKWARD, FFTW_ESTIMATE);
 
     for (int k = 0; k < N; k++) {
+        if(k==16){in[k][0]=1.0;in[k][1]=0.0;continue;} /* pilot: fixed ref */
         double re = (k < D) ? wf->re[k] : 0.0;
         double im = (k < D) ? wf->im[k] : 0.0;
-        /* Randomize phase to reduce crest factor */
         double phase = (double)(k * 2654435761ULL) * 2.0 * M_PI / 4294967296.0;
         double cr = cos(phase), sr = sin(phase);
         in[k][0] = re * cr - im * sr;
