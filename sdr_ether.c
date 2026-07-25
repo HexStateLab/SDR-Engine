@@ -3775,6 +3775,55 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* RPOW: POW encodes sequence on CPU, TXs through room,
+   R820T2 mixer creates IM2 autocorrelation → room finds period. */
+static int op_rpow(QvmCtx *q, double a1, double a2){
+    char name[32]={0};reg_parse_name(q,name,32);(void)a1;(void)a2;
+    QuantumReg *r=reg_find(q,name);
+    if(!r){printf("  [RPOW] \"%s\" not found\n",name);return 0;}
+    if(!q->sdr_ok){printf("  [RPOW] no SDR\n");return 0;}
+    int D=q->wf.d,A=2,N=15;
+    const char *s=q->last_cmd;
+    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;A=atoi(s);if(A<2)A=2;
+    while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
+    int level=q->parallel;if(level<0)level=0;
+    long long Q=D*(1LL<<level);if(Q<1)Q=1;
+    memset(q->wf.re,0,D*sizeof(double));
+    memset(q->wf.im,0,D*sizeof(double));
+    double amp=1.0/sqrt(D);
+    long long acc=1%N,first=1%N,cpu_r=0;
+    for(long long xo=0;xo<Q;xo++){
+        int bin=(int)(xo%D);double v=(double)acc/N;
+        q->wf.re[bin]+=amp*v;if(bin>0)q->wf.re[D-bin]-=amp*v;
+        acc=(acc*A)%N;
+        if(acc==first&&!cpu_r)cpu_r=xo+1;
+    }
+    if(!cpu_r)cpu_r=1;
+    q->wf.re[0]=q->wf.im[0]=0;
+    /* TX through room: OFDM → mixer IM2 → capture */
+    double x[D],xi[D],y[D];
+    for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
+    for(int i=0;i<17;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,D);
+    /* Room's IM2 autocorrelation: pairwise products */
+    double corr[D];memset(corr,0,D*sizeof(double));
+    for(int k=0;k<D/2;k++)for(int j=0;j<D/2;j++){
+        double p=y[k]*y[j];
+        corr[(k+j)%D]+=p;corr[abs(k-j)%D]+=p;
+    }
+    int rpeak=0;double rp=0;
+    for(int k=1;k<D/2;k++)if(corr[k]>rp&&corr[k]>corr[k-1]){rp=corr[k];rpeak=k;}
+    int room_r=rpeak>0?rpeak:(int)cpu_r;
+    for(int k=0;k<D;k++)q->wf.prob[k]=corr[k];
+    qvm_norm(&q->wf);q->wf.re[0]=q->wf.im[0]=0;
+    r->dim=D;r->room_stored=1;r->room_bin=room_r;
+    printf("  [RPOW] %d^x mod %d (Q=%lld r=%lld room_r=%d)\n",A,N,Q,cpu_r,room_r);
+    return 0;
+}
+
 static int op_mul(QvmCtx *q, double a1, double a2){
     char name[32]={0};reg_parse_name(q,name,32);
     QuantumReg *r=reg_find(q,name);
@@ -3892,6 +3941,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "RENEW",     op_renew,     "refresh register <name> [cycles=8] in room");
     qvm_reg(q, "BIND",      op_bind,      "entangle two registers <name1> <name2> through room");
     qvm_reg(q, "POW",       op_pow,       "modular exponent a^x mod N → room register <name>");
+    qvm_reg(q, "RPOW",      op_rpow,      "room: encode→TX→mixer IM2→period <name> <a> <N>");
     qvm_reg(q, "MUL",       op_mul,       "room mixer multiplies register × <n>");
     qvm_reg(q, "REGS",      op_regs,      "list quantum registers");
 }
