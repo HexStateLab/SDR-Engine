@@ -3533,8 +3533,9 @@ static int op_qec_coh(QvmCtx *q, double a1, double a2){
    When enabled, QEC reads both space and surface bins for redundancy.
    Doubles effective qubit count via negative-frequency mapping. */
 static int op_parallel(QvmCtx *q, double a1, double a2){
-    q->parallel=((int)a1)!=0?1:0;(void)a2;
-    printf("  [PARALLEL] surface reality %s\n",q->parallel?"ENABLED":"disabled");
+    int lv=((int)a1);if(lv<0)lv=0;(void)a2;
+    q->parallel=lv;
+    printf("  [PARALLEL] level %d → Q=%.0f×D\n",lv,pow(2,lv));
     return 0;
 }
 
@@ -3746,39 +3747,32 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     while(*s==' '||*s=='\t')s++;A=atoi(s);if(A<2)A=2;
     while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
-    int Q=(q->parallel&&D>16)?D*2:D;
-    if(Q>D*2)Q=D*2;
+    int level=q->parallel;if(level<0)level=0;
+    int Q=D*(1<<level);
     int *vals=malloc(Q*sizeof(int));if(!vals)return 0;
     long long acc=1%N;
     for(int xo=0;xo<Q;xo++){vals[xo]=(int)acc;acc=(acc*A)%N;}
     int period=1;for(int p=1;p<Q;p++){if(vals[p]==vals[0]){period=p;break;}}
     memset(q->wf.re,0,D*sizeof(double));
     memset(q->wf.im,0,D*sizeof(double));
-    double amp=1.0/sqrt(Q>D?D:Q);
-    if(q->parallel&&Q>D){
-        int half=D;
-        for(int xv=0;xv<half;xv++){
-            double v=(double)vals[xv]/N;
-            q->wf.re[xv]=amp*v;
-            q->wf.re[D-xv]-=amp*v;
-        }
-        for(int xv=0;xv<half&&xv<Q-half;xv++){
-            double v=(double)vals[half+xv]/N;
-            q->wf.im[xv]=amp*v;
-            q->wf.im[D-xv]-=amp*v;
-        }
-    }else{
-        for(int xv=0;xv<Q&&xv<D;xv++){
-            double v=(double)vals[xv]/N;
-            q->wf.re[xv]=amp*v;
-            q->wf.re[D-xv]-=amp*v;
+    double amp=1.0/sqrt(D);
+    int vp=0;
+    for(int lv=0;lv<=level;lv++){
+        for(int xv=0;xv<D&&vp<Q;xv++){
+            double v=(double)vals[vp++]/N;
+            switch(lv&3){
+            case 0:q->wf.re[xv]+=amp*v;break;
+            case 1:q->wf.im[xv]+=amp*v;break;
+            case 2:if(xv>0)q->wf.re[D-xv]+=amp*v;break;
+            case 3:if(xv>0)q->wf.im[D-xv]+=amp*v;break;
+            }
         }
     }
     q->wf.re[0]=q->wf.im[0]=0;
     qvm_norm(&q->wf);
     r->dim=D;r->room_stored=0;r->room_bin=vals[0]%D;
     printf("  [POW] %d^x mod %d (Q=%d%s r=%d) encoded\n",A,N,Q,
-        q->parallel?" parallel":"",period);
+        level?" parallel":"",period);
     printf("  values: ");for(int xv=0;xv<period&&xv<8;xv++)printf("%d ",vals[xv]);printf("\n");
     free(vals);
     return 0;
