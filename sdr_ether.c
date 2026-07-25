@@ -54,7 +54,6 @@
 #include <fftw3.h>
 
 #include "qvm_api.h"
-#include <gmp.h>
 
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
@@ -2070,14 +2069,6 @@ typedef struct QvmCtx QvmCtx;
 typedef int (*QvmOp)(QvmCtx *q, double a1, double a2);
 
 #define QVM_MAX_OPS 80
-#define QVM_MAX_REGS 16
-
-typedef struct {
-    char   name[32];
-    int    dim;
-    int    room_stored;
-    int    room_bin;
-} QuantumReg;
 
 struct QvmCtx {
     SdrDev       *sdr;
@@ -2105,11 +2096,6 @@ struct QvmCtx {
     int    coh_rounds; /* QEC coherent capture rounds */
     int    parallel;   /* 1 = use surface reality (D-k bins) for doubled qubit count */
     int    n_qbins;
-
-    /* Quantum Register file */
-    QuantumReg regs[QVM_MAX_REGS];
-    int        n_regs;
-    const char *last_cmd;
 };
 
 /* ─── Helpers ─── */
@@ -3534,9 +3520,8 @@ static int op_qec_coh(QvmCtx *q, double a1, double a2){
    When enabled, QEC reads both space and surface bins for redundancy.
    Doubles effective qubit count via negative-frequency mapping. */
 static int op_parallel(QvmCtx *q, double a1, double a2){
-    int lv=((int)a1);if(lv<0)lv=0;(void)a2;
-    q->parallel=lv;
-    printf("  [PARALLEL] level %d → Q=%.0f×D\n",lv,pow(2,lv));
+    q->parallel=((int)a1)!=0?1:0;(void)a2;
+    printf("  [PARALLEL] surface reality %s\n",q->parallel?"ENABLED":"disabled");
     return 0;
 }
 
@@ -3564,352 +3549,6 @@ static int op_qft(QvmCtx *q, double a1, double a2){
 
     printf("  [QFT] %d-point Fourier transform\n",n);
     fftw_destroy_plan(plan);fftw_free(in);fftw_free(out);
-    return 0;
-}
-
-/* ── Quantum Register in The Room ──
-   Named registers radiate WF into the room's EM field and
-   capture it back via multipath persistence (~500ms).
-   No software copies — the room IS the register. */
-static int reg_parse_name(QvmCtx *q, char *name, int sz){
-    if(!q->last_cmd)return -1;
-    const char *s=q->last_cmd;
-    while(*s==' '||*s=='\t')s++;
-    while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;
-    if(!*s||*s=='\n'||*s=='\r')return -1;
-    int i=0;
-    while(*s&&*s!=' '&&*s!='\t'&&*s!='\n'&&*s!='\r'&&i<sz-1)name[i++]=*s++;
-    name[i]=0;
-    return i;
-}
-
-static int reg_parse_bin(QvmCtx *q){
-    if(!q->last_cmd)return 0;
-    const char *s=q->last_cmd;
-    while(*s==' '||*s=='\t')s++;
-    while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;
-    while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;
-    return atoi(s);
-}
-
-static QuantumReg *reg_find(QvmCtx *q, const char *name){
-    for(int i=0;i<q->n_regs;i++)if(q->regs[i].name[0]&&strcasecmp(q->regs[i].name,name)==0)return &q->regs[i];
-    return NULL;
-}
-
-static int op_reg(QvmCtx *q, double a1, double a2){
-    if(q->n_regs>=QVM_MAX_REGS){printf("  [REG] register file full\n");return 0;}
-    QuantumReg *r=&q->regs[q->n_regs];
-    char nm[32]={0};
-    if(reg_parse_name(q,nm,32)<=0){snprintf(nm,32,"reg%d",(int)a1);}
-    r->dim=q->wf.d;r->room_stored=0;r->room_bin=(int)a2;
-    strncpy(r->name,nm,31);
-    q->n_regs++;
-    printf("  [REG] \"%s\" D=%d\n",r->name,q->wf.d);
-    return 0;
-}
-
-static int op_store(QvmCtx *q, double a1, double a2){
-    (void)a1;(void)a2;
-    char name[32]={0};reg_parse_name(q,name,32);
-    QuantumReg *r=reg_find(q,name);
-    if(!r){printf("  [STORE] \"%s\" not found\n",name);return 0;}
-    int D=q->wf.d,mb=reg_parse_bin(q);
-    r->dim=D;r->room_bin=mb;
-    if(q->sdr_ok){
-        double x[D],xi[D],y[D];
-        memset(x,0,D*8);memset(xi,0,D*8);
-        for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
-        if(mb>0&&mb<D){x[mb]*=3.0;xi[mb]*=3.0;}
-        for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-        r->room_stored=1;
-        printf("  [STORE] \"%s\" → room (OFDM TX)",name);
-        if(mb)printf(" marker=bin%d",mb);
-        printf("\n");
-    }else{printf("  [STORE] \"%s\" no SDR\n",name);}
-    return 0;
-}
-
-static int op_recall(QvmCtx *q, double a1, double a2){
-    (void)a1;(void)a2;
-    char name[32]={0};reg_parse_name(q,name,32);
-    QuantumReg *r=reg_find(q,name);
-    if(!r){printf("  [RECALL] \"%s\" not found\n",name);return 0;}
-    if(!q->sdr_ok){printf("  [RECALL] \"%s\" no SDR\n",name);return 0;}
-    if(!r->room_stored){printf("  [RECALL] \"%s\" never stored to room\n",name);return 0;}
-    sdr_capture(q->sdr);
-    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
-    int D=q->wf.d;double tp=0,mp=0;
-    for(int k=0;k<D;k++)tp+=q->wf.prob[k];
-    if(r->room_bin>0&&r->room_bin<D)mp=q->wf.prob[r->room_bin]+q->wf.prob[D-r->room_bin];
-    int alive=mp>0.05;
-    printf("  [RECALL] \"%s\" ← room (pwr=%.3f",name,tp);
-    if(r->room_bin)printf(" marker_bin%d=%.3f",r->room_bin,mp);
-    printf(") %s\n",alive?"ALIVE":"decayed");
-    wf_print(&q->wf,"|ψ⟩",-1);
-    return 0;
-}
-
-static int op_renew(QvmCtx *q, double a1, double a2){
-    int cycles=((int)a1)>0?(int)a1:8;(void)a2;
-    char name[32]={0};reg_parse_name(q,name,32);
-    QuantumReg *r=reg_find(q,name);
-    if(!r){printf("  [RENEW] \"%s\" not found\n",name);return 0;}
-    if(!q->sdr_ok){printf("  [RENEW] \"%s\" no SDR\n",name);return 0;}
-    int D=q->wf.d;double x[D],xi[D],y[D];
-    printf("  [RENEW] \"%s\" ×%d cycles:",name,cycles);
-    for(int cy=0;cy<cycles;cy++){
-        memset(x,0,D*8);memset(xi,0,D*8);
-        if(cy==0){
-            for(int k=0;k<D;k++){
-                if(q->wf.prob[k]>1e-10){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
-            }
-        }else{
-            double tot=0;for(int k=0;k<D;k++)tot+=y[k];
-            if(tot>1e-15)for(int k=0;k<D;k++){
-                if(y[k]>1e-10){x[k]=sqrt(y[k]);x[D-k]=-sqrt(y[k]);}
-            }
-        }
-        int mb=r->room_bin;
-        if(mb>0&&mb<D){x[mb]*=3.0;xi[mb]*=3.0;}
-        for(int i=0;i<16;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-        if(cy==cycles-1){
-            double tot=0;for(int k=0;k<D;k++)tot+=y[k];
-            if(tot>1e-15)for(int k=0;k<D;k++){
-                q->wf.prob[k]=y[k]/tot;q->wf.re[k]=sqrt(y[k]/tot);q->wf.im[k]=0;}
-        }
-        printf(" %d",cy+1);fflush(stdout);
-    }
-    r->room_stored=1;
-    printf(" OK\n");
-    return 0;
-}
-
-static int op_bind(QvmCtx *q, double a1, double a2){
-    (void)a1;(void)a2;
-    char n1[32]={0},n2[32]={0};
-    reg_parse_name(q,n1,32);
-    QuantumReg *ra=reg_find(q,n1);
-    if(!ra){printf("  [BIND] \"%s\" not found\n",n1);return 0;}
-    if(!q->sdr_ok){printf("  [BIND] no SDR\n");return 0;}
-    const char *s=q->last_cmd;while(*s==' '||*s=='\t')s++;
-    while(*s&&*s!=' '&&*s!='\t')s++;while(*s==' '||*s=='\t')s++;
-    while(*s&&*s!=' '&&*s!='\t')s++;while(*s==' '||*s=='\t')s++;
-    int i=0;while(*s&&*s!=' '&&*s!='\t'&&i<31)n2[i++]=*s++;n2[i]=0;
-    QuantumReg *rb=reg_find(q,n2);
-    if(!rb){printf("  [BIND] \"%s\" not found\n",n2);return 0;}
-    if(!ra->room_stored||!rb->room_stored){
-        printf("  [BIND] both registers must be STOREd first\n");return 0;}
-    int ba=ra->room_bin,bb=rb->room_bin,D=q->wf.d;
-    if(!ba||!bb||ba==bb){printf("  [BIND] need distinct marker bins (have %d,%d)\n",ba,bb);return 0;}
-    if(ba>=D||bb>=D)return 0;
-    double x[D],xi[D],y[D];
-    memset(x,0,D*8);memset(xi,0,D*8);
-    double a=0.7071;
-    x[ba]=+a;x[D-ba]=-a;x[bb]=+a;x[D-bb]=-a;
-    for(int o=0;o<16;o++)x[o]=xi[o]=0;
-    printf("  [BIND] \"%s\"(bin%d) + \"%s\"(bin%d) → room",n1,ba,n2,bb);
-    for(int p=0;p<4;p++){
-        qvm_ofdm_compute(q,x,xi,y,D);
-        double ta=y[ba]+y[D-ba];
-        double tb=y[bb]+y[D-bb];
-        memset(x,0,D*8);memset(xi,0,D*8);
-        if(ta>1e-15){x[ba]=+sqrt(ta);x[D-ba]=-sqrt(ta);}
-        if(tb>1e-15){x[bb]=+sqrt(tb);x[D-bb]=-sqrt(tb);}
-        for(int o=0;o<16;o++)x[o]=xi[o]=0;
-        if(p<3)printf(".");
-    }
-    double ta=y[ba]+y[D-ba],tb=y[bb]+y[D-bb],tt=ta+tb;
-    double corr=0;
-    for(int k=0;k<D;k++){
-        if(k!=ba&&k!=D-ba&&k!=bb&&k!=D-bb)corr+=y[k];
-    }
-    double crosstalk=tt>1e-15?corr/tt:0;
-    printf(" |a|=%.3f |b|=%.3f crosstalk=%.3f\n",
-        ta/(ta+tb+1e-15),tb/(ta+tb+1e-15),crosstalk);
-    wf_print(&q->wf,"|ψ⟩ bind",-1);
-    return 0;
-}
-
-static int op_pow(QvmCtx *q, double a1, double a2){
-    (void)a1;(void)a2;
-    char name[32]={0};reg_parse_name(q,name,32);
-    QuantumReg *r=reg_find(q,name);
-    if(!r){printf("  [POW] \"%s\" not found\n",name);return 0;}
-    int D=q->wf.d,A=2,N=15;
-    const char *s=q->last_cmd;
-    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;A=atoi(s);if(A<2)A=2;
-    while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
-    int level=q->parallel;if(level<0)level=0;
-    long long Q=D*(1LL<<level);if(Q<1)Q=1;
-    memset(q->wf.re,0,D*sizeof(double));
-    memset(q->wf.im,0,D*sizeof(double));
-    double amp=1.0/sqrt(D);
-    long long acc=1%N;int period=0,first=1%N;
-    for(long long xo=0;xo<Q;xo++){
-        int lv=(int)(xo/D),bin=(int)(xo%D);
-        double ph=2.0*M_PI*(double)acc/N;
-        double re=amp*cos(ph),im=amp*sin(ph);
-        switch(lv&3){
-        case 0:q->wf.re[bin]+=re;q->wf.im[bin]+=im;break;
-        case 1:q->wf.re[bin]+=im;q->wf.im[bin]-=re;break;
-        case 2:if(bin>0){q->wf.re[D-bin]+=re;q->wf.im[D-bin]-=im;}break;
-        case 3:if(bin>0){q->wf.re[D-bin]+=im;q->wf.im[D-bin]+=re;}break;
-        }
-        acc=(acc*A)%N;
-        if(acc==(long long)first&&!period)period=(int)(xo+1);
-    }
-    if(!period)period=1;
-    q->wf.re[0]=q->wf.im[0]=0;
-    qvm_norm(&q->wf);
-    r->dim=D;r->room_stored=0;r->room_bin=first%D;
-    printf("  [POW] %d^x mod %d (Q=%lld%s r=%d) encoded\n",A,N,Q,
-        level?" parallel":"",period);
-    return 0;
-}
-
-/* RPOW: POW encodes sequence on CPU, TXs through room,
-   R820T2 mixer creates IM2 autocorrelation → room finds period. */
-static int op_rpow(QvmCtx *q, double a1, double a2){
-    char name[32]={0};reg_parse_name(q,name,32);(void)a1;(void)a2;
-    QuantumReg *r=reg_find(q,name);
-    if(!r){printf("  [RPOW] \"%s\" not found\n",name);return 0;}
-    if(!q->sdr_ok){printf("  [RPOW] no SDR\n");return 0;}
-    int D=q->wf.d,A=2,N=15,use_gmp=0;
-    char nbuf[256]={0};
-    const char *s=q->last_cmd;
-    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;A=atoi(s);if(A<2)A=2;
-    while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;
-    {int i=0;while(*s&&*s!=' '&&*s!='\t'&&i<255)nbuf[i++]=*s++;nbuf[i]=0;}
-    if(strlen(nbuf)>9){use_gmp=1;}
-    else{N=atoi(nbuf);if(N<2)N=15;}
-    int level=q->parallel;if(level<0)level=0;
-    long long Q=D*(1LL<<level);if(Q<1)Q=1;
-    memset(q->wf.re,0,D*sizeof(double));
-    memset(q->wf.im,0,D*sizeof(double));
-    double amp=1.0/sqrt(D);long long cpu_r=0;
-    if(use_gmp){
-        mpz_t gN,gA,gacc,gfirst,gtmp;
-        mpz_inits(gN,gA,gacc,gfirst,gtmp,NULL);
-        mpz_set_str(gN,nbuf,10);mpz_set_si(gA,A);
-        mpz_set_ui(gacc,1);mpz_mod(gacc,gacc,gN);mpz_set(gfirst,gacc);
-        for(long long xo=0;xo<Q;xo++){
-            int bin=(int)(xo%D);
-            double v=mpz_get_d(gacc)/mpz_get_d(gN);
-            q->wf.re[bin]+=amp*v;if(bin>0)q->wf.re[D-bin]-=amp*v;
-            mpz_mul(gtmp,gacc,gA);mpz_mod(gacc,gtmp,gN);
-            if(mpz_cmp(gacc,gfirst)==0&&!cpu_r)cpu_r=xo+1;
-        }
-        if(!cpu_r)cpu_r=1;
-        mpz_clears(gN,gA,gacc,gfirst,gtmp,NULL);
-        /* room TX for GMP path */
-        q->wf.re[16]=q->wf.im[16]=0;q->wf.re[0]=q->wf.im[0]=0;
-        double x[D],xi[D],y[D];
-        for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
-        for(int i=0;i<17;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-        double corr[D];memset(corr,0,D*sizeof(double));
-        for(int a=32;a<D/2;a++)for(int b=32;b<D/2;b++){
-            int d=abs(a-b)%D;corr[d]+=y[a]*y[b];}
-        int room_r=0;double best=0;
-        for(int k=1;k<D/2;k++)if(corr[k]>best){best=corr[k];room_r=k;}
-        for(int k=0;k<D;k++){q->wf.prob[k]=corr[k];}
-        qvm_norm(&q->wf);q->wf.re[0]=q->wf.im[0]=0;
-        r->dim=D;r->room_stored=1;r->room_bin=room_r;
-        printf("  [RPOW] %d^x mod %s (Q=%lld cpu_r=%lld room_r=%d) gmp\n",A,nbuf,Q,cpu_r,room_r);
-        return 0;
-    } else {
-        long long acc=1%N,first=1%N;
-        for(long long xo=0;xo<Q;xo++){
-            int bin=(int)(xo%D);double v=(double)acc/N;
-            q->wf.re[bin]+=amp*v;if(bin>0)q->wf.re[D-bin]-=amp*v;
-            acc=(acc*A)%N;
-            if(acc==first&&!cpu_r)cpu_r=xo+1;
-        }
-        if(!cpu_r)cpu_r=1;
-    }
-    if(!cpu_r)cpu_r=1;
-    /* zero pilot + DC before room TX */
-    q->wf.re[16]=q->wf.im[16]=0;
-    q->wf.re[0]=q->wf.im[0]=0;
-    /* feedback: ANTI-SYM-style convergence, amplifies signal vs ambient */
-    int n_fb=8;
-    double x[D],xi[D],y[D];
-    for(int fb=0;fb<n_fb;fb++){
-        for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
-        for(int i=0;i<17;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-        /* re-encode captured values back into WF for next pass */
-        double tot=0;for(int k=0;k<D;k++)tot+=y[k];
-        if(tot>1e-15)for(int k=0;k<D;k++){
-            q->wf.re[k]=sqrt(y[k]/tot);q->wf.im[k]=0;
-        }
-    }
-    /* IM2 difference correlation — skip pilot zone */
-    double corr[D];memset(corr,0,D*sizeof(double));
-    for(int a=32;a<D/2;a++)for(int b=32;b<D/2;b++){
-        int d=abs(a-b)%D;
-        corr[d]+=y[a]*y[b];
-    }
-    int room_r=0;double best=0;
-    for(int k=1;k<D/2;k++)if(corr[k]>best){best=corr[k];room_r=k;}
-    for(int k=0;k<D;k++){q->wf.prob[k]=corr[k];}
-    qvm_norm(&q->wf);q->wf.re[0]=q->wf.im[0]=0;
-    r->dim=D;r->room_stored=1;r->room_bin=room_r;
-    printf("  [RPOW] %d^x mod %d (Q=%lld r=%lld room_r=%d)\n",A,N,Q,cpu_r,room_r);
-    return 0;
-}
-
-static int op_mul(QvmCtx *q, double a1, double a2){
-    char name[32]={0};reg_parse_name(q,name,32);
-    QuantumReg *r=reg_find(q,name);
-    if(!r){printf("  [MUL] \"%s\" not found\n",name);return 0;}
-    if(!q->sdr_ok){printf("  [MUL] no SDR\n");return 0;}
-    const char *s=q->last_cmd;int mul=2;
-    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;mul=atoi(s);if(mul<2)mul=2;
-    int D=q->wf.d,n_pass=16;double x[D],xi[D],y[D];
-    /* find accumulator from current WF */
-    int acc=0;double ap=0;
-    for(int k=17;k<D-17;k++){if(q->wf.prob[k]>ap){ap=q->wf.prob[k];acc=k;}}
-    if(!acc)acc=17;
-    int product=(acc+mul);if(product>=D)product=D-1;
-    for(int pass=0;pass<n_pass;pass++){
-        memset(x,0,D*8);memset(xi,0,D*8);
-        x[product]=3.0;x[D-product]=-3.0;
-        x[mul]=3.0;x[D-mul]=-3.0;
-        x[acc]=3.0;x[D-acc]=-3.0;
-        for(int i=0;i<17;i++)x[i]=xi[i]=0;
-        qvm_ofdm_compute(q,x,xi,y,D);
-    }
-    for(int k=0;k<D;k++){q->wf.re[k]=q->wf.im[k]=q->wf.prob[k]=0;}
-    q->wf.prob[product]=1.0;q->wf.re[product]=1.0;
-    r->room_bin=product;r->room_stored=0;
-    printf("  [MUL] %d×%d → bin %d (pwr=%.3f)\n",acc,mul,product,y[product]);
-    return 0;
-}
-
-static int op_regs(QvmCtx *q, double a1, double a2){
-    (void)a1;(void)a2;
-    printf("  [REGS] %d/%d registers:\n",q->n_regs,QVM_MAX_REGS);
-    for(int i=0;i<q->n_regs;i++){
-        QuantumReg *r=&q->regs[i];
-        printf("    [%d] \"%s\" D=%d room=%s bin=%d\n",
-            i,r->name[0]?r->name:"(unnamed)",r->dim,
-            r->room_stored?"YES":"no",r->room_bin);
-    }
     return 0;
 }
 
@@ -3982,15 +3621,6 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "CALIBRATE", op_calibrate, "measure room channel M [avg=4]");
     qvm_reg(q, "SOLVE",     op_solve,     "subset sum via room [n=5]");
     qvm_reg(q, "BENCH",     op_bench,     "room vs CPU matvec [D=8]");
-    qvm_reg(q, "REG",       op_reg,       "allocate quantum register <name> [marker_bin]");
-    qvm_reg(q, "STORE",     op_store,     "TX WF → room register <name> [marker_bin]");
-    qvm_reg(q, "RECALL",    op_recall,    "capture from room → register <name>");
-    qvm_reg(q, "RENEW",     op_renew,     "refresh register <name> [cycles=8] in room");
-    qvm_reg(q, "BIND",      op_bind,      "entangle two registers <name1> <name2> through room");
-    qvm_reg(q, "POW",       op_pow,       "modular exponent a^x mod N → room register <name>");
-    qvm_reg(q, "RPOW",      op_rpow,      "room: encode→TX→mixer IM2→period <name> <a> <N>");
-    qvm_reg(q, "MUL",       op_mul,       "room mixer multiplies register × <n>");
-    qvm_reg(q, "REGS",      op_regs,      "list quantum registers");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
@@ -4158,7 +3788,6 @@ int qvm_eval(QvmCtx *q, const char *cmd){
     if (!fn) { printf("  ? Unknown: %s\n", op); return 0; }
     if (fn == op_echo) { printf("  %s\n", cmd+4); return 0; }
 
-    q->last_cmd = cmd;
     int rc = fn(q, a1, a2);
 
     /* Auto-sync with ether only for operations that NEED the room.
@@ -4191,7 +3820,6 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
     }
     q->running = 1;
     memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0; q->coh_rounds=4; q->parallel=0;
-    q->n_regs=0; memset(q->regs,0,sizeof(q->regs)); q->last_cmd=NULL;
     qvm_init_ops(q);
     return q;
 }
