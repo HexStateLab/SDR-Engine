@@ -3739,29 +3739,47 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     char name[32]={0};reg_parse_name(q,name,32);
     QuantumReg *r=reg_find(q,name);
     if(!r){printf("  [POW] \"%s\" not found\n",name);return 0;}
-    const char *s=q->last_cmd;int A=2,N=15;
+    int D=q->wf.d,A=2,N=15;
+    const char *s=q->last_cmd;
     while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;A=atoi(s);if(A<2)A=2;
     while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
-    int D=q->wf.d,Q=D;if(N>=D)N=D-1;
+    int Q=(q->parallel&&D>16)?D*2:D;
+    if(Q>D*2)Q=D*2;
     if(N>=D)N=D-1;
-    int *vals=malloc(Q*sizeof(int));
-    int acc=1%N;
-    for(int xo=0;xo<Q;xo++){vals[xo]=acc;acc=(acc*A)%N;}
+    int *vals=malloc(Q*sizeof(int));if(!vals)return 0;
+    long long acc=1%N;
+    for(int xo=0;xo<Q;xo++){vals[xo]=(int)acc;acc=(acc*A)%N;}
     int period=1;for(int p=1;p<Q;p++){if(vals[p]==vals[0]){period=p;break;}}
     memset(q->wf.re,0,D*sizeof(double));
     memset(q->wf.im,0,D*sizeof(double));
-    double amp=1.0/sqrt(Q);
-    for(int xv=0;xv<Q;xv++){
-        q->wf.re[xv]=amp*(double)vals[xv]/N;
-        q->wf.re[D-xv]-=amp*(double)vals[xv]/N;
+    double amp=1.0/sqrt(Q>D?D:Q);
+    if(q->parallel&&Q>D){
+        int half=D;
+        for(int xv=0;xv<half;xv++){
+            double v=(double)vals[xv]/N;
+            q->wf.re[xv]=amp*v;
+            q->wf.re[D-xv]-=amp*v;
+        }
+        for(int xv=0;xv<half&&xv<Q-half;xv++){
+            double v=(double)vals[half+xv]/N;
+            q->wf.im[xv]=amp*v;
+            q->wf.im[D-xv]-=amp*v;
+        }
+    }else{
+        for(int xv=0;xv<Q&&xv<D;xv++){
+            double v=(double)vals[xv]/N;
+            q->wf.re[xv]=amp*v;
+            q->wf.re[D-xv]-=amp*v;
+        }
     }
     q->wf.re[0]=q->wf.im[0]=0;
     qvm_norm(&q->wf);
     r->dim=D;r->room_stored=0;r->room_bin=vals[0]%D;
-    printf("  [POW] %d^x mod %d (Q=%d r=%d) encoded\n",A,N,Q,period);
+    printf("  [POW] %d^x mod %d (Q=%d%s r=%d) encoded\n",A,N,Q,
+        q->parallel?" parallel":"",period);
     printf("  values: ");for(int xv=0;xv<period&&xv<8;xv++)printf("%d ",vals[xv]);printf("\n");
     free(vals);
     return 0;
