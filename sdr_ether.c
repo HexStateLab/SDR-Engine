@@ -3755,12 +3755,13 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     long long acc=1%N;int period=0,first=1%N;
     for(long long xo=0;xo<Q;xo++){
         int lv=(int)(xo/D),bin=(int)(xo%D);
-        double v=(double)acc/N;
+        double ph=2.0*M_PI*(double)acc/N;
+        double re=amp*cos(ph),im=amp*sin(ph);
         switch(lv&3){
-        case 0:q->wf.re[bin]+=amp*v;break;
-        case 1:q->wf.im[bin]+=amp*v;break;
-        case 2:if(bin>0)q->wf.re[D-bin]+=amp*v;break;
-        case 3:if(bin>0)q->wf.im[D-bin]+=amp*v;break;
+        case 0:q->wf.re[bin]+=re;q->wf.im[bin]+=im;break;
+        case 1:q->wf.re[bin]+=im;q->wf.im[bin]-=re;break;
+        case 2:if(bin>0){q->wf.re[D-bin]+=re;q->wf.im[D-bin]-=im;}break;
+        case 3:if(bin>0){q->wf.re[D-bin]+=im;q->wf.im[D-bin]+=re;}break;
         }
         acc=(acc*A)%N;
         if(acc==(long long)first&&!period)period=(int)(xo+1);
