@@ -3748,33 +3748,29 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
     int level=q->parallel;if(level<0)level=0;
-    int Q=D*(1<<level);
-    int *vals=malloc(Q*sizeof(int));if(!vals)return 0;
-    long long acc=1%N;
-    for(int xo=0;xo<Q;xo++){vals[xo]=(int)acc;acc=(acc*A)%N;}
-    int period=1;for(int p=1;p<Q;p++){if(vals[p]==vals[0]){period=p;break;}}
+    long long Q=D*(1LL<<level);if(Q<1)Q=1;
     memset(q->wf.re,0,D*sizeof(double));
     memset(q->wf.im,0,D*sizeof(double));
     double amp=1.0/sqrt(D);
-    int vp=0;
-    for(int lv=0;lv<=level;lv++){
-        for(int xv=0;xv<D&&vp<Q;xv++){
-            double v=(double)vals[vp++]/N;
-            switch(lv&3){
-            case 0:q->wf.re[xv]+=amp*v;break;
-            case 1:q->wf.im[xv]+=amp*v;break;
-            case 2:if(xv>0)q->wf.re[D-xv]+=amp*v;break;
-            case 3:if(xv>0)q->wf.im[D-xv]+=amp*v;break;
-            }
+    long long acc=1%N;int period=0,first=1%N;
+    for(long long xo=0;xo<Q;xo++){
+        int lv=(int)(xo/D),bin=(int)(xo%D);
+        double v=(double)acc/N;
+        switch(lv&3){
+        case 0:q->wf.re[bin]+=amp*v;break;
+        case 1:q->wf.im[bin]+=amp*v;break;
+        case 2:if(bin>0)q->wf.re[D-bin]+=amp*v;break;
+        case 3:if(bin>0)q->wf.im[D-bin]+=amp*v;break;
         }
+        acc=(acc*A)%N;
+        if(acc==(long long)first&&!period)period=(int)(xo+1);
     }
+    if(!period)period=1;
     q->wf.re[0]=q->wf.im[0]=0;
     qvm_norm(&q->wf);
-    r->dim=D;r->room_stored=0;r->room_bin=vals[0]%D;
-    printf("  [POW] %d^x mod %d (Q=%d%s r=%d) encoded\n",A,N,Q,
+    r->dim=D;r->room_stored=0;r->room_bin=first%D;
+    printf("  [POW] %d^x mod %d (Q=%lld%s r=%d) encoded\n",A,N,Q,
         level?" parallel":"",period);
-    printf("  values: ");for(int xv=0;xv<period&&xv<8;xv++)printf("%d ",vals[xv]);printf("\n");
-    free(vals);
     return 0;
 }
 
