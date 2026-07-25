@@ -2069,6 +2069,14 @@ typedef struct QvmCtx QvmCtx;
 typedef int (*QvmOp)(QvmCtx *q, double a1, double a2);
 
 #define QVM_MAX_OPS 80
+#define QVM_MAX_REGS 16
+
+typedef struct {
+    char   name[32];
+    int    dim;
+    int    room_stored;
+    int    room_bin;
+} QuantumReg;
 
 struct QvmCtx {
     SdrDev       *sdr;
@@ -2096,6 +2104,11 @@ struct QvmCtx {
     int    coh_rounds; /* QEC coherent capture rounds */
     int    parallel;   /* 1 = use surface reality (D-k bins) for doubled qubit count */
     int    n_qbins;
+
+    /* Quantum Register file */
+    QuantumReg regs[QVM_MAX_REGS];
+    int        n_regs;
+    const char *last_cmd;
 };
 
 /* ─── Helpers ─── */
@@ -3552,6 +3565,187 @@ static int op_qft(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ── Quantum Register in The Room ──
+   Named registers radiate WF into the room's EM field and
+   capture it back via multipath persistence (~500ms).
+   No software copies — the room IS the register. */
+static int reg_parse_name(QvmCtx *q, char *name, int sz){
+    if(!q->last_cmd)return -1;
+    const char *s=q->last_cmd;
+    while(*s==' '||*s=='\t')s++;
+    while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;
+    if(!*s||*s=='\n'||*s=='\r')return -1;
+    int i=0;
+    while(*s&&*s!=' '&&*s!='\t'&&*s!='\n'&&*s!='\r'&&i<sz-1)name[i++]=*s++;
+    name[i]=0;
+    return i;
+}
+
+static int reg_parse_bin(QvmCtx *q){
+    if(!q->last_cmd)return 0;
+    const char *s=q->last_cmd;
+    while(*s==' '||*s=='\t')s++;
+    while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;
+    while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;
+    return atoi(s);
+}
+
+static QuantumReg *reg_find(QvmCtx *q, const char *name){
+    for(int i=0;i<q->n_regs;i++)if(q->regs[i].name[0]&&strcasecmp(q->regs[i].name,name)==0)return &q->regs[i];
+    return NULL;
+}
+
+static int op_reg(QvmCtx *q, double a1, double a2){
+    if(q->n_regs>=QVM_MAX_REGS){printf("  [REG] register file full\n");return 0;}
+    QuantumReg *r=&q->regs[q->n_regs];
+    char nm[32]={0};
+    if(reg_parse_name(q,nm,32)<=0){snprintf(nm,32,"reg%d",(int)a1);}
+    r->dim=q->wf.d;r->room_stored=0;r->room_bin=(int)a2;
+    strncpy(r->name,nm,31);
+    q->n_regs++;
+    printf("  [REG] \"%s\" D=%d\n",r->name,q->wf.d);
+    return 0;
+}
+
+static int op_store(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    char name[32]={0};reg_parse_name(q,name,32);
+    QuantumReg *r=reg_find(q,name);
+    if(!r){printf("  [STORE] \"%s\" not found\n",name);return 0;}
+    int D=q->wf.d,mb=reg_parse_bin(q);
+    r->dim=D;r->room_bin=mb;
+    if(q->sdr_ok){
+        double x[D],xi[D],y[D];
+        memset(x,0,D*8);memset(xi,0,D*8);
+        for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
+        if(mb>0&&mb<D){x[mb]*=3.0;xi[mb]*=3.0;}
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+        r->room_stored=1;
+        printf("  [STORE] \"%s\" → room (OFDM TX)",name);
+        if(mb)printf(" marker=bin%d",mb);
+        printf("\n");
+    }else{printf("  [STORE] \"%s\" no SDR\n",name);}
+    return 0;
+}
+
+static int op_recall(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    char name[32]={0};reg_parse_name(q,name,32);
+    QuantumReg *r=reg_find(q,name);
+    if(!r){printf("  [RECALL] \"%s\" not found\n",name);return 0;}
+    if(!q->sdr_ok){printf("  [RECALL] \"%s\" no SDR\n",name);return 0;}
+    if(!r->room_stored){printf("  [RECALL] \"%s\" never stored to room\n",name);return 0;}
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    int D=q->wf.d;double tp=0,mp=0;
+    for(int k=0;k<D;k++)tp+=q->wf.prob[k];
+    if(r->room_bin>0&&r->room_bin<D)mp=q->wf.prob[r->room_bin]+q->wf.prob[D-r->room_bin];
+    int alive=mp>0.05;
+    printf("  [RECALL] \"%s\" ← room (pwr=%.3f",name,tp);
+    if(r->room_bin)printf(" marker_bin%d=%.3f",r->room_bin,mp);
+    printf(") %s\n",alive?"ALIVE":"decayed");
+    wf_print(&q->wf,"|ψ⟩",-1);
+    return 0;
+}
+
+static int op_renew(QvmCtx *q, double a1, double a2){
+    int cycles=((int)a1)>0?(int)a1:8;(void)a2;
+    char name[32]={0};reg_parse_name(q,name,32);
+    QuantumReg *r=reg_find(q,name);
+    if(!r){printf("  [RENEW] \"%s\" not found\n",name);return 0;}
+    if(!q->sdr_ok){printf("  [RENEW] \"%s\" no SDR\n",name);return 0;}
+    int D=q->wf.d;double x[D],xi[D],y[D];
+    printf("  [RENEW] \"%s\" ×%d cycles:",name,cycles);
+    for(int cy=0;cy<cycles;cy++){
+        memset(x,0,D*8);memset(xi,0,D*8);
+        if(cy==0){
+            for(int k=0;k<D;k++){
+                if(q->wf.prob[k]>1e-10){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
+            }
+        }else{
+            double tot=0;for(int k=0;k<D;k++)tot+=y[k];
+            if(tot>1e-15)for(int k=0;k<D;k++){
+                if(y[k]>1e-10){x[k]=sqrt(y[k]);x[D-k]=-sqrt(y[k]);}
+            }
+        }
+        int mb=r->room_bin;
+        if(mb>0&&mb<D){x[mb]*=3.0;xi[mb]*=3.0;}
+        for(int i=0;i<16;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+        if(cy==cycles-1){
+            double tot=0;for(int k=0;k<D;k++)tot+=y[k];
+            if(tot>1e-15)for(int k=0;k<D;k++){
+                q->wf.prob[k]=y[k]/tot;q->wf.re[k]=sqrt(y[k]/tot);q->wf.im[k]=0;}
+        }
+        printf(" %d",cy+1);fflush(stdout);
+    }
+    r->room_stored=1;
+    printf(" OK\n");
+    return 0;
+}
+
+static int op_bind(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    char n1[32]={0},n2[32]={0};
+    reg_parse_name(q,n1,32);
+    QuantumReg *ra=reg_find(q,n1);
+    if(!ra){printf("  [BIND] \"%s\" not found\n",n1);return 0;}
+    if(!q->sdr_ok){printf("  [BIND] no SDR\n");return 0;}
+    const char *s=q->last_cmd;while(*s==' '||*s=='\t')s++;
+    while(*s&&*s!=' '&&*s!='\t')s++;while(*s==' '||*s=='\t')s++;
+    while(*s&&*s!=' '&&*s!='\t')s++;while(*s==' '||*s=='\t')s++;
+    int i=0;while(*s&&*s!=' '&&*s!='\t'&&i<31)n2[i++]=*s++;n2[i]=0;
+    QuantumReg *rb=reg_find(q,n2);
+    if(!rb){printf("  [BIND] \"%s\" not found\n",n2);return 0;}
+    if(!ra->room_stored||!rb->room_stored){
+        printf("  [BIND] both registers must be STOREd first\n");return 0;}
+    int ba=ra->room_bin,bb=rb->room_bin,D=q->wf.d;
+    if(!ba||!bb||ba==bb){printf("  [BIND] need distinct marker bins (have %d,%d)\n",ba,bb);return 0;}
+    if(ba>=D||bb>=D)return 0;
+    double x[D],xi[D],y[D];
+    memset(x,0,D*8);memset(xi,0,D*8);
+    double a=0.7071;
+    x[ba]=+a;x[D-ba]=-a;x[bb]=+a;x[D-bb]=-a;
+    for(int o=0;o<16;o++)x[o]=xi[o]=0;
+    printf("  [BIND] \"%s\"(bin%d) + \"%s\"(bin%d) → room",n1,ba,n2,bb);
+    for(int p=0;p<4;p++){
+        qvm_ofdm_compute(q,x,xi,y,D);
+        double ta=y[ba]+y[D-ba];
+        double tb=y[bb]+y[D-bb];
+        memset(x,0,D*8);memset(xi,0,D*8);
+        if(ta>1e-15){x[ba]=+sqrt(ta);x[D-ba]=-sqrt(ta);}
+        if(tb>1e-15){x[bb]=+sqrt(tb);x[D-bb]=-sqrt(tb);}
+        for(int o=0;o<16;o++)x[o]=xi[o]=0;
+        if(p<3)printf(".");
+    }
+    double ta=y[ba]+y[D-ba],tb=y[bb]+y[D-bb],tt=ta+tb;
+    double corr=0;
+    for(int k=0;k<D;k++){
+        if(k!=ba&&k!=D-ba&&k!=bb&&k!=D-bb)corr+=y[k];
+    }
+    double crosstalk=tt>1e-15?corr/tt:0;
+    printf(" |a|=%.3f |b|=%.3f crosstalk=%.3f\n",
+        ta/(ta+tb+1e-15),tb/(ta+tb+1e-15),crosstalk);
+    wf_print(&q->wf,"|ψ⟩ bind",-1);
+    return 0;
+}
+
+static int op_regs(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    printf("  [REGS] %d/%d registers:\n",q->n_regs,QVM_MAX_REGS);
+    for(int i=0;i<q->n_regs;i++){
+        QuantumReg *r=&q->regs[i];
+        printf("    [%d] \"%s\" D=%d room=%s bin=%d\n",
+            i,r->name[0]?r->name:"(unnamed)",r->dim,
+            r->room_stored?"YES":"no",r->room_bin);
+    }
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
@@ -3621,6 +3815,12 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "CALIBRATE", op_calibrate, "measure room channel M [avg=4]");
     qvm_reg(q, "SOLVE",     op_solve,     "subset sum via room [n=5]");
     qvm_reg(q, "BENCH",     op_bench,     "room vs CPU matvec [D=8]");
+    qvm_reg(q, "REG",       op_reg,       "allocate quantum register <name> [marker_bin]");
+    qvm_reg(q, "STORE",     op_store,     "TX WF → room register <name> [marker_bin]");
+    qvm_reg(q, "RECALL",    op_recall,    "capture from room → register <name>");
+    qvm_reg(q, "RENEW",     op_renew,     "refresh register <name> [cycles=8] in room");
+    qvm_reg(q, "BIND",      op_bind,      "entangle two registers <name1> <name2> through room");
+    qvm_reg(q, "REGS",      op_regs,      "list quantum registers");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
@@ -3788,6 +3988,7 @@ int qvm_eval(QvmCtx *q, const char *cmd){
     if (!fn) { printf("  ? Unknown: %s\n", op); return 0; }
     if (fn == op_echo) { printf("  %s\n", cmd+4); return 0; }
 
+    q->last_cmd = cmd;
     int rc = fn(q, a1, a2);
 
     /* Auto-sync with ether only for operations that NEED the room.
@@ -3820,6 +4021,7 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
     }
     q->running = 1;
     memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0; q->coh_rounds=4; q->parallel=0;
+    q->n_regs=0; memset(q->regs,0,sizeof(q->regs)); q->last_cmd=NULL;
     qvm_init_ops(q);
     return q;
 }
