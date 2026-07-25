@@ -2068,7 +2068,7 @@ static void tx_write_file(const TxBuf *tx, const char *path);
 typedef struct QvmCtx QvmCtx;
 typedef int (*QvmOp)(QvmCtx *q, double a1, double a2);
 
-#define QVM_MAX_OPS 64
+#define QVM_MAX_OPS 80
 
 struct QvmCtx {
     SdrDev       *sdr;
