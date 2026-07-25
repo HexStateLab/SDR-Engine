@@ -54,6 +54,7 @@
 #include <fftw3.h>
 
 #include "qvm_api.h"
+#include <gmp.h>
 
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
@@ -3782,42 +3783,88 @@ static int op_rpow(QvmCtx *q, double a1, double a2){
     QuantumReg *r=reg_find(q,name);
     if(!r){printf("  [RPOW] \"%s\" not found\n",name);return 0;}
     if(!q->sdr_ok){printf("  [RPOW] no SDR\n");return 0;}
-    int D=q->wf.d,A=2,N=15;
+    int D=q->wf.d,A=2,N=15,use_gmp=0;
+    char nbuf[256]={0};
     const char *s=q->last_cmd;
     while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
     while(*s==' '||*s=='\t')s++;A=atoi(s);if(A<2)A=2;
     while(*s&&*s!=' '&&*s!='\t')s++;
-    while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
+    while(*s==' '||*s=='\t')s++;
+    {int i=0;while(*s&&*s!=' '&&*s!='\t'&&i<255)nbuf[i++]=*s++;nbuf[i]=0;}
+    if(strlen(nbuf)>9){use_gmp=1;}
+    else{N=atoi(nbuf);if(N<2)N=15;}
     int level=q->parallel;if(level<0)level=0;
     long long Q=D*(1LL<<level);if(Q<1)Q=1;
     memset(q->wf.re,0,D*sizeof(double));
     memset(q->wf.im,0,D*sizeof(double));
-    double amp=1.0/sqrt(D);
-    long long acc=1%N,first=1%N,cpu_r=0;
-    for(long long xo=0;xo<Q;xo++){
-        int bin=(int)(xo%D);double v=(double)acc/N;
-        q->wf.re[bin]+=amp*v;if(bin>0)q->wf.re[D-bin]-=amp*v;
-        acc=(acc*A)%N;
-        if(acc==first&&!cpu_r)cpu_r=xo+1;
+    double amp=1.0/sqrt(D);long long cpu_r=0;
+    if(use_gmp){
+        mpz_t gN,gA,gacc,gfirst,gtmp;
+        mpz_inits(gN,gA,gacc,gfirst,gtmp,NULL);
+        mpz_set_str(gN,nbuf,10);mpz_set_si(gA,A);
+        mpz_set_ui(gacc,1);mpz_mod(gacc,gacc,gN);mpz_set(gfirst,gacc);
+        for(long long xo=0;xo<Q;xo++){
+            int bin=(int)(xo%D);
+            double v=mpz_get_d(gacc)/mpz_get_d(gN);
+            q->wf.re[bin]+=amp*v;if(bin>0)q->wf.re[D-bin]-=amp*v;
+            mpz_mul(gtmp,gacc,gA);mpz_mod(gacc,gtmp,gN);
+            if(mpz_cmp(gacc,gfirst)==0&&!cpu_r)cpu_r=xo+1;
+        }
+        if(!cpu_r)cpu_r=1;
+        mpz_clears(gN,gA,gacc,gfirst,gtmp,NULL);
+        /* room TX for GMP path */
+        q->wf.re[16]=q->wf.im[16]=0;q->wf.re[0]=q->wf.im[0]=0;
+        double x[D],xi[D],y[D];
+        for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
+        for(int i=0;i<17;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+        double corr[D];memset(corr,0,D*sizeof(double));
+        for(int a=32;a<D/2;a++)for(int b=32;b<D/2;b++){
+            int d=abs(a-b)%D;corr[d]+=y[a]*y[b];}
+        int room_r=0;double best=0;
+        for(int k=1;k<D/2;k++)if(corr[k]>best){best=corr[k];room_r=k;}
+        for(int k=0;k<D;k++){q->wf.prob[k]=corr[k];}
+        qvm_norm(&q->wf);q->wf.re[0]=q->wf.im[0]=0;
+        r->dim=D;r->room_stored=1;r->room_bin=room_r;
+        printf("  [RPOW] %d^x mod %s (Q=%lld cpu_r=%lld room_r=%d) gmp\n",A,nbuf,Q,cpu_r,room_r);
+        return 0;
+    } else {
+        long long acc=1%N,first=1%N;
+        for(long long xo=0;xo<Q;xo++){
+            int bin=(int)(xo%D);double v=(double)acc/N;
+            q->wf.re[bin]+=amp*v;if(bin>0)q->wf.re[D-bin]-=amp*v;
+            acc=(acc*A)%N;
+            if(acc==first&&!cpu_r)cpu_r=xo+1;
+        }
+        if(!cpu_r)cpu_r=1;
     }
     if(!cpu_r)cpu_r=1;
+    /* zero pilot + DC before room TX */
+    q->wf.re[16]=q->wf.im[16]=0;
     q->wf.re[0]=q->wf.im[0]=0;
-    /* TX through room: OFDM → mixer IM2 → capture */
+    /* feedback: ANTI-SYM-style convergence, amplifies signal vs ambient */
+    int n_fb=8;
     double x[D],xi[D],y[D];
-    for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
-    for(int i=0;i<17;i++)x[i]=xi[i]=0;
-    qvm_ofdm_compute(q,x,xi,y,D);
-    /* Room's IM2 autocorrelation: pairwise products */
-    double corr[D];memset(corr,0,D*sizeof(double));
-    for(int k=0;k<D/2;k++)for(int j=0;j<D/2;j++){
-        double p=y[k]*y[j];
-        corr[(k+j)%D]+=p;corr[abs(k-j)%D]+=p;
+    for(int fb=0;fb<n_fb;fb++){
+        for(int k=0;k<D;k++){x[k]=q->wf.re[k];xi[k]=q->wf.im[k];}
+        for(int i=0;i<17;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+        /* re-encode captured values back into WF for next pass */
+        double tot=0;for(int k=0;k<D;k++)tot+=y[k];
+        if(tot>1e-15)for(int k=0;k<D;k++){
+            q->wf.re[k]=sqrt(y[k]/tot);q->wf.im[k]=0;
+        }
     }
-    int rpeak=0;double rp=0;
-    for(int k=1;k<D/2;k++)if(corr[k]>rp&&corr[k]>corr[k-1]){rp=corr[k];rpeak=k;}
-    int room_r=rpeak>0?rpeak:(int)cpu_r;
-    for(int k=0;k<D;k++)q->wf.prob[k]=corr[k];
+    /* IM2 difference correlation — skip pilot zone */
+    double corr[D];memset(corr,0,D*sizeof(double));
+    for(int a=32;a<D/2;a++)for(int b=32;b<D/2;b++){
+        int d=abs(a-b)%D;
+        corr[d]+=y[a]*y[b];
+    }
+    int room_r=0;double best=0;
+    for(int k=1;k<D/2;k++)if(corr[k]>best){best=corr[k];room_r=k;}
+    for(int k=0;k<D;k++){q->wf.prob[k]=corr[k];}
     qvm_norm(&q->wf);q->wf.re[0]=q->wf.im[0]=0;
     r->dim=D;r->room_stored=1;r->room_bin=room_r;
     printf("  [RPOW] %d^x mod %d (Q=%lld r=%lld room_r=%d)\n",A,N,Q,cpu_r,room_r);
