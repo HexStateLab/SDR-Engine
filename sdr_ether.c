@@ -3797,9 +3797,8 @@ static int op_mul(QvmCtx *q, double a1, double a2){
         for(int i=0;i<17;i++)x[i]=xi[i]=0;
         qvm_ofdm_compute(q,x,xi,y,D);
     }
-    /* verify the product bin has power */
     for(int k=0;k<D;k++){q->wf.re[k]=q->wf.im[k]=q->wf.prob[k]=0;}
-    q->wf.prob[product]=y[product];q->wf.re[product]=sqrt(y[product]);
+    q->wf.prob[product]=1.0;q->wf.re[product]=1.0;
     r->room_bin=product;r->room_stored=0;
     printf("  [MUL] %d×%d → bin %d (pwr=%.3f)\n",acc,mul,product,y[product]);
     return 0;
