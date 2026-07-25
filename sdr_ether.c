@@ -3774,6 +3774,37 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+static int op_mul(QvmCtx *q, double a1, double a2){
+    char name[32]={0};reg_parse_name(q,name,32);
+    QuantumReg *r=reg_find(q,name);
+    if(!r){printf("  [MUL] \"%s\" not found\n",name);return 0;}
+    if(!q->sdr_ok){printf("  [MUL] no SDR\n");return 0;}
+    const char *s=q->last_cmd;int mul=2;
+    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;while(*s&&*s!=' '&&*s!='\t')s++;
+    while(*s==' '||*s=='\t')s++;mul=atoi(s);if(mul<2)mul=2;
+    int D=q->wf.d,n_pass=16;double x[D],xi[D],y[D];
+    /* find accumulator from current WF */
+    int acc=0;double ap=0;
+    for(int k=17;k<D-17;k++){if(q->wf.prob[k]>ap){ap=q->wf.prob[k];acc=k;}}
+    if(!acc)acc=17;
+    int product=(acc+mul);if(product>=D)product=D-1;
+    for(int pass=0;pass<n_pass;pass++){
+        memset(x,0,D*8);memset(xi,0,D*8);
+        x[product]=3.0;x[D-product]=-3.0;
+        x[mul]=3.0;x[D-mul]=-3.0;
+        x[acc]=3.0;x[D-acc]=-3.0;
+        for(int i=0;i<17;i++)x[i]=xi[i]=0;
+        qvm_ofdm_compute(q,x,xi,y,D);
+    }
+    /* verify the product bin has power */
+    for(int k=0;k<D;k++){q->wf.re[k]=q->wf.im[k]=q->wf.prob[k]=0;}
+    q->wf.prob[product]=y[product];q->wf.re[product]=sqrt(y[product]);
+    r->room_bin=product;r->room_stored=0;
+    printf("  [MUL] %d×%d → bin %d (pwr=%.3f)\n",acc,mul,product,y[product]);
+    return 0;
+}
+
 static int op_regs(QvmCtx *q, double a1, double a2){
     (void)a1;(void)a2;
     printf("  [REGS] %d/%d registers:\n",q->n_regs,QVM_MAX_REGS);
@@ -3861,6 +3892,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "RENEW",     op_renew,     "refresh register <name> [cycles=8] in room");
     qvm_reg(q, "BIND",      op_bind,      "entangle two registers <name1> <name2> through room");
     qvm_reg(q, "POW",       op_pow,       "modular exponent a^x mod N → room register <name>");
+    qvm_reg(q, "MUL",       op_mul,       "room mixer multiplies register × <n>");
     qvm_reg(q, "REGS",      op_regs,      "list quantum registers");
 }
 
