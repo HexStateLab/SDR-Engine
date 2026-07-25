@@ -3748,7 +3748,6 @@ static int op_pow(QvmCtx *q, double a1, double a2){
     while(*s==' '||*s=='\t')s++;N=atoi(s);if(N<2)N=15;
     int Q=(q->parallel&&D>16)?D*2:D;
     if(Q>D*2)Q=D*2;
-    if(N>=D)N=D-1;
     int *vals=malloc(Q*sizeof(int));if(!vals)return 0;
     long long acc=1%N;
     for(int xo=0;xo<Q;xo++){vals[xo]=(int)acc;acc=(acc*A)%N;}
