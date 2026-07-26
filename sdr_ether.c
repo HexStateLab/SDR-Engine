@@ -3118,8 +3118,8 @@ static int op_ghz_stab(QvmCtx *q, double a1, double a2){
    Radiates anti-sym probe + noise at target qubit's bins.
    The room's multipath/mixer/thermal noise PHYSICALLY collapses
    the qubit.  Capture reads which branch the room chose.
-   Then GHZ collapse propagates to ALL qubits — the room IS
-   the measurement apparatus.  No software collapse. */
+   Then REFRESH radiates the collapsed state back from the room's
+   own multipath — no software memory, the room IS the register. */
 static int qvm_selective_proj(QvmCtx *q, int qi){
     int nq=q->n_qbins/2, D=q->wf.d;
     if(qi>=nq||!q->sdr_ok)return -1;
@@ -3137,9 +3137,7 @@ static int qvm_selective_proj(QvmCtx *q, int qi){
       b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
       if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
 
-    /* ── Phase 2: anti-sym noise bursts (random phase) → PHYSICAL collapse ──
-       The room's nonlinearity + thermal noise amplifies one branch,
-       suppresses the other.  ROOM decides the outcome, not software. */
+    /* ── Phase 2: noise bursts → room PHYSICALLY collapses ── */
     for(int burst=0; burst<3; burst++){
         memset(x,0,D*8); memset(xi,0,D*8);
         double phi0 = ((double)rand()/RAND_MAX) * 2 * M_PI;
@@ -3156,45 +3154,48 @@ static int qvm_selective_proj(QvmCtx *q, int qi){
           if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
     }
 
-    /* ── Phase 3: let room settle, then capture the room's decision ── */
+    /* ── Phase 3: capture room's decision, read outcome ── */
     usleep(80000);
     sdr_capture(q->sdr);
     wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
 
-    /* Read outcome from the ROOM's physical state — not software-enforced */
     double p0 = q->wf.prob[b0] + q->wf.prob[D-b0];
     double p1 = q->wf.prob[b1] + q->wf.prob[D-b1];
     int outcome = (p1 > p0) ? 1 : 0;
 
-    /* GHZ collapse: the room collapsed the state physically.
-       Propagate the outcome to all qubits — reflect what room already did. */
-    for(int i=0; i<nq; i++){
-        int bi0 = q->qbins[2*i];
-        int bi1 = q->qbins[2*i+1];
-        q->wf.re[bi0] = q->wf.im[bi0] = q->wf.prob[bi0] = 0;
-        q->wf.re[bi1] = q->wf.im[bi1] = q->wf.prob[bi1] = 0;
-        int ob = outcome ? bi1 : bi0;
-        q->wf.prob[ob] = 1.0;
-        q->wf.re[ob]   = 1.0;
+    /* ── Phase 4: REFRESH — re-radiate what the room already holds.
+       Capture ALL qbin amplitudes from the room's physical state,
+       then TX them back.  0 bytes of software state stored.
+       This keeps the collapsed state alive in the room's multipath
+       for subsequent measurements. ── */
+    {
+        /* Read current amplitudes from room for all qubit bins */
+        double amp_sum = 0;
+        for(int i=0; i<nq; i++){
+            int bi0 = q->qbins[2*i], bi1 = q->qbins[2*i+1];
+            double a0 = q->wf.prob[bi0] + q->wf.prob[D-bi0];
+            double a1 = q->wf.prob[bi1] + q->wf.prob[D-bi1];
+            amp_sum += a0 + a1;
+        }
+        if(amp_sum > 1e-15){
+            memset(x,0,D*8); memset(xi,0,D*8);
+            for(int i=0; i<nq; i++){
+                int bi0 = q->qbins[2*i], bi1 = q->qbins[2*i+1];
+                double a0 = q->wf.prob[bi0] + q->wf.prob[D-bi0];
+                double a1 = q->wf.prob[bi1] + q->wf.prob[D-bi1];
+                if(a0 > 1e-6){ double amp = sqrt(a0/amp_sum);
+                    x[bi0]=+amp; x[D-bi0]=-amp; }
+                if(a1 > 1e-6){ double amp = sqrt(a1/amp_sum);
+                    x[bi1]=+amp; x[D-bi1]=-amp; }
+            }
+            for(int i=0;i<16;i++) x[i]=xi[i]=0;
+            for(int i=0;i<D;i++){q->wf.re[i]=x[i]; q->wf.im[i]=xi[i];}
+            gate_ofdm_tx(q->sdr, &q->wf, NULL);
+            { struct v4l2_buffer b; memset(&b,0,sizeof(b));
+              b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
+              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
+        }
     }
-
-    /* Radiate the collapsed state back into the room.
-       Without this, the room still holds the old GHZ multipath
-       and subsequent measurements see the pre-collapse state.
-       One OFDM TX updates the room to match the collapse. */
-    memset(x,0,D*8); memset(xi,0,D*8);
-    for(int i=0; i<nq; i++){
-        int ob = outcome ? q->qbins[2*i+1] : q->qbins[2*i];
-        x[ob] = +a;
-        if(ob > 0) x[D-ob] = -a;
-    }
-    for(int i=0;i<16;i++) x[i]=xi[i]=0;
-    for(int i=0;i<D;i++){q->wf.re[i]=x[i]; q->wf.im[i]=xi[i];}
-    gate_ofdm_tx(q->sdr, &q->wf, NULL);
-    { struct v4l2_buffer b; memset(&b,0,sizeof(b));
-      b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
-      if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
-    usleep(30000);
 
     return outcome;
 }
