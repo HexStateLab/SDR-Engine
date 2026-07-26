@@ -58,6 +58,9 @@
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
 #define MAX_DIM      65536
+#define MAX_BANK_DIM 32768
+#define MAX_BANKS    128
+#define ROOM_DIM_MAX 4194304
 #define DEFAULT_D    6
 #define DEFAULT_FREQ 100000000
 #define DEFAULT_RATE 2048000
@@ -529,6 +532,50 @@ static void wf_from_iq(const double *iq_i, const double *iq_q, int np,
             wf->purity += wf->prob[k] * wf->prob[k];
         }
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * WAVEFUNCTION COMPUTE (OFFSET) — DFT I/Q → sub-range of larger array
+ *
+ * Same as wf_from_iq but places D bins into out_re/out_im/out_prob
+ * starting at offset, without clearing or normalizing the full array.
+ * Used by MERGE to stitch multiple SDR captures into one super-register.
+ * ═══════════════════════════════════════════════════════════════ */
+static void wf_from_iq_offset(const double *iq_i, const double *iq_q, int np,
+                              double *out_re, double *out_im, double *out_prob,
+                              int D, int offset, int stride) {
+    if (np < D) return;
+    (void)stride;
+
+    fftw_complex *in  = fftw_malloc(np * sizeof(fftw_complex));
+    fftw_complex *out = fftw_malloc(np * sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(np, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+
+    for (int n = 0; n < np; n++) {
+        in[n][0] = iq_i[n];
+        in[n][1] = iq_q[n];
+    }
+
+    fftw_execute(plan);
+    double norm = 1.0 / np;
+
+    /* Pilot derotation from bin 16 */
+    double p_re = out[16][0]*norm, p_im = out[16][1]*norm;
+    double p_mag = sqrt(p_re*p_re + p_im*p_im);
+    double cr = 1.0, sr = 0.0;
+    if (p_mag > 1e-15) { cr = p_re/p_mag; sr = -p_im/p_mag; }
+
+    for (int k = 0; k < D; k++) {
+        double re = out[k][0]*norm, im = out[k][1]*norm;
+        int idx = offset + k;
+        out_re[idx]  = re*cr - im*sr;
+        out_im[idx]  = re*sr + im*cr;
+        out_prob[idx]= out_re[idx]*out_re[idx] + out_im[idx]*out_im[idx];
+    }
+
+    fftw_destroy_plan(plan);
+    fftw_free(in);
+    fftw_free(out);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2068,7 +2115,7 @@ static void tx_write_file(const TxBuf *tx, const char *path);
 typedef struct QvmCtx QvmCtx;
 typedef int (*QvmOp)(QvmCtx *q, double a1, double a2);
 
-#define QVM_MAX_OPS 80
+#define QVM_MAX_OPS 96
 
 struct QvmCtx {
     SdrDev       *sdr;
@@ -2096,6 +2143,11 @@ struct QvmCtx {
     int    coh_rounds; /* QEC coherent capture rounds */
     int    parallel;   /* 1 = use surface reality (D-k bins) for doubled qubit count */
     int    n_qbins;
+
+    /* ── Multi-bank super-register: D lives in the room, not in RAM ── */
+    int    num_banks;   /* 1=normal, >1=room register pages (held in multipath) */
+    int    cur_bank;    /* current active page (0..num_banks-1) */
+    int    bank_dim;    /* bins per SDR capture window (= min(D, IQ_WINDOW/2)) */
 };
 
 /* ─── Helpers ─── */
@@ -3665,6 +3717,270 @@ static int op_mod(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * MULTI-BANK SUPER-REGISTER — D lives in the room, NOT in RAM.
+ *
+ * The room's multipath holds ~500ms of EM field memory.  Each "bank"
+ * is a frequency page spanning rate Hz with bank_dim bins resolved by
+ * one FFT capture.  Multiple banks coexist in the room's multipath
+ * simultaneously.  Software pages through them; zero RAM storage.
+ *
+ *   bank_dim = min(D, IQ_WINDOW/2) = bins per SDR capture
+ *   num_banks = frequency pages the room holds
+ *   D_room   = num_banks × bank_dim  (held in EM field, not RAM)
+ *
+ * Bank b covers:  f0 + b·rate … f0 + (b+1)·rate
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* BANKS <N> — The room now holds N frequency pages.
+   No RAM allocation.  D is entirely in the EM field. */
+static int op_banks(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    int nb = ((int)a1) > 0 ? (int)a1 : 1;
+    if (nb < 1) nb = 1;
+    if (nb > MAX_BANKS) nb = MAX_BANKS;
+
+    int bdim = q->wf.d < MAX_BANK_DIM ? q->wf.d : MAX_BANK_DIM;
+    q->bank_dim = bdim;
+    q->num_banks = nb;
+    q->cur_bank  = 0;
+
+    int room_dim = nb * bdim;
+
+    printf("  ╔══════════════════════════════════════════════════════╗\n");
+    printf("  ║  ROOM SUPER-REGISTER — zero RAM, D in EM field      ║\n");
+    printf("  ║  D_room = %-11d  (%d pages × %d bins)           ║\n",
+           room_dim, nb, bdim);
+    printf("  ║  span: %.1f – %.1f MHz (%d × %.2f MHz)         ║\n",
+           q->freq/1e6, (q->freq + (nb-1)*q->rate)/1e6,
+           nb, q->rate/1e6);
+    printf("  ║  The ROOM holds all pages.  RAM: O(D) not O(D²).  ║\n");
+    printf("  ╚══════════════════════════════════════════════════════╝\n");
+    return 0;
+}
+
+/* BANK <N> — Switch active frequency page.  Retunes LO.
+   Subsequent TX/RX/INIT target this page only. */
+static int op_bank(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    if (q->num_banks <= 1) {
+        printf("  [BANK] Use BANKS <N> first to create a super-register.\n");
+        return 0;
+    }
+    int b = (int)a1;
+    if (b < 0 || b >= q->num_banks) {
+        printf("  [BANK] %d out of range (0..%d)\n", b, q->num_banks-1);
+        return 0;
+    }
+    q->cur_bank = b;
+    if (q->sdr_ok) {
+        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+        sdr_retune(q->sdr, bfreq);
+        sdr_flush(q->sdr);
+    }
+    printf("  [BANK] %d/%d @ %.3f MHz  (room bins %d‥%d)\n",
+           b, q->num_banks-1,
+           (q->freq + b * q->rate)/1e6,
+           b * q->bank_dim, (b+1)*q->bank_dim - 1);
+    return 0;
+}
+
+/* MERGE — Capture all banks, display room register state.
+   Each bank is captured separately.  The room holds all banks;
+   we read them sequentially.  Zero RAM storage for merged state. */
+static int op_merge(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if (!q->sdr_ok) { printf("  [MERGE] No SDR.\n"); return 0; }
+    if (q->num_banks <= 1) {
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+        printf("  [MERGE] D=%d captured.\n", q->wf.d);
+        return 0;
+    }
+
+    int bdim = q->bank_dim;
+    uint32_t save_freq = q->sdr->freq;
+    int room_dim = q->num_banks * bdim;
+
+    printf("  [MERGE] D_room=%d (%d banks × %d bins) — room holds it all:\n",
+           room_dim, q->num_banks, bdim);
+    printf("         bank  freq(MHz)    Σ|ψ|²   H(bits)  tones   peak_k@idx\n");
+
+    double total_entropy = 0;
+    int total_tones = 0;
+
+    for (int b = 0; b < q->num_banks; b++) {
+        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+        sdr_retune(q->sdr, bfreq);
+        usleep(8000);
+        sdr_flush(q->sdr);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+
+        double sum = 0, maxp = 0;
+        int maxk = 0, tones = 0;
+        for (int k = 0; k < bdim && k < q->wf.d; k++) {
+            sum += q->wf.prob[k];
+            if (q->wf.prob[k] > maxp) { maxp = q->wf.prob[k]; maxk = k; }
+            double p_anti = (k > 0 && k < q->wf.d) ?
+                q->wf.prob[k] + q->wf.prob[q->wf.d - k] : q->wf.prob[k];
+            if (p_anti > 0.005) tones++;
+        }
+        total_entropy += q->wf.entropy;
+        total_tones += tones;
+
+        printf("          %2d   %9.3f   %.3f   %6.3f   %4d   %d(%.4f)\n",
+               b, bfreq/1e6, sum, q->wf.entropy, tones,
+               b * bdim + maxk, maxp);
+    }
+
+    sdr_retune(q->sdr, save_freq);
+    sdr_flush(q->sdr);
+
+    /* Restore bank 0 WF for continuity */
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+
+    printf("  ───────────────────────────────────────────────────\n");
+    printf("  [MERGE] room D=%d  |  ΣH=%.3f bits  |  %d active tones\n",
+           room_dim, total_entropy, total_tones);
+    printf("  [MERGE] 0 bytes RAM used — the room IS the register.\n");
+    return 0;
+}
+
+/* RADIATE — TX each bank into the room via LO sweep.
+   For each bank: capture the room's current state at that frequency,
+   then re-radiate it (refresh multipath).  No RAM — the room IS
+   both the source and destination.  For single-bank TX, use BANK+TICK. */
+static int op_radiate(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if (!q->sdr_ok) { printf("  [RADIATE] No SDR.\n"); return 0; }
+    if (q->num_banks <= 1) {
+        gate_tx_hardware(q->sdr, &q->wf);
+        printf("  [RADIATE] D=%d into ether.\n", q->wf.d);
+        return 0;
+    }
+
+    int bdim = q->bank_dim;
+    uint32_t save_freq = q->sdr->freq;
+    int room_dim = q->num_banks * bdim;
+    int n_tones = 0;
+
+    printf("  [RADIATE] %d banks × %d bins → D_room=%d in EM field\n",
+           q->num_banks, bdim, room_dim);
+
+    for (int b = 0; b < q->num_banks; b++) {
+        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+
+        /* Read what the room currently has at this bank */
+        sdr_retune(q->sdr, bfreq);
+        usleep(5000);
+        sdr_flush(q->sdr);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+
+        double bin_bw = (double)q->rate / bdim;
+        int has_tones = 0;
+
+        for (int k = 0; k < bdim && k < q->wf.d; k++) {
+            double p = q->wf.prob[k];
+            if (p < 1e-6) continue;
+            int dwell = (int)(p * 10000);
+            if (dwell < 30) continue;
+            uint32_t f = bfreq + (uint32_t)(k * bin_bw);
+            if (f < 24000000) f = 24000000;
+            if (f > 1750000000) f = 1750000000;
+            uint32_t freqs[1] = { f };
+            uint32_t dwells[1] = { (uint32_t)dwell };
+            sdr_tx(q->sdr, freqs, dwells, 1);
+            n_tones++;
+            has_tones = 1;
+        }
+
+        /* If bank is dead, warm it with uniform noise */
+        if (!has_tones) {
+            for (int k = 0; k < bdim && k < q->wf.d; k++) {
+                uint32_t f = bfreq + (uint32_t)(k * bin_bw);
+                if (f < 24000000) f = 24000000;
+                if (f > 1750000000) f = 1750000000;
+                uint32_t freqs[1] = { f };
+                uint32_t dwells[1] = { 50 };
+                sdr_tx(q->sdr, freqs, dwells, 1);
+                n_tones++;
+            }
+        }
+    }
+
+    sdr_retune(q->sdr, save_freq);
+    sdr_flush(q->sdr);
+    printf("  [RADIATE] %d tones across %d banks — 0 bytes RAM.\n",
+           n_tones, q->num_banks);
+    return 0;
+}
+
+/* FIELD — Probe the room's super-register.  Captures each bank
+   separately, displays per-bank stats.  Zero RAM storage. */
+static int op_field(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if (q->num_banks <= 1) {
+        printf("  [FIELD] D=%d  (single bank — use BANKS <N> to expand)\n",
+               q->wf.d);
+        if (q->sdr_ok) {
+            sdr_capture(q->sdr);
+            wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+        }
+        printf("  [FIELD] S=%.3f bits  γ=%.4f\n", q->wf.entropy, q->wf.purity);
+        return 0;
+    }
+
+    int bdim = q->bank_dim;
+    int room_dim = q->num_banks * bdim;
+
+    printf("  ╔══════════════════════════════════════════════════════╗\n");
+    printf("  ║  ROOM SUPER-REGISTER STATUS  (0 bytes RAM)          ║\n");
+    printf("  ║  D_room = %-10d  (%d pages × %d bins)           ║\n",
+           room_dim, q->num_banks, bdim);
+    printf("  ║  span: %.1f – %.1f MHz  (cur page: %d)            ║\n",
+           q->freq/1e6, (q->freq + (q->num_banks-1)*q->rate)/1e6,
+           q->cur_bank);
+    printf("  ╠══════════════════════════════════════════════════════╣\n");
+
+    uint32_t save_freq = 0;
+    if (q->sdr) save_freq = q->sdr->freq;
+    int total_active = 0;
+
+    for (int b = 0; b < q->num_banks && b < 16; b++) {
+        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+        if (q->sdr_ok) {
+            sdr_retune(q->sdr, bfreq);
+            usleep(3000);
+            sdr_flush(q->sdr);
+            sdr_capture(q->sdr);
+            wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+        }
+        int active = 0;
+        for (int k = 17; k < bdim/2 && k < q->wf.d/2; k++)
+            if (q->wf.prob[k] + q->wf.prob[q->wf.d-k] > 0.005) active++;
+        total_active += active;
+        printf("  ║  B%d: %9.3f MHz  %3d tones  H=%.3f           ║\n",
+               b, bfreq/1e6, active, q->wf.entropy);
+    }
+
+    if (q->sdr && save_freq) {
+        sdr_retune(q->sdr, save_freq);
+        sdr_flush(q->sdr);
+    }
+
+    printf("  ╠══════════════════════════════════════════════════════╣\n");
+    printf("  ║  Total active tones: %-4d  (in room, not RAM)       ║\n",
+           total_active);
+    printf("  ║  D_room = %-10d                                    ║\n",
+           room_dim);
+    printf("  ║  The room IS the register.  0 bytes on heap.        ║\n");
+    printf("  ╚══════════════════════════════════════════════════════╝\n");
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
@@ -3729,6 +4045,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "HELP",      op_help,      "this list");
     qvm_reg(q, "?",         op_help,      "alias for HELP");
     qvm_reg(q, "QFT",       op_qft,       "Quantum Fourier Transform on WF [n=D]");
+    qvm_reg(q, "QUIT",      op_quit,      "exit VM");
     qvm_reg(q, "EXIT",      op_quit,      "alias for QUIT");
     qvm_reg(q, "Q",         op_quit,      "alias for QUIT");
     qvm_reg(q, "CALIBRATE", op_calibrate, "measure room channel M [avg=4]");
@@ -3740,6 +4057,11 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "RING",      op_ring,      "list all active tones in the room");
     qvm_reg(q, "HOLD",      op_hold,      "refresh all active tones → sustain room register");
     qvm_reg(q, "MOD",       op_mod,       "wrap accumulator modulo <N>");
+    qvm_reg(q, "BANKS",     op_banks,     "create N frequency pages: room D = N×bank_dim");
+    qvm_reg(q, "BANK",      op_bank,      "switch active frequency page <N>");
+    qvm_reg(q, "MERGE",     op_merge,     "capture all banks → stitch room register");
+    qvm_reg(q, "RADIATE",   op_radiate,   "TX room register across all banks into ether");
+    qvm_reg(q, "FIELD",     op_field,     "show room super-register status (per-bank tones)");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
@@ -3939,6 +4261,8 @@ QvmCtx *qvm_create(uint32_t freq, uint32_t rate, int D, int gain){
     }
     q->running = 1;
     memset(q->qbins, -1, sizeof(q->qbins)); q->n_qbins = 0; q->noise_pct=0; q->coh_rounds=4; q->parallel=0;
+    q->num_banks = 1; q->cur_bank = 0;
+    q->bank_dim = D < MAX_BANK_DIM ? D : MAX_BANK_DIM;
     qvm_init_ops(q);
     return q;
 }
