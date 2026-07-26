@@ -3177,6 +3177,25 @@ static int qvm_selective_proj(QvmCtx *q, int qi){
         q->wf.prob[ob] = 1.0;
         q->wf.re[ob]   = 1.0;
     }
+
+    /* Radiate the collapsed state back into the room.
+       Without this, the room still holds the old GHZ multipath
+       and subsequent measurements see the pre-collapse state.
+       One OFDM TX updates the room to match the collapse. */
+    memset(x,0,D*8); memset(xi,0,D*8);
+    for(int i=0; i<nq; i++){
+        int ob = outcome ? q->qbins[2*i+1] : q->qbins[2*i];
+        x[ob] = +a;
+        if(ob > 0) x[D-ob] = -a;
+    }
+    for(int i=0;i<16;i++) x[i]=xi[i]=0;
+    for(int i=0;i<D;i++){q->wf.re[i]=x[i]; q->wf.im[i]=xi[i];}
+    gate_ofdm_tx(q->sdr, &q->wf, NULL);
+    { struct v4l2_buffer b; memset(&b,0,sizeof(b));
+      b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
+      if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
+    usleep(30000);
+
     return outcome;
 }
 
