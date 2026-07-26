@@ -52,6 +52,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <fftw3.h>
+#include <gmp.h>
 
 #include "qvm_api.h"
 
@@ -64,7 +65,7 @@
 #define DEFAULT_D    6
 #define DEFAULT_FREQ 100000000
 #define DEFAULT_RATE 2048000
-#define TX_RING_SIZE 16384
+#define TX_RING_SIZE 131072
 
 /* ═══════════════════════════════════════════════════════════════
  * GLOBAL STATE
@@ -153,7 +154,15 @@ static int sdr_tx(SdrDev *s, const uint32_t *freqs,
                    const uint32_t *dwells, int n) {
     if (n < 1 || n > 512) return -1;
     int slots = 1 + 2 * n;
-    if (((s->tx_wr + slots) % TX_RING_SIZE) == s->tx_rd) return -1;
+    int avail, waited = 0;
+    do {
+        if (s->tx_rd > s->tx_wr)
+            avail = s->tx_rd - s->tx_wr - 1;
+        else
+            avail = TX_RING_SIZE - s->tx_wr + s->tx_rd - 1;
+        if (avail < slots) { usleep(500); waited++; }
+        if (waited > 200) return -1; /* timeout: worker dead */
+    } while (avail < slots);
     s->tx_ring[s->tx_wr] = n;
     for (int i = 0; i < n; i++) {
         s->tx_ring[s->tx_wr + 1 + 2*i] = freqs[i];
@@ -169,7 +178,7 @@ static int sdr_tx_wavefunction(SdrDev *s, const double *prob,
     int count = 0;
     for (int k = 0; k < d; k++) {
         int dwell = (int)(prob[k] * base_dwell_us);
-        if (dwell < 30) continue;
+        if (dwell < 5) dwell = 5;
         uint32_t f = base_freq + (uint32_t)(k * bin_bw);
         if (f < 24000000) f = 24000000;
         if (f > 1750000000) f = 1750000000;
@@ -317,6 +326,8 @@ static int sdr_open(SdrDev *s, uint32_t freq, uint32_t rate, int gain) {
     if (ioctl(s->fd, VIDIOC_STREAMON, &type) < 0) goto fail;
 
     for (int a = 0; a < 8; a++) {
+        struct pollfd pfd = { .fd = s->fd, .events = POLLIN };
+        if (poll(&pfd, 1, 2000) <= 0) break;
         struct v4l2_buffer wb;
         memset(&wb, 0, sizeof(wb));
         wb.type = V4L2_BUF_TYPE_SDR_CAPTURE;
@@ -2148,6 +2159,8 @@ struct QvmCtx {
     int    num_banks;   /* 1=normal, >1=room register pages (held in multipath) */
     int    cur_bank;    /* current active page (0..num_banks-1) */
     int    bank_dim;    /* bins per SDR capture window (= min(D, IQ_WINDOW/2)) */
+
+    char   last_cmd[512]; /* raw command text for 64-bit arg parsing */
 };
 
 /* ─── Helpers ─── */
@@ -3967,7 +3980,7 @@ static int op_radiate(QvmCtx *q, double a1, double a2){
             double p = q->wf.prob[k];
             if (p < 1e-6) continue;
             int dwell = (int)(p * 10000);
-            if (dwell < 30) continue;
+        if (dwell < 1) continue;
             uint32_t f = bfreq + (uint32_t)(k * bin_bw);
             if (f < 24000000) f = 24000000;
             if (f > 1750000000) f = 1750000000;
@@ -4062,6 +4075,283 @@ static int op_field(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * SHOR — Period-finding via room.  Evaluates f(x)=a^x mod N
+ * for ALL x ∈ [0, D_room).  Two-pass: compute global maxval,
+ * then encode with consistent normalization.  Captures complex
+ * I/Q, runs QFT via FFTW3 on the reassembled sequence, uses
+ * continued fractions to extract period r from peak spacings.
+ * GMP for arbitrary-precision N.
+ *
+ *   SHOR <N> [a]   — factor N, optionally specify base a
+ * ═══════════════════════════════════════════════════════════════ */
+static int op_shor(QvmCtx *q, double a1, double a2){
+    mpz_t gN, ga, gr, ghalf, gtmp, ggcd;
+    mpz_inits(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
+
+    /* Parse N from raw command text (arbitrary precision) */
+    {
+        char *s = q->last_cmd, numbuf[4096] = {0};
+        while (*s && *s != ' ') s++;
+        while (*s == ' ') s++;
+        int i = 0;
+        while (s[i] && s[i] != ' ' && s[i] != '\n' && i < 4095)
+            { numbuf[i] = s[i]; i++; }
+        numbuf[i] = 0;
+        if (mpz_set_str(gN, numbuf, 0) != 0)
+            mpz_set_ui(gN, (unsigned long)a1);
+    }
+
+    unsigned long force_a = (unsigned long)a2;
+    if (force_a >= 2) mpz_set_ui(ga, force_a);
+    else mpz_set_ui(ga, 0);
+
+    if (mpz_cmp_ui(gN, 4) < 0) {
+        printf("  [SHOR] N must be >= 4\n"); goto done;
+    }
+
+    int D = q->wf.d, bdim = q->bank_dim;
+    int use_banks = q->num_banks;
+    if (use_banks < 1) use_banks = 1;
+    if (use_banks > MAX_BANKS) use_banks = MAX_BANKS;
+    int D_room = use_banks * bdim;
+
+    gmp_printf("  ╔══════════════════════════════════╗\n"
+               "  ║  SHOR: N=%Zd  D_room=%d  banks=%d ║\n"
+               "  ╚══════════════════════════════════╝\n",
+               gN, D_room, use_banks);
+
+    if (!q->sdr_ok) { printf("  [SHOR] No SDR\n"); goto done; }
+
+    srand(time(NULL));
+    if (mpz_cmp_ui(ga, 0) == 0) mpz_set_ui(ga, 2);
+    uint32_t save_freq = q->sdr->freq;
+
+    /* Quick GCD check */
+    mpz_gcd(ggcd, ga, gN);
+    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+        mpz_divexact(gtmp, gN, ggcd);
+        gmp_printf("  [SHOR] a=%Zd gcd=%Zd → %Zd = %Zd × %Zd\n",
+                   ga, ggcd, gN, ggcd, gtmp);
+        goto done;
+    }
+
+    gmp_printf("  [SHOR] a=%Zd  encoding %d bins...\n", ga, D_room);
+    fflush(stdout);
+
+    if (!q->wf.prob || !q->sdr || bdim <= 0) {
+        fprintf(stderr, "  [SHOR] bad state\n"); goto done;
+    }
+
+    /* ── Pass 1: compute all seq values, find global maxval ── */
+    double *all_seq = malloc(D_room * sizeof(double));
+    if (!all_seq) { printf("  [SHOR] OOM\n"); goto done; }
+
+    {
+        mpz_t val; mpz_init_set_ui(val, 1);
+        double global_max = 0;
+        for (int b = 0; b < use_banks; b++) {
+            int bank_start = b * bdim;
+            if (bank_start > 0)
+                mpz_powm_ui(val, ga, (unsigned long)bank_start, gN);
+            for (int k = 0; k < bdim; k++) {
+                double amp = mpz_get_d(val);
+                int idx = bank_start + k;
+                all_seq[idx] = amp;
+                if (amp > global_max) global_max = amp;
+                mpz_mul(val, val, ga);
+                mpz_mod(val, val, gN);
+            }
+        }
+        mpz_clear(val);
+
+        if (global_max < 1.0) global_max = 1.0;
+
+        /* ── Pass 2: TX each bank with consistent normalization ── */
+        for (int b = 0; b < use_banks; b++) {
+            int bank_start = b * bdim;
+            uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+            if (b % 10 == 0)
+                fprintf(stderr, "  [SHOR]  TX %3d/%d (%d%%)\r", b, use_banks,
+                        100*b/use_banks);
+            sdr_retune(q->sdr, bfreq);
+            usleep(3000);
+            sdr_flush(q->sdr);
+
+            for (int k = 0; k < bdim; k++) {
+                double amp = all_seq[bank_start + k] / global_max;
+                q->wf.re[k] = amp;
+                q->wf.im[k] = 0;
+                q->wf.prob[k] = amp;
+            }
+            /* Zero global DC bin once (not per-bank — that creates
+               an artificial bdim-periodic spike) */
+            if (b == 0) q->wf.re[0] = q->wf.im[0] = 0;
+
+            gate_ofdm_tx(q->sdr, &q->wf, NULL);
+            { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
+              vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
+              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
+                  ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
+        }
+        fprintf(stderr, "  [SHOR]  TX done\n");
+    }
+
+    free(all_seq);
+    sdr_retune(q->sdr, save_freq);
+    usleep(50000);
+
+    /* ── Capture: get complex I/Q, run QFT, find period via continued fractions ── */
+    {
+        int Ns = IQ_WINDOW / 2;
+        double *seq_re = calloc(D_room, sizeof(double));
+        double *seq_im = calloc(D_room, sizeof(double));
+        if (!seq_re || !seq_im) goto done;
+
+        for (int b = 0; b < use_banks; b++) {
+            uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+            sdr_retune(q->sdr, bfreq);
+            usleep(8000); sdr_flush(q->sdr);
+
+            /* Coherent capture: average complex I/Q, not just power */
+            double *avg_I = calloc(q->wf.d, sizeof(double));
+            double *avg_Q = calloc(q->wf.d, sizeof(double));
+            int n_cap = 16;
+            for (int cap = 0; cap < n_cap; cap++) {
+                sdr_capture(q->sdr);
+                int np = q->sdr->iq_n; if (np < Ns) np = Ns;
+                fftw_complex *fin  = fftw_malloc(np * sizeof(fftw_complex));
+                fftw_complex *fout = fftw_malloc(np * sizeof(fftw_complex));
+                fftw_plan plan = fftw_plan_dft_1d(np, fin, fout,
+                                                  FFTW_FORWARD, FFTW_ESTIMATE);
+                for (int n = 0; n < np; n++) {
+                    fin[n][0] = q->sdr->iq_i[n];
+                    fin[n][1] = q->sdr->iq_q[n];
+                }
+                fftw_execute(plan);
+                double norm = 1.0 / np;
+                double p_re = fout[16][0]*norm, p_im = fout[16][1]*norm;
+                double pm = sqrt(p_re*p_re + p_im*p_im);
+                double cr = 1.0, sr = 0.0;
+                if (pm > 1e-15) { cr = p_re/pm; sr = -p_im/pm; }
+                for (int k = 0; k < q->wf.d && k < np; k++) {
+                    double re = fout[k][0]*norm, im = fout[k][1]*norm;
+                    avg_I[k] += re*cr - im*sr;
+                    avg_Q[k] += re*sr + im*cr;
+                }
+                fftw_destroy_plan(plan);
+                fftw_free(fin); fftw_free(fout);
+            }
+            for (int k = 0; k < q->wf.d; k++) {
+                avg_I[k] /= n_cap;
+                avg_Q[k] /= n_cap;
+            }
+            for (int k = 0; k < bdim; k++) {
+                int idx = b * bdim + k;
+                seq_re[idx] = avg_I[k];
+                seq_im[idx] = avg_Q[k];
+            }
+            free(avg_I); free(avg_Q);
+        }
+
+        sdr_retune(q->sdr, save_freq); sdr_flush(q->sdr);
+
+        /* ── QFT: FFTW3 FFT on the full reassembled sequence ── */
+        int Q = D_room;
+        fftw_complex *qin  = fftw_malloc(Q * sizeof(fftw_complex));
+        fftw_complex *qout = fftw_malloc(Q * sizeof(fftw_complex));
+        fftw_plan qft = fftw_plan_dft_1d(Q, qin, qout,
+                                         FFTW_FORWARD, FFTW_ESTIMATE);
+        for (int i = 0; i < Q; i++) {
+            qin[i][0] = seq_re[i];
+            qin[i][1] = seq_im[i];
+        }
+        fftw_execute(qft);
+
+        /* Find top peaks in QFT magnitude */
+        double *qmag = calloc(Q, sizeof(double));
+        for (int i = 0; i < Q; i++)
+            qmag[i] = qout[i][0]*qout[i][0] + qout[i][1]*qout[i][1];
+        qmag[0] = 0;
+
+        /* Find the strongest peak bin k */
+        double best_pwr = 0;
+        int best_k = 0;
+        for (int i = 2; i < Q/2; i++) {
+            if (qmag[i] > best_pwr) { best_pwr = qmag[i]; best_k = i; }
+        }
+
+        gmp_printf("  [SHOR] QFT peak at bin %d/%d (pwr=%.6f)\n", best_k, Q, best_pwr);
+
+        /* ── Continued fraction expansion: extract r from k/Q ──
+           Convergents of k/Q give d/r.  Denominator r < N. */
+        if (best_k > 1 && best_k < Q) {
+            unsigned long N_ui = mpz_get_ui(gN);
+            long a = best_k, b = Q;
+            long cf[64]; int ncf = 0;
+            while (b && ncf < 64) { cf[ncf++] = a / b; long t = a % b; a = b; b = t; }
+
+            long p_prev2 = 1, q_prev2 = 0, p_prev1 = cf[0], q_prev1 = 1;
+            int found = 0;
+            for (int i = 1; i < ncf; i++) {
+                long p = cf[i] * p_prev1 + p_prev2;
+                long q = cf[i] * q_prev1 + q_prev2;
+                if (q > 1 && q < (long)N_ui) {
+                    mpz_set_ui(gr, (unsigned long)q);
+                    gmp_printf("  [SHOR] CF convergent %d/%d: d=%ld r=%ld\n",
+                               i, ncf, p, q);
+                    found = 1;
+                }
+                p_prev2 = p_prev1; q_prev2 = q_prev1;
+                p_prev1 = p; q_prev1 = q;
+            }
+            if (!found) mpz_set_ui(gr, (unsigned long)(Q / best_k));
+            gmp_printf("  [SHOR] period candidate r=%Zd\n", gr);
+        } else {
+            mpz_set_ui(gr, (unsigned long)(Q / best_k));
+        }
+
+        free(qmag);
+        free(seq_re); free(seq_im);
+        fftw_destroy_plan(qft);
+        fftw_free(qin); fftw_free(qout);
+
+        if (mpz_cmp_ui(gr, 2) < 0) {
+            printf("  [SHOR] r too small\n"); goto done;
+        }
+        if (mpz_odd_p(gr)) {
+            printf("  [SHOR] r is odd — period invalid, try different base\n");
+            goto done;
+        }
+
+        mpz_tdiv_q_ui(ghalf, gr, 2);
+        mpz_powm(ghalf, ga, ghalf, gN);
+
+        mpz_add_ui(gtmp, ghalf, 1);
+        mpz_gcd(ggcd, gtmp, gN);
+        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+            mpz_divexact(gtmp, gN, ggcd);
+            gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+            gmp_printf("         a=%Zd r=%Zd a^(r/2)=%Zd\n", ga, gr, ghalf);
+            goto done;
+        }
+        mpz_sub_ui(gtmp, ghalf, 1);
+        if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
+        mpz_gcd(ggcd, gtmp, gN);
+        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+            mpz_divexact(gtmp, gN, ggcd);
+            gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+            gmp_printf("         a=%Zd r=%Zd a^(r/2)=%Zd\n", ga, gr, ghalf);
+            goto done;
+        }
+        printf("  [SHOR] gcd(a^(r/2)±1,N) trivial\n");
+    }
+
+done:
+    mpz_clears(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
@@ -4143,6 +4433,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "MERGE",     op_merge,     "capture all banks → stitch room register");
     qvm_reg(q, "RADIATE",   op_radiate,   "TX room register across all banks into ether");
     qvm_reg(q, "FIELD",     op_field,     "show room super-register status (per-bank tones)");
+    qvm_reg(q, "SHOR",      op_shor,      "Shor's: period-finding via room intermodulation");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
@@ -4302,6 +4593,8 @@ void qvm_antisym_encode(QvmCtx *q, const int *bins, const double *amps,
 }
 
 int qvm_eval(QvmCtx *q, const char *cmd){
+    strncpy(q->last_cmd, cmd, 511);
+    q->last_cmd[511] = 0;
     char op[32]={0}; double a1=0,a2=0;
     sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
     if(!op[0]) return 0;
@@ -5728,6 +6021,8 @@ static int run_sat_solver(uint32_t freq, uint32_t rate, int gain, int n_vars) {
  * ═══════════════════════════════════════════════════════════════ */
 #ifndef NO_MAIN
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     int    D    = DEFAULT_D;
     int    freq = DEFAULT_FREQ;
     int    rate = DEFAULT_RATE;
