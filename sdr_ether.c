@@ -4125,7 +4125,15 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
     srand(time(NULL));
     if (mpz_cmp_ui(ga, 0) == 0) mpz_set_ui(ga, 2);
+    int max_attempts = (mpz_cmp_ui(ga, 2) == 0) ? 8 : 1;
     uint32_t save_freq = q->sdr->freq;
+
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        if (attempt > 0) {
+            mpz_add_ui(ga, ga, 1);
+            mpz_mod(ga, ga, gN);
+            if (mpz_cmp_ui(ga, 2) < 0) mpz_set_ui(ga, 2);
+        }
 
     /* Quick GCD check */
     mpz_gcd(ggcd, ga, gN);
@@ -4167,9 +4175,9 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
         if (global_max < 1.0) global_max = 1.0;
 
-        /* ── Pass 2: TX each bank via LO sweep (PLL leakage — physically radiates).
-           After TX, room multipath holds all tones for ~500ms.
-           Wait, then capture — mixer IM2 gives autocorrelation directly. ── */
+        /* ── Pass 2: OFDM TX via gate_ofdm_tx — all bins simultaneously.
+           The room's mixer + multipath IS the QFT.  Capture power
+           spectrum directly — max bin = period. ── */
         for (int b = 0; b < use_banks; b++) {
             int bank_start = b * bdim;
             uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
@@ -4178,17 +4186,19 @@ static int op_shor(QvmCtx *q, double a1, double a2){
                         100*b/use_banks);
             sdr_retune(q->sdr, bfreq);
             usleep(3000);
-            sdr_flush(q->sdr);
 
-            for (int k = 0; k < bdim; k++)
-                q->wf.prob[k] = (global_max > 0)
-                    ? all_seq[bank_start + k] / global_max : 0;
-            sdr_tx_wavefunction(q->sdr, q->wf.prob, bdim, bfreq,
-                                (double)q->rate / bdim, 100);
-            /* Let TX worker drain ring before next bank */
-            usleep(500000);
+            for (int k = 0; k < bdim; k++) {
+                double amp = all_seq[bank_start + k] / global_max;
+                q->wf.re[k] = amp;
+                q->wf.im[k] = 0;
+            }
+            gate_ofdm_tx(q->sdr, &q->wf, NULL);
+            { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
+              vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
+              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
+                  ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
         }
-        fprintf(stderr, "  [SHOR]  TX done, waiting for multipath...\n");
+        fprintf(stderr, "  [SHOR]  TX done, capturing...\n");
     }
 
     free(all_seq);
@@ -4275,14 +4285,14 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         gmp_printf("  [SHOR] QFT done. Top peaks:\n");
 
         /* ── Find top peaks, run CFE on each ── */
-        /* Find the top 8 peak bins (skip DC and near-DC artifacts) */
-        int top_k[8] = {0};
-        double top_pwr[8] = {0};
-        for (int i = 32; i < Q/2; i++) {  /* skip low bins — DC artifacts */
-            if (qmag[i] > top_pwr[7]) {
-                top_pwr[7] = qmag[i]; top_k[7] = i;
-                /* insertion sort */
-                for (int j = 6; j >= 0; j--) {
+        /* Find the top 20 peak bins (skip low bins — DC artifacts) */
+        int n_peaks = 20;
+        int top_k[20] = {0};
+        double top_pwr[20] = {0};
+        for (int i = 32; i < Q/2; i++) {
+            if (qmag[i] > top_pwr[19]) {
+                top_pwr[19] = qmag[i]; top_k[19] = i;
+                for (int j = 18; j >= 0; j--) {
                     if (top_pwr[j] < top_pwr[j+1]) {
                         double tp = top_pwr[j]; top_pwr[j] = top_pwr[j+1]; top_pwr[j+1] = tp;
                         int tk = top_k[j]; top_k[j] = top_k[j+1]; top_k[j+1] = tk;
@@ -4292,7 +4302,7 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         }
 
         int factored = 0;
-        for (int peak = 0; peak < 8 && !factored; peak++) {
+        for (int peak = 0; peak < n_peaks && !factored; peak++) {
             if (top_k[peak] <= 1) continue;
             int best_k = top_k[peak];
             gmp_printf("  [SHOR]  peak %d: bin=%d pwr=%.6f\n", peak+1, best_k, top_pwr[peak]);
@@ -4356,6 +4366,7 @@ skip_rest:
         fftw_destroy_plan(qft);
         fftw_free(qin); fftw_free(qout);
     }
+    }  /* end attempt loop */
 
 done:
     mpz_clears(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
