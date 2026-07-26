@@ -59,8 +59,8 @@
 #define IQ_WINDOW    65536
 #define MAX_DIM      65536
 #define MAX_BANK_DIM 32768
-#define MAX_BANKS    128
-#define ROOM_DIM_MAX 4194304
+#define MAX_BANKS    1024
+#define ROOM_DIM_MAX 33554432
 #define DEFAULT_D    6
 #define DEFAULT_FREQ 100000000
 #define DEFAULT_RATE 2048000
@@ -2303,12 +2303,19 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
     if(!q->sdr_ok)return 0;
     int n=q->n_qbins;
     if(n<2){printf("  [ANTISYM] need >=2 bins (>=2 qudits)\n");return 0;}
-    int nq=n/2, D=q->wf.d, n_pass=8;
-    double x[D],xi[D],y[D],amp=1.0/sqrt(2.0);
-    for(int pass=0;pass<n_pass;pass++){
-        memset(x,0,D*sizeof(double));memset(xi,0,D*sizeof(double));
+    int nq=n/2, D=q->wf.d;
+
+    /* Adaptive parameters: scale with qubit count for convergence */
+    int n_pass = nq < 8 ? 8 : (nq < 64 ? 16 : 32);
+    double amp = nq < 32 ? 1.0/sqrt(2.0) : 3.0;
+
+    double x[D], xi[D], y[D];
+
+    for(int pass=0; pass<n_pass; pass++){
+        memset(x,0,D*sizeof(double));
+        memset(xi,0,D*sizeof(double));
+
         if(pass==0){
-            /* Encode all configured bins. Read from wf state if available. */
             double init=0;
             for(int i=0;i<n;i++)init+=q->wf.prob[q->qbins[i]];
             if(init>1e-10){
@@ -2318,34 +2325,70 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
                 }
             }else{
                 for(int i=0;i<n;i+=2){
-                    x[q->qbins[i]]+=amp;x[D-q->qbins[i]]-=amp;
-                    x[q->qbins[i+1]]+=amp;x[D-q->qbins[i+1]]-=amp;
+                    x[q->qbins[i]]+=amp; x[D-q->qbins[i]]-=amp;
+                    x[q->qbins[i+1]]+=amp; x[D-q->qbins[i+1]]-=amp;
                 }
             }
         }else{
+            /* Adaptive threshold: only amplify bins that are above the noise floor.
+               Compute mean power across all qbins to establish noise baseline. */
+            double mean=0;
+            for(int i=0;i<n;i++)
+                mean += y[q->qbins[i]] + y[D-q->qbins[i]];
+            mean /= n;
+            double threshold = mean * 2.5;  /* 2.5× mean = signal, not noise */
+
+            /* Adaptive gain: increase amplification each pass to converge faster */
+            double gain = 1.0 + pass * 0.3;
+
             double tot=0;
-            for(int i=0;i<n;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+            for(int i=0;i<n;i++)
+                tot += y[q->qbins[i]] + y[D-q->qbins[i]];
+
             if(tot>1e-15){
+                for(int i=0;i<n;i++){
+                    double p = y[q->qbins[i]] + y[D-q->qbins[i]];
+                    /* Selective: only re-encode bins with significant signal */
+                    if(p < threshold && pass > 4) continue;
+                    p /= tot;
+                    double a = sqrt(p) * gain;
+                    if(a > 3.0) a = 3.0;  /* clip to prevent runaway */
+                    x[q->qbins[i]] = +a;
+                    x[D-q->qbins[i]] = -a;
+                }
+            }
+            /* If selectivity killed everything, fall back to uniform re-encode */
+            int alive=0;
+            for(int i=0;i<n;i++)
+                if(fabs(x[q->qbins[i]]) > 1e-10) alive++;
+            if(alive == 0 && tot>1e-15){
                 for(int i=0;i<n;i++){
                     double p=(y[q->qbins[i]]+y[D-q->qbins[i]])/tot;
                     if(p>1e-10){x[q->qbins[i]]=+sqrt(p);x[D-q->qbins[i]]=-sqrt(p);}
                 }
             }
         }
-        for(int i=0;i<16;i++)x[i]=xi[i]=0.0;
+
+        for(int i=0;i<16;i++) x[i]=xi[i]=0.0;
         qvm_ofdm_compute(q,x,xi,y,D);
     }
-    double tot=0;for(int i=0;i<n;i++)tot+=y[q->qbins[i]]+y[D-q->qbins[i]];
+
+    double tot=0;
+    for(int i=0;i<n;i++) tot += y[q->qbins[i]] + y[D-q->qbins[i]];
     double s0=0,s1=0;
     if(tot>1e-15){
-        for(int i=0;i<n;i+=2){s0+=y[q->qbins[i]]+y[D-q->qbins[i]];s1+=y[q->qbins[i+1]]+y[D-q->qbins[i+1]];}
+        for(int i=0;i<n;i+=2){
+            s0 += y[q->qbins[i]] + y[D-q->qbins[i]];
+            s1 += y[q->qbins[i+1]] + y[D-q->qbins[i+1]];
+        }
         double s=s0+s1;
         for(int i=0;i<n;i++)
-            q->wf.prob[q->qbins[i]]=(y[q->qbins[i]]+y[D-q->qbins[i]])/s;
-        for(int i=0;i<n;i++)q->wf.re[q->qbins[i]]=sqrt(q->wf.prob[q->qbins[i]]);
+            q->wf.prob[q->qbins[i]] = (y[q->qbins[i]] + y[D-q->qbins[i]]) / s;
+        for(int i=0;i<n;i++)
+            q->wf.re[q->qbins[i]] = sqrt(q->wf.prob[q->qbins[i]]);
     }
-    printf("  [ANTISYM] %d-qudit GHZ -> %d passes: |0..0>=%.3f |1..1>=%.3f\n",
-        nq,n_pass,tot>1e-15?s0/(s0+s1):0,tot>1e-15?s1/(s0+s1):0);
+    printf("  [ANTISYM] %d-qudit GHZ → %d passes: |0..0>=%.3f |1..1>=%.3f\n",
+        nq, n_pass, tot>1e-15?s0/(s0+s1):0, tot>1e-15?s1/(s0+s1):0);
     return 0;
 }
 
