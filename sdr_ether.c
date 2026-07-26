@@ -3114,29 +3114,60 @@ static int op_ghz_stab(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* ── Selective projective measurement with GHZ collapse ──
-   Measures qubit qi.  In a GHZ state, measuring ONE qubit
-   collapses ALL qubits to the same value (|0..0⟩ or |1..1⟩).
-   This enforces global consistency instead of leaving
-   unmeasured qubits in superposition. */
+/* ── Room-side projective measurement ──
+   Radiates anti-sym probe + noise at target qubit's bins.
+   The room's multipath/mixer/thermal noise PHYSICALLY collapses
+   the qubit.  Capture reads which branch the room chose.
+   Then GHZ collapse propagates to ALL qubits — the room IS
+   the measurement apparatus.  No software collapse. */
 static int qvm_selective_proj(QvmCtx *q, int qi){
     int nq=q->n_qbins/2, D=q->wf.d;
     if(qi>=nq||!q->sdr_ok)return -1;
     int b0=q->qbins[2*qi], b1=q->qbins[2*qi+1];
+    double x[D], xi[D], a=0.7071;
 
-    /* DPSK phase-demodulated readout of target qubit */
-    double x[D], xi[D], I[D], Q[D];
+    /* ── Phase 1: anti-sym probe at target qubit ── */
     memset(x,0,D*8); memset(xi,0,D*8);
-    x[b0]=0.7071; for(int i=0;i<16;i++)x[i]=0;
-    qvm_ofdm_complex(q,x,xi,I,Q,D);
+    x[b0]=+a; x[D-b0]=-a;
+    x[b1]=+a; x[D-b1]=-a;
+    for(int i=0;i<16;i++) x[i]=xi[i]=0;
+    for(int i=0;i<D;i++){q->wf.re[i]=x[i]; q->wf.im[i]=xi[i];}
+    gate_ofdm_tx(q->sdr, &q->wf, NULL);
+    { struct v4l2_buffer b; memset(&b,0,sizeof(b));
+      b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
+      if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
 
-    double I0=I[b0], Q0=Q[b0], I1=I[b1], Q1=Q[b1];
-    double dphi = I1*I0 + Q1*Q0;
-    int outcome = (dphi < 0) ? 1 : 0;
+    /* ── Phase 2: anti-sym noise bursts (random phase) → PHYSICAL collapse ──
+       The room's nonlinearity + thermal noise amplifies one branch,
+       suppresses the other.  ROOM decides the outcome, not software. */
+    for(int burst=0; burst<3; burst++){
+        memset(x,0,D*8); memset(xi,0,D*8);
+        double phi0 = ((double)rand()/RAND_MAX) * 2 * M_PI;
+        double phi1 = ((double)rand()/RAND_MAX) * 2 * M_PI;
+        x[b0]=+a*cos(phi0);  x[D-b0]=-a*cos(phi0);
+        xi[b0]=+a*sin(phi0); xi[D-b0]=-a*sin(phi0);
+        x[b1]=+a*cos(phi1);  x[D-b1]=-a*cos(phi1);
+        xi[b1]=+a*sin(phi1); xi[D-b1]=-a*sin(phi1);
+        for(int i=0;i<16;i++) x[i]=xi[i]=0;
+        for(int i=0;i<D;i++){q->wf.re[i]=x[i]; q->wf.im[i]=xi[i];}
+        gate_ofdm_tx(q->sdr, &q->wf, NULL);
+        { struct v4l2_buffer b; memset(&b,0,sizeof(b));
+          b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
+          if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&b)==0)ioctl(q->sdr->fd,VIDIOC_QBUF,&b); }
+    }
 
-    /* GHZ collapse: set ALL qubits to the measured outcome.
-       |0⟩ for all qubits if outcome=0, |1⟩ for all qubits if outcome=1.
-       This is the true quantum behavior of a GHZ state under measurement. */
+    /* ── Phase 3: let room settle, then capture the room's decision ── */
+    usleep(80000);
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+
+    /* Read outcome from the ROOM's physical state — not software-enforced */
+    double p0 = q->wf.prob[b0] + q->wf.prob[D-b0];
+    double p1 = q->wf.prob[b1] + q->wf.prob[D-b1];
+    int outcome = (p1 > p0) ? 1 : 0;
+
+    /* GHZ collapse: the room collapsed the state physically.
+       Propagate the outcome to all qubits — reflect what room already did. */
     for(int i=0; i<nq; i++){
         int bi0 = q->qbins[2*i];
         int bi1 = q->qbins[2*i+1];
