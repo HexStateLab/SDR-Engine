@@ -2160,7 +2160,7 @@ struct QvmCtx {
     int    cur_bank;    /* current active page (0..num_banks-1) */
     int    bank_dim;    /* bins per SDR capture window (= min(D, IQ_WINDOW/2)) */
 
-    char   last_cmd[512]; /* raw command text for 64-bit arg parsing */
+    char   last_cmd[8192]; /* raw command text for big-number parsing */
 };
 
 /* ─── Helpers ─── */
@@ -4091,11 +4091,11 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
     /* Parse N from raw command text (arbitrary precision) */
     {
-        char *s = q->last_cmd, numbuf[4096] = {0};
+        char *s = q->last_cmd, numbuf[8192] = {0};
         while (*s && *s != ' ') s++;
         while (*s == ' ') s++;
         int i = 0;
-        while (s[i] && s[i] != ' ' && s[i] != '\n' && i < 4095)
+        while (s[i] && s[i] != ' ' && s[i] != '\n' && i < 8191)
             { numbuf[i] = s[i]; i++; }
         numbuf[i] = 0;
         if (mpz_set_str(gN, numbuf, 0) != 0)
@@ -4603,8 +4603,8 @@ void qvm_antisym_encode(QvmCtx *q, const int *bins, const double *amps,
 }
 
 int qvm_eval(QvmCtx *q, const char *cmd){
-    strncpy(q->last_cmd, cmd, 511);
-    q->last_cmd[511] = 0;
+    strncpy(q->last_cmd, cmd, 8191);
+    q->last_cmd[8191] = 0;
     char op[32]={0}; double a1=0,a2=0;
     sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
     if(!op[0]) return 0;
@@ -4684,7 +4684,7 @@ int qvm_run(QvmCtx *q, const char *script_path){
     if (!q->interactive) {
         FILE *f = fopen(script_path, "r");
         if (!f) { fprintf(stderr,"[VM] Cannot open %s\n",script_path); return 1; }
-        char lbuf[512];
+        char lbuf[8192];
         q->lines = malloc(131072*sizeof(char*));
         while (fgets(lbuf,sizeof(lbuf),f) && q->nlines<131072) {
             char *nl=strchr(lbuf,'\n');if(nl)*nl=0;
@@ -4696,7 +4696,7 @@ int qvm_run(QvmCtx *q, const char *script_path){
     }
 
     while (q->running) {
-        char line[512]={0};
+        char line[8192]={0};
         if (!q->interactive) {
             if (q->ip >= q->nlines) break;
             strcpy(line, q->lines[q->ip++]);
