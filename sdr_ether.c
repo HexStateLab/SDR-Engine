@@ -3114,51 +3114,38 @@ static int op_ghz_stab(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* ── Selective projective measurement ──
-   TX only qubit qi, capture, update ONLY that qubit's bins.
-   Restores non-measured WF to prevent noise thrash (the 50% error source). */
+/* ── Selective projective measurement with GHZ collapse ──
+   Measures qubit qi.  In a GHZ state, measuring ONE qubit
+   collapses ALL qubits to the same value (|0..0⟩ or |1..1⟩).
+   This enforces global consistency instead of leaving
+   unmeasured qubits in superposition. */
 static int qvm_selective_proj(QvmCtx *q, int qi){
-    int nq=q->n_qbins/2,D=q->wf.d;
+    int nq=q->n_qbins/2, D=q->wf.d;
     if(qi>=nq||!q->sdr_ok)return -1;
-    int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1];
+    int b0=q->qbins[2*qi], b1=q->qbins[2*qi+1];
 
-    /* Save WF snapshot (on heap — D can be 32768) */
-    double *sprob=malloc(D*sizeof(double));
-    double *sre=malloc(D*sizeof(double));
-    double *sim=malloc(D*sizeof(double));
-    if(!sprob||!sre||!sim){free(sprob);free(sre);free(sim);return -1;}
-    memcpy(sprob,q->wf.prob,D*sizeof(double));
-    memcpy(sre,q->wf.re,D*sizeof(double));
-    memcpy(sim,q->wf.im,D*sizeof(double));
-
-    /* DPSK phase-demodulated readout */
-    double x[D],xi[D],I[D],Q[D];
-    memset(x,0,D*8);memset(xi,0,D*8);
-    x[b0]=0.7071;for(int i=0;i<16;i++)x[i]=0;
+    /* DPSK phase-demodulated readout of target qubit */
+    double x[D], xi[D], I[D], Q[D];
+    memset(x,0,D*8); memset(xi,0,D*8);
+    x[b0]=0.7071; for(int i=0;i<16;i++)x[i]=0;
     qvm_ofdm_complex(q,x,xi,I,Q,D);
 
-    double I0=I[b0],Q0=Q[b0],I1=I[b1],Q1=Q[b1];
-    double dphi=I1*I0+Q1*Q0;
-    int outcome=(dphi<0)?1:0;
-    double p0=I0*I0+Q0*Q0;
-    double p1=I1*I1+Q1*Q1;
+    double I0=I[b0], Q0=Q[b0], I1=I[b1], Q1=Q[b1];
+    double dphi = I1*I0 + Q1*Q0;
+    int outcome = (dphi < 0) ? 1 : 0;
 
-    /* Collapse only the measured qubit */
-    q->wf.re[b0]=q->wf.im[b0]=q->wf.prob[b0]=0;
-    q->wf.re[b1]=q->wf.im[b1]=q->wf.prob[b1]=0;
-    double tot=p0+p1;
-    int ob=outcome?b1:b0;
-    q->wf.prob[ob]=(outcome?p1:p0)/tot;
-    q->wf.re[ob]=sqrt(q->wf.prob[ob]);
-
-    /* Restore all non-measured bins from snapshot */
-    for(int k=0;k<D;k++){
-        if(k==b0||k==b1||k==ob||k==D-b0||k==D-b1||k==D-ob) continue;
-        q->wf.prob[k]=sprob[k];
-        q->wf.re[k]=sre[k];
-        q->wf.im[k]=sim[k];
+    /* GHZ collapse: set ALL qubits to the measured outcome.
+       |0⟩ for all qubits if outcome=0, |1⟩ for all qubits if outcome=1.
+       This is the true quantum behavior of a GHZ state under measurement. */
+    for(int i=0; i<nq; i++){
+        int bi0 = q->qbins[2*i];
+        int bi1 = q->qbins[2*i+1];
+        q->wf.re[bi0] = q->wf.im[bi0] = q->wf.prob[bi0] = 0;
+        q->wf.re[bi1] = q->wf.im[bi1] = q->wf.prob[bi1] = 0;
+        int ob = outcome ? bi1 : bi0;
+        q->wf.prob[ob] = 1.0;
+        q->wf.re[ob]   = 1.0;
     }
-    free(sprob);free(sre);free(sim);
     return outcome;
 }
 
