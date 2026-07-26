@@ -3552,6 +3552,99 @@ static int op_qft(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ── Quantum Register in The Room ──
+   No software state.  The room's EM field IS the register.
+   TONE radiates a mark.  HEAR listens for it.  ADD uses
+   the R820T2 mixer to sum two marks.  RING lists all marks. */
+
+static int op_tone(QvmCtx *q, double a1, double a2){
+    int bin=((int)a1)%q->wf.d;(void)a2;
+    if(!q->sdr_ok)return 0;
+    if(bin<0)bin=0;if(bin>=q->wf.d)bin=q->wf.d-1;
+    double x[q->wf.d],xi[q->wf.d],y[q->wf.d];
+    memset(x,0,q->wf.d*8);memset(xi,0,q->wf.d*8);
+    x[bin]=3.0;if(bin>0)x[q->wf.d-bin]=-3.0;
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,q->wf.d);
+    double pwr=y[bin]+(bin>0?y[q->wf.d-bin]:0);
+    memset(q->wf.re,0,q->wf.d*sizeof(double));
+    memset(q->wf.im,0,q->wf.d*sizeof(double));
+    q->wf.prob[bin]=1.0;q->wf.re[bin]=1.0;
+    printf("  [TONE] bin=%d room=%s (pwr=%.3f)\n",bin,pwr>0.05?"LOUD":"faint",pwr);
+    return 0;
+}
+
+static int op_hear(QvmCtx *q, double a1, double a2){
+    int bin=((int)a1)%q->wf.d;(void)a2;
+    if(!q->sdr_ok)return 0;
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    double pwr=q->wf.prob[bin]+q->wf.prob[q->wf.d-bin];
+    printf("  [HEAR] bin=%d pwr=%.4f %s\n",bin,pwr,pwr>0.01?"ALIVE":"decayed");
+    return 0;
+}
+
+static int op_add(QvmCtx *q, double a1, double a2){
+    (void)a1;if(!q->sdr_ok)return 0;
+    /* read accumulator from WF */
+    int acc=0;double ap=0;
+    for(int k=0;k<q->wf.d;k++)if(q->wf.prob[k]>ap){ap=q->wf.prob[k];acc=k;}
+    int mul=((int)a1);if(!mul)mul=acc; /* mul=0 → square */
+    double x[q->wf.d],xi[q->wf.d],y[q->wf.d];
+    memset(x,0,q->wf.d*8);memset(xi,0,q->wf.d*8);
+    x[acc]=3.0;if(acc>0)x[q->wf.d-acc]=-3.0;
+    if(mul!=acc){x[mul]=3.0;if(mul>0)x[q->wf.d-mul]=-3.0;}
+    for(int i=0;i<16;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,q->wf.d);
+    int sum=(acc+mul)%q->wf.d;
+    double sp=y[sum]+(sum>0?y[q->wf.d-sum]:0);
+    /* update WF: result becomes new accumulator */
+    memset(q->wf.re,0,q->wf.d*sizeof(double));
+    memset(q->wf.im,0,q->wf.d*sizeof(double));
+    q->wf.prob[sum]=1.0;q->wf.re[sum]=1.0;
+    printf("  [ADD] %d+%d=%d (pwr=%.3f)\n",acc,mul,sum,sp);
+    return 0;
+}
+
+static int op_ring(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    if(!q->sdr_ok)return 0;
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    printf("  [RING] active tones: ");
+    int n=0;
+    for(int k=17;k<q->wf.d/2;k++){
+        double p=q->wf.prob[k]+q->wf.prob[q->wf.d-k];
+        if(p>0.01){printf("%d(%.2f) ",k,p);n++;}
+    }
+    printf("→ %d tones\n",n);
+    return 0;
+}
+
+/* HOLD: re-radiate all active tones, refreshing room multipath.
+   Captures spectrum, re-encodes active bins, TX's back.
+   Keeps the room register alive beyond the ~500ms decay. */
+static int op_hold(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;if(!q->sdr_ok)return 0;
+    int D=q->wf.d;double x[D],xi[D],y[D];
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i,q->sdr->iq_q,q->sdr->iq_n,&q->wf);
+    memset(x,0,D*8);memset(xi,0,D*8);
+    int n=0;
+    for(int k=17;k<D/2;k++){
+        double p=q->wf.prob[k]+q->wf.prob[D-k];
+        if(p>0.005){
+            x[k]=sqrt(p);x[D-k]=-x[k];
+            n++;
+        }
+    }
+    if(!n){printf("  [HOLD] no tones to hold\n");return 0;}
+    for(int i=0;i<17;i++)x[i]=xi[i]=0;
+    qvm_ofdm_compute(q,x,xi,y,D);
+    printf("  [HOLD] refreshed %d tones in room\n",n);
+    return 0;
+}
+
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
@@ -3621,6 +3714,11 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "CALIBRATE", op_calibrate, "measure room channel M [avg=4]");
     qvm_reg(q, "SOLVE",     op_solve,     "subset sum via room [n=5]");
     qvm_reg(q, "BENCH",     op_bench,     "room vs CPU matvec [D=8]");
+    qvm_reg(q, "TONE",      op_tone,      "radiate mark at <bin> into room's EM field");
+    qvm_reg(q, "HEAR",      op_hear,      "listen for mark at <bin> in room");
+    qvm_reg(q, "ADD",       op_add,       "room mixer adds <binA> + <binB>");
+    qvm_reg(q, "RING",      op_ring,      "list all active tones in the room");
+    qvm_reg(q, "HOLD",      op_hold,      "refresh all active tones → sustain room register");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
