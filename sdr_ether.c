@@ -4125,14 +4125,26 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
     srand(time(NULL));
     if (mpz_cmp_ui(ga, 0) == 0) mpz_set_ui(ga, 2);
-    int max_attempts = (mpz_cmp_ui(ga, 2) == 0) ? 8 : 1;
     uint32_t save_freq = q->sdr->freq;
+    int attempt = 0;
 
-    for (int attempt = 0; attempt < max_attempts; attempt++) {
+    while (1) {
         if (attempt > 0) {
             mpz_add_ui(ga, ga, 1);
             mpz_mod(ga, ga, gN);
             if (mpz_cmp_ui(ga, 2) < 0) mpz_set_ui(ga, 2);
+            /* Skip bases sharing a factor with N */
+            mpz_gcd(ggcd, ga, gN);
+            if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                mpz_divexact(gtmp, gN, ggcd);
+                gmp_printf("  [SHOR] a=%Zd gcd=%Zd → %Zd = %Zd × %Zd\n",
+                           ga, ggcd, gN, ggcd, gtmp);
+                goto done;
+            }
+            while (mpz_cmp_ui(ggcd, 1) != 0 && mpz_cmp(ga, gN) < 0) {
+                mpz_add_ui(ga, ga, 1);
+                mpz_gcd(ggcd, ga, gN);
+            }
         }
 
     /* Quick GCD check */
@@ -4341,7 +4353,7 @@ static int op_shor(QvmCtx *q, double a1, double a2){
                         gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
                                    ga, r_try, peak+1, best_k, deltas[d]);
                         factored = 1;
-                        mpz_clear(r_try); goto skip_rest;
+                        mpz_clear(r_try); goto done;
                     }
                     mpz_sub_ui(gtmp, ghalf, 1);
                     if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
@@ -4352,13 +4364,14 @@ static int op_shor(QvmCtx *q, double a1, double a2){
                         gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
                                    ga, r_try, peak+1, best_k, deltas[d]);
                         factored = 1;
-                        mpz_clear(r_try); goto skip_rest;
+                        mpz_clear(r_try); goto done;
                     }
                     mpz_clear(r_try);
                 }
             }
         }
-        if (!factored) printf("  [SHOR] gcd(a^(r/2)±1,N) trivial\n");
+        if (!factored) gmp_printf("  [SHOR] gcd trivial (attempt %d, a=%Zd)\n",
+                                    ++attempt, ga);
 
 skip_rest:
         free(qmag);
