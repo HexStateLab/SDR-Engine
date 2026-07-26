@@ -3561,6 +3561,11 @@ static int op_tone(QvmCtx *q, double a1, double a2){
     int bin=((int)a1)%q->wf.d;(void)a2;
     if(!q->sdr_ok)return 0;
     if(bin<0)bin=0;if(bin>=q->wf.d)bin=q->wf.d-1;
+    memset(q->wf.re,0,q->wf.d*sizeof(double));
+    memset(q->wf.im,0,q->wf.d*sizeof(double));
+    q->wf.prob[bin]=1.0;q->wf.re[bin]=1.0;
+    if(!q->sdr_ok)return 0;
+    if(!bin){printf("  [TONE] bin=0 (DC, WF only)\n");return 0;}
     double x[q->wf.d],xi[q->wf.d],y[q->wf.d];
     memset(x,0,q->wf.d*8);memset(xi,0,q->wf.d*8);
     x[bin]=3.0;if(bin>0)x[q->wf.d-bin]=-3.0;
@@ -3598,10 +3603,10 @@ static int op_add(QvmCtx *q, double a1, double a2){
     qvm_ofdm_compute(q,x,xi,y,q->wf.d);
     int sum=(acc+mul)%q->wf.d;
     double sp=y[sum]+(sum>0?y[q->wf.d-sum]:0);
-    /* update WF: result becomes new accumulator */
-    memset(q->wf.re,0,q->wf.d*sizeof(double));
-    memset(q->wf.im,0,q->wf.d*sizeof(double));
-    q->wf.prob[sum]=1.0;q->wf.re[sum]=1.0;
+    /* accumulate: don't clear previous bins */
+    q->wf.prob[sum]+=1.0;
+    q->wf.re[sum]=sqrt(q->wf.prob[sum]);
+    q->wf.im[sum]=0;
     printf("  [ADD] %d+%d=%d (pwr=%.3f)\n",acc,mul,sum,sp);
     return 0;
 }
@@ -3642,6 +3647,21 @@ static int op_hold(QvmCtx *q, double a1, double a2){
     for(int i=0;i<17;i++)x[i]=xi[i]=0;
     qvm_ofdm_compute(q,x,xi,y,D);
     printf("  [HOLD] refreshed %d tones in room\n",n);
+    return 0;
+}
+
+/* MOD: log-space modulo. 2^bin → value → mod N → log2 back */
+static int op_mod(QvmCtx *q, double a1, double a2){
+    int N=((int)a1)>1?(int)a1:15;(void)a2;
+    int acc=0;double ap=0;
+    for(int k=0;k<q->wf.d;k++)if(q->wf.prob[k]>ap){ap=q->wf.prob[k];acc=k;}
+    long long val=1LL<<acc;
+    long long wrapped=val%N;
+    int bin=0;while((1LL<<(bin+1))<=wrapped&&bin<60)bin++;
+    memset(q->wf.re,0,q->wf.d*sizeof(double));
+    memset(q->wf.im,0,q->wf.d*sizeof(double));
+    q->wf.prob[bin]=1.0;q->wf.re[bin]=1.0;
+    printf("  [MOD] 2^%d=%lld mod %d=%lld → bin %d\n",acc,val,N,wrapped,bin);
     return 0;
 }
 
@@ -3719,6 +3739,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "ADD",       op_add,       "room mixer adds <binA> + <binB>");
     qvm_reg(q, "RING",      op_ring,      "list all active tones in the room");
     qvm_reg(q, "HOLD",      op_hold,      "refresh all active tones → sustain room register");
+    qvm_reg(q, "MOD",       op_mod,       "wrap accumulator modulo <N>");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
