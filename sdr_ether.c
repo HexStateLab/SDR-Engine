@@ -4167,7 +4167,9 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
         if (global_max < 1.0) global_max = 1.0;
 
-        /* ── Pass 2: TX each bank with consistent normalization ── */
+        /* ── Pass 2: TX each bank via LO sweep (PLL leakage — physically radiates).
+           After TX, room multipath holds all tones for ~500ms.
+           Wait, then capture — mixer IM2 gives autocorrelation directly. ── */
         for (int b = 0; b < use_banks; b++) {
             int bank_start = b * bdim;
             uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
@@ -4178,30 +4180,23 @@ static int op_shor(QvmCtx *q, double a1, double a2){
             usleep(3000);
             sdr_flush(q->sdr);
 
-            for (int k = 0; k < bdim; k++) {
-                double amp = all_seq[bank_start + k] / global_max;
-                q->wf.re[k] = amp;
-                q->wf.im[k] = 0;
-                q->wf.prob[k] = amp;
-            }
-            /* Zero global DC bin once (not per-bank — that creates
-               an artificial bdim-periodic spike) */
-            if (b == 0) q->wf.re[0] = q->wf.im[0] = 0;
-
-            gate_ofdm_tx(q->sdr, &q->wf, NULL);
-            { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
-              vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
-              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
-                  ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
+            for (int k = 0; k < bdim; k++)
+                q->wf.prob[k] = (global_max > 0)
+                    ? all_seq[bank_start + k] / global_max : 0;
+            sdr_tx_wavefunction(q->sdr, q->wf.prob, bdim, bfreq,
+                                (double)q->rate / bdim, 100);
+            /* Let TX worker drain ring before next bank */
+            usleep(500000);
         }
-        fprintf(stderr, "  [SHOR]  TX done\n");
+        fprintf(stderr, "  [SHOR]  TX done, waiting for multipath...\n");
     }
 
     free(all_seq);
     sdr_retune(q->sdr, save_freq);
     usleep(50000);
 
-    /* ── Capture: get complex I/Q, run QFT, find period via continued fractions ── */
+    /* ── Capture: complex I/Q per bank, assemble full sequence,
+       run QFT via FFTW3, continued fractions to extract period ── */
     {
         int Ns = IQ_WINDOW / 2;
         double *seq_re = calloc(D_room, sizeof(double));
@@ -4213,7 +4208,6 @@ static int op_shor(QvmCtx *q, double a1, double a2){
             sdr_retune(q->sdr, bfreq);
             usleep(8000); sdr_flush(q->sdr);
 
-            /* Coherent capture: average complex I/Q, not just power */
             double *avg_I = calloc(q->wf.d, sizeof(double));
             double *avg_Q = calloc(q->wf.d, sizeof(double));
             int n_cap = 16;
@@ -4243,8 +4237,7 @@ static int op_shor(QvmCtx *q, double a1, double a2){
                 fftw_free(fin); fftw_free(fout);
             }
             for (int k = 0; k < q->wf.d; k++) {
-                avg_I[k] /= n_cap;
-                avg_Q[k] /= n_cap;
+                avg_I[k] /= n_cap; avg_Q[k] /= n_cap;
             }
             for (int k = 0; k < bdim; k++) {
                 int idx = b * bdim + k;
@@ -4268,83 +4261,100 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         }
         fftw_execute(qft);
 
-        /* Find top peaks in QFT magnitude */
         double *qmag = calloc(Q, sizeof(double));
         for (int i = 0; i < Q; i++)
             qmag[i] = qout[i][0]*qout[i][0] + qout[i][1]*qout[i][1];
         qmag[0] = 0;
 
-        /* Find the strongest peak bin k */
         double best_pwr = 0;
         int best_k = 0;
-        for (int i = 2; i < Q/2; i++) {
+        for (int i = 2; i < Q; i++) {
             if (qmag[i] > best_pwr) { best_pwr = qmag[i]; best_k = i; }
         }
 
-        gmp_printf("  [SHOR] QFT peak at bin %d/%d (pwr=%.6f)\n", best_k, Q, best_pwr);
+        gmp_printf("  [SHOR] QFT done. Top peaks:\n");
 
-        /* ── Continued fraction expansion: extract r from k/Q ──
-           Convergents of k/Q give d/r.  Denominator r < N. */
-        if (best_k > 1 && best_k < Q) {
-            unsigned long N_ui = mpz_get_ui(gN);
+        /* ── Find top peaks, run CFE on each ── */
+        /* Find the top 8 peak bins (skip DC and near-DC artifacts) */
+        int top_k[8] = {0};
+        double top_pwr[8] = {0};
+        for (int i = 32; i < Q/2; i++) {  /* skip low bins — DC artifacts */
+            if (qmag[i] > top_pwr[7]) {
+                top_pwr[7] = qmag[i]; top_k[7] = i;
+                /* insertion sort */
+                for (int j = 6; j >= 0; j--) {
+                    if (top_pwr[j] < top_pwr[j+1]) {
+                        double tp = top_pwr[j]; top_pwr[j] = top_pwr[j+1]; top_pwr[j+1] = tp;
+                        int tk = top_k[j]; top_k[j] = top_k[j+1]; top_k[j+1] = tk;
+                    } else break;
+                }
+            }
+        }
+
+        int factored = 0;
+        for (int peak = 0; peak < 8 && !factored; peak++) {
+            if (top_k[peak] <= 1) continue;
+            int best_k = top_k[peak];
+            gmp_printf("  [SHOR]  peak %d: bin=%d pwr=%.6f\n", peak+1, best_k, top_pwr[peak]);
+
+            /* CFE on this peak */
             long a = best_k, b = Q;
             long cf[64]; int ncf = 0;
             while (b && ncf < 64) { cf[ncf++] = a / b; long t = a % b; a = b; b = t; }
 
             long p_prev2 = 1, q_prev2 = 0, p_prev1 = cf[0], q_prev1 = 1;
-            int found = 0;
             for (int i = 1; i < ncf; i++) {
                 long p = cf[i] * p_prev1 + p_prev2;
                 long q = cf[i] * q_prev1 + q_prev2;
-                if (q > 1 && q < (long)N_ui) {
-                    mpz_set_ui(gr, (unsigned long)q);
-                    gmp_printf("  [SHOR] CF convergent %d/%d: d=%ld r=%ld\n",
-                               i, ncf, p, q);
-                    found = 1;
-                }
-                p_prev2 = p_prev1; q_prev2 = q_prev1;
-                p_prev1 = p; q_prev1 = q;
-            }
-            if (!found) mpz_set_ui(gr, (unsigned long)(Q / best_k));
-            gmp_printf("  [SHOR] period candidate r=%Zd\n", gr);
-        } else {
-            mpz_set_ui(gr, (unsigned long)(Q / best_k));
-        }
+                if (q <= 1 || mpz_cmp_ui(gN, (unsigned long)q) <= 0) continue;
 
+                mpz_set_ui(gr, (unsigned long)q);
+
+                /* Fuzzy search r, r±2, r±4, r±6 */
+                int deltas[] = {0, 2, -2, 4, -4, 6, -6};
+                for (int d = 0; d < 7; d++) {
+                    mpz_t r_try; mpz_init(r_try);
+                    mpz_set(r_try, gr);
+                    if (deltas[d] >= 0) mpz_add_ui(r_try, r_try, deltas[d]);
+                    else mpz_sub_ui(r_try, r_try, -deltas[d]);
+                    if (mpz_cmp_ui(r_try, 2) < 0 || mpz_odd_p(r_try))
+                        { mpz_clear(r_try); continue; }
+
+                    mpz_tdiv_q_ui(ghalf, r_try, 2);
+                    mpz_powm(ghalf, ga, ghalf, gN);
+
+                    mpz_add_ui(gtmp, ghalf, 1);
+                    mpz_gcd(ggcd, gtmp, gN);
+                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                        mpz_divexact(gtmp, gN, ggcd);
+                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                        gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
+                                   ga, r_try, peak+1, best_k, deltas[d]);
+                        factored = 1;
+                        mpz_clear(r_try); goto skip_rest;
+                    }
+                    mpz_sub_ui(gtmp, ghalf, 1);
+                    if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
+                    mpz_gcd(ggcd, gtmp, gN);
+                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                        mpz_divexact(gtmp, gN, ggcd);
+                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                        gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
+                                   ga, r_try, peak+1, best_k, deltas[d]);
+                        factored = 1;
+                        mpz_clear(r_try); goto skip_rest;
+                    }
+                    mpz_clear(r_try);
+                }
+            }
+        }
+        if (!factored) printf("  [SHOR] gcd(a^(r/2)±1,N) trivial\n");
+
+skip_rest:
         free(qmag);
         free(seq_re); free(seq_im);
         fftw_destroy_plan(qft);
         fftw_free(qin); fftw_free(qout);
-
-        if (mpz_cmp_ui(gr, 2) < 0) {
-            printf("  [SHOR] r too small\n"); goto done;
-        }
-        if (mpz_odd_p(gr)) {
-            printf("  [SHOR] r is odd — period invalid, try different base\n");
-            goto done;
-        }
-
-        mpz_tdiv_q_ui(ghalf, gr, 2);
-        mpz_powm(ghalf, ga, ghalf, gN);
-
-        mpz_add_ui(gtmp, ghalf, 1);
-        mpz_gcd(ggcd, gtmp, gN);
-        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-            mpz_divexact(gtmp, gN, ggcd);
-            gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-            gmp_printf("         a=%Zd r=%Zd a^(r/2)=%Zd\n", ga, gr, ghalf);
-            goto done;
-        }
-        mpz_sub_ui(gtmp, ghalf, 1);
-        if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
-        mpz_gcd(ggcd, gtmp, gN);
-        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-            mpz_divexact(gtmp, gN, ggcd);
-            gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-            gmp_printf("         a=%Zd r=%Zd a^(r/2)=%Zd\n", ga, gr, ghalf);
-            goto done;
-        }
-        printf("  [SHOR] gcd(a^(r/2)±1,N) trivial\n");
     }
 
 done:
