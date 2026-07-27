@@ -4089,6 +4089,10 @@ static int op_shor(QvmCtx *q, double a1, double a2){
     mpz_t gN, ga, gr, ghalf, gtmp, ggcd;
     mpz_inits(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
     int a_from_cmd = 0;
+    static mpz_t g_room; static int g_room_set = 0;
+    static double chan_phase_offset = 0.0;
+    static int chan_calibrated = 0;
+    if (!g_room_set) { mpz_init(g_room); g_room_set = 1; }
 
     /* Parse N from raw command text (arbitrary precision) */
     {
@@ -4099,6 +4103,55 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         while (s[i] && s[i] != ' ' && s[i] != '\n' && i < 8191)
             { numbuf[i] = s[i]; i++; }
         numbuf[i] = 0;
+        /* ── SHOR CAL: calibrate the room's cascade generator g ── */
+        if (strncmp(numbuf, "CAL", 3) == 0) {
+            if (!q->sdr_ok) { printf("  [CAL] No SDR\n"); goto done; }
+            int D = q->wf.d;
+            uint32_t save_freq_cal = q->sdr->freq;
+            for (int b = 0; b < 1; b++) {
+                uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+                sdr_retune(q->sdr, bfreq); usleep(8000); sdr_flush(q->sdr);
+                int n_cap = 16; double ap0 = 0, ap1 = 0;
+                for (int cap = 0; cap < n_cap; cap++) {
+                    { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
+                      vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
+                      ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb); ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
+                    memset(q->wf.re, 0, D*sizeof(double));
+                    memset(q->wf.im, 0, D*sizeof(double));
+                    q->wf.re[0] = 1.0;
+                    gate_ofdm_tx(q->sdr, &q->wf, NULL);
+                    sdr_capture(q->sdr);
+                    int np = q->sdr->iq_n, Ns = IQ_WINDOW/2;
+                    if (np < Ns) np = Ns;
+                    fftw_complex *fin = fftw_malloc(np*sizeof(fftw_complex));
+                    fftw_complex *fout = fftw_malloc(np*sizeof(fftw_complex));
+                    fftw_plan p2 = fftw_plan_dft_1d(np, fin, fout, FFTW_FORWARD, FFTW_ESTIMATE);
+                    for (int n = 0; n < np; n++) { fin[n][0]=q->sdr->iq_i[n]; fin[n][1]=q->sdr->iq_q[n]; }
+                    fftw_execute(p2);
+                    ap0 += fout[0][0]*fout[0][0] + fout[0][1]*fout[0][1];
+                    ap1 += fout[1][0]*fout[1][0] + fout[1][1]*fout[1][1];
+                    fftw_destroy_plan(p2); fftw_free(fin); fftw_free(fout);
+                }
+                double m0 = sqrt(ap0/n_cap), m1 = sqrt(ap1/n_cap);
+                double ratio_cal = (m0 > 1e-60) ? 0.3 * m1 / m0 : 0.0;
+                gmp_printf("  [CAL] m0=%.3f m1=%.3f ratio=%.6f\n", m0, m1, ratio_cal);
+                if (ratio_cal > 0.0 && ratio_cal < 1.0) {
+                    mpq_t rq; mpq_init(rq);
+                    mpz_t num, den; mpz_inits(num, den, NULL);
+                    mpq_set_d(rq, ratio_cal);
+                    mpq_get_num(num, rq); mpq_get_den(den, rq);
+                    mpz_t twop32; mpz_init(twop32);
+                    mpz_ui_pow_ui(twop32, 2, 32);
+                    mpz_mul(num, twop32, num);
+                    mpz_fdiv_q(g_room, num, den);
+                    mpz_clear(twop32);
+                    gmp_printf("  [CAL] cascade generator g_room ≈ %Zd (32-bit scale)\n", g_room);
+                    mpq_clear(rq); mpz_clears(num, den, NULL);
+                }
+            }
+            sdr_retune(q->sdr, save_freq_cal);
+            goto done;
+        }
         if (mpz_set_str(gN, numbuf, 0) != 0)
             mpz_set_ui(gN, (unsigned long)a1);
 
@@ -4123,10 +4176,6 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         else mpz_set_ui(ga, 0);
     }
 
-    if (mpz_cmp_ui(gN, 4) < 0) {
-        printf("  [SHOR] N must be >= 4\n"); goto done;
-    }
-
     int D = q->wf.d, bdim = q->bank_dim;
     int use_banks = q->num_banks;
     if (use_banks < 1) use_banks = 1;
@@ -4141,15 +4190,52 @@ static int op_shor(QvmCtx *q, double a1, double a2){
     if (!q->sdr_ok) { printf("  [SHOR] No SDR\n"); goto done; }
 
     srand(time(NULL));
-    if (mpz_cmp_ui(ga, 0) == 0) mpz_set_ui(ga, 2);
+    if (mpz_cmp_ui(ga, 0) == 0) {
+        if (mpz_cmp_ui(g_room, 1) > 0) {
+            mpz_set(ga, g_room);
+            gmp_printf("  [SHOR] using calibrated room generator as base\n");
+        } else {
+            mpz_set_ui(ga, 2);
+        }
+    } else if (!a_from_cmd && mpz_cmp_ui(g_room, 1) > 0 && mpz_cmp_ui(ga, 2) == 0) {
+        /* no explicit A given, defaulting to 2 — suggest calibration */
+        printf("  [SHOR] hint: run 'SHOR CAL' first to measure room generator\n");
+    }
     uint32_t save_freq = q->sdr->freq;
 
-    /* ── Seed-only TX: single impulse at bin 0, the room
-       generates the full sequence spectrum from this seed. ── */
+    /* ── Pass 1: compute f(x)=a^x mod N / N for all x ∈ [0,D_room). ── */
+    double *all_seq = malloc(D_room * sizeof(double));
+    if (!all_seq) { printf("  [SHOR] OOM\n"); goto done; }
     {
+        mpz_t val; mpz_init_set_ui(val, 1);
+        double global_max = 0;
+        signed long n_exp;
+        double n_d = mpz_get_d_2exp(&n_exp, gN);
         for (int b = 0; b < use_banks; b++) {
+            int bank_start = b * bdim;
+            if (bank_start > 0)
+                mpz_powm_ui(val, ga, (unsigned long)bank_start, gN);
+            for (int k = 0; k < bdim; k++) {
+                signed long v_exp;
+                double v_d = mpz_get_d_2exp(&v_exp, val);
+                double amp = ldexp(v_d / n_d, (int)(v_exp - n_exp));
+                int idx = bank_start + k;
+                all_seq[idx] = amp;
+                if (amp > global_max) global_max = amp;
+                mpz_mul(val, val, ga);
+                mpz_mod(val, val, gN);
+            }
+        }
+        mpz_clear(val);
+        if (global_max < 1e-300) global_max = 1.0;
+
+        /* ── Pass 2: phase-encode all_seq → OFDM transmission.
+           Phase = 2π · (a^x mod N)/N.  The periodic phase structure
+           survives the LTI channel; multipath only weights peaks. ── */
+        for (int b = 0; b < use_banks; b++) {
+            int bank_start = b * bdim;
             uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
-            fprintf(stderr, "  [SHOR]  seed %3d/%d (%d%%)\r", b, use_banks,
+            fprintf(stderr, "  [SHOR]  TX %3d/%d (%d%%)\r", b, use_banks,
                     100*b/use_banks);
             sdr_retune(q->sdr, bfreq);
             usleep(3000);
@@ -4157,20 +4243,29 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
             memset(q->wf.re, 0, D*sizeof(double));
             memset(q->wf.im, 0, D*sizeof(double));
-            q->wf.re[0] = 1.0;
-            gate_ofdm_tx(q->sdr, &q->wf, NULL);
-
+            for (int k = 1; k < bdim && k < D; k++) {
+                double frac = all_seq[bank_start + k] / global_max;
+                q->wf.re[k] = cos(2.0 * M_PI * frac);
+                q->wf.im[k] = sin(2.0 * M_PI * frac);
+                q->wf.re[D - k] = -q->wf.re[k];
+                q->wf.im[D - k] = -q->wf.im[k];
+            }
             { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
               vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
-              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
-                  ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
+              ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb);
+              ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
+            gate_ofdm_tx(q->sdr, &q->wf, NULL);
         }
-        fprintf(stderr, "  [SHOR]  seed done, capturing room response...\n");
+        fprintf(stderr, "  [SHOR]  TX done, capturing...\n");
     }
+    free(all_seq);
+    sdr_retune(q->sdr, save_freq);
+    usleep(50000);
 
-    /* ── Capture room spectrum once — valid for all bases ── */
+    /* ── Capture I/Q + FFT → complex bin amplitudes → QFT → peaks ── */
     int Q = D_room, Ns = IQ_WINDOW / 2;
-    double *qmag = calloc(Q, sizeof(double));
+    typedef double cplx[2];
+    cplx *seq = calloc(Q, sizeof(cplx)); /* complex sequence per bin */
 
     for (int b = 0; b < use_banks; b++) {
         uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
@@ -4189,16 +4284,41 @@ static int op_shor(QvmCtx *q, double a1, double a2){
             fin[n][1] = q->sdr->iq_q[n];
         }
         fftw_execute(plan);
-        double norm = 1.0 / (np * np);
+        double norm = 1.0 / np;
+        /* Phase-derotate by bin 16 (channel reference) */
+        double pr = fout[16][0]*norm, pi = fout[16][1]*norm;
+        double pm = sqrt(pr*pr+pi*pi), cr = 1.0, sr = 0.0;
+        if (pm > 1e-15) { cr = pr/pm; sr = -pi/pm; }
         for (int k = 0; k < bdim; k++) {
+            double re = fout[k][0]*norm, im = fout[k][1]*norm;
             int idx = b * bdim + k;
-            qmag[idx] = (fout[k][0]*fout[k][0] + fout[k][1]*fout[k][1]) * norm;
+            seq[idx][0] = re*cr - im*sr;
+            seq[idx][1] = re*sr + im*cr;
         }
         fftw_destroy_plan(plan);
         fftw_free(fin); fftw_free(fout);
     }
     sdr_retune(q->sdr, save_freq); sdr_flush(q->sdr);
+
+    /* ── QFT: FFTW on the full reassembled sequence ── */
+    fftw_complex *qin  = fftw_malloc(Q * sizeof(fftw_complex));
+    fftw_complex *qout = fftw_malloc(Q * sizeof(fftw_complex));
+    fftw_plan qft = fftw_plan_dft_1d(Q, qin, qout,
+                                     FFTW_FORWARD, FFTW_ESTIMATE);
+    for (int i = 0; i < Q; i++) { qin[i][0] = seq[i][0]; qin[i][1] = seq[i][1]; }
+    fftw_execute(qft);
+
+    double *qmag = calloc(Q, sizeof(double));
+    for (int i = 0; i < Q; i++)
+        qmag[i] = qout[i][0]*qout[i][0] + qout[i][1]*qout[i][1];
     qmag[0] = 0;
+
+    /* save captured complex amplitudes at bins 0,1 for phase derivation */
+    double sv0r = seq[0][0], sv0i = seq[0][1];
+    double sv1r = seq[1][0], sv1i = seq[1][1];
+    free(seq);
+    fftw_destroy_plan(qft);
+    fftw_free(qin); fftw_free(qout);
 
     /* ── Extract the room's artifact peaks — these are fixed
        by the channel, same for every base. ── */
@@ -4221,6 +4341,269 @@ static int op_shor(QvmCtx *q, double a1, double a2){
     gmp_printf("  [SHOR] Oracle done. Top room peaks:\n");
     for (int pk = 0; pk < n_peaks && top_k[pk] > 1; pk++)
         gmp_printf("  [SHOR]  peak %d: bin=%d pwr=%.6f\n", pk+1, top_k[pk], top_pwr[pk]);
+
+    int cascade_factored = 0;
+
+    /* ── Phase-derived A from captured bin 0/1 complex ratio ── */
+    {
+        /* Convert FFT doubles to GMP rational for full-precision ratio */
+        mpq_t s0r, s0i, s1r, s1i;
+        mpq_inits(s0r, s0i, s1r, s1i, NULL);
+        mpq_set_d(s0r, sv0r); mpq_set_d(s0i, sv0i);
+        mpq_set_d(s1r, sv1r); mpq_set_d(s1i, sv1i);
+        /* denom = s0r² + s0i² */
+        mpq_t d0, r0r, r0i, num_r, num_i;
+        mpq_inits(d0, r0r, r0i, num_r, num_i, NULL);
+        mpq_mul(r0r, s0r, s0r); mpq_mul(r0i, s0i, s0i);
+        mpq_add(d0, r0r, r0i);
+        if (mpq_sgn(d0) != 0) {
+            /* num_r = s1r·s0r + s1i·s0i  (real part of ratio) */
+            mpq_t t1, t2; mpq_inits(t1, t2, NULL);
+            mpq_mul(t1, s1r, s0r); mpq_mul(t2, s1i, s0i);
+            mpq_add(num_r, t1, t2);
+            mpq_div(num_r, num_r, d0);
+            /* num_i = s1i·s0r - s1r·s0i  (imag part of ratio) */
+            mpq_mul(t1, s1i, s0r); mpq_mul(t2, s1r, s0i);
+            mpq_sub(num_i, t1, t2);
+            mpq_div(num_i, num_i, d0);
+            mpq_clears(t1, t2, NULL);
+            /* Convert to double for atan2 (only transcendental step) */
+            double qr = mpq_get_d(num_r);
+            double qi = mpq_get_d(num_i);
+            double phase = atan2(qi, qr);
+            double frac = phase / (2.0 * M_PI);
+            if (frac < 0) frac += 1.0;
+
+            /* Apply channel calibration */
+            if (a_from_cmd) {
+                signed long ae, ne;
+                double ad = mpz_get_d_2exp(&ae, ga);
+                double nd = mpz_get_d_2exp(&ne, gN);
+                double frac_exp = (ad/nd) * ldexp(1.0, (int)(ae-ne));
+                chan_phase_offset = phase - 2.0*M_PI*frac_exp;
+                while (chan_phase_offset >  M_PI) chan_phase_offset -= 2.0*M_PI;
+                while (chan_phase_offset < -M_PI) chan_phase_offset += 2.0*M_PI;
+                chan_calibrated = 1;
+                gmp_printf("  [SHOR] channel cal θ=%.4f°\n", chan_phase_offset*180./M_PI);
+            }
+            if (!a_from_cmd && chan_calibrated) {
+                double phi_clean = phase - chan_phase_offset;
+                frac = phi_clean / (2.0 * M_PI);
+                if (frac < 0) frac += 1.0;
+            }
+
+            if (frac > 0.0 && frac < 1.0) {
+                mpz_t A_ph; mpz_init(A_ph);
+                mpq_t rq; mpq_init(rq);
+                mpz_t num, den; mpz_inits(num, den, NULL);
+                mpq_set_d(rq, frac);
+                mpq_get_num(num, rq); mpq_get_den(den, rq);
+                mpz_mul(num, gN, num);
+                mpz_fdiv_q(A_ph, num, den);
+                mpz_add_ui(A_ph, A_ph, 1);
+                gmp_printf("  [SHOR] phase-derived A≈%Zd (frac=%.6f%s)\n",
+                           A_ph, frac,
+                           chan_calibrated && !a_from_cmd ? ", cal" : "");
+                for (int pk = 0; pk < n_peaks && !cascade_factored; pk++) {
+                    if (top_k[pk] <= 1) continue;
+                    int bk = top_k[pk];
+                    long ca = bk, cb = Q, cf2[64]; int nc = 0;
+                    while (cb && nc < 64) { cf2[nc++]=ca/cb; long t=ca%cb; ca=cb; cb=t; }
+                    long pp2=1, qq2=0, p2p=cf2[0], q2p=1;
+                    for (int ii=1; ii<nc && !cascade_factored; ii++) {
+                        long pn=cf2[ii]*p2p+pp2, qn=cf2[ii]*q2p+qq2;
+                        pp2=p2p; qq2=q2p; p2p=pn; q2p=qn;
+                        if (qn<=1 || mpz_cmp_ui(gN,(unsigned long)qn)<=0) continue;
+                        int ds[]={0,2,-2,4,-4,6,-6};
+                        for (int d=0;d<7&&!cascade_factored;d++){
+                            mpz_set_ui(gr,(unsigned long)qn);
+                            if (ds[d]>=0) mpz_add_ui(gr,gr,ds[d]);
+                            else mpz_sub_ui(gr,gr,-ds[d]);
+                            if (mpz_cmp_ui(gr,2)<0 || mpz_odd_p(gr)) continue;
+                            mpz_tdiv_q_ui(ghalf,gr,2);
+                            mpz_powm(ghalf,A_ph,ghalf,gN);
+                            mpz_add_ui(gtmp,ghalf,1); mpz_gcd(ggcd,gtmp,gN);
+                            if (mpz_cmp_ui(ggcd,1)>0&&mpz_cmp(ggcd,gN)<0){
+                                mpz_divexact(gtmp,gN,ggcd);
+                                gmp_printf("  [SHOR] phase-derived A=%Zd r=%Zd → FACTOR\n", A_ph, gr);
+                                gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                                cascade_factored=1; break;
+                            }
+                            mpz_sub_ui(gtmp,ghalf,1);
+                            if (mpz_cmp_ui(gtmp,0)<=0) mpz_add(gtmp,gtmp,gN);
+                            mpz_gcd(ggcd,gtmp,gN);
+                            if (mpz_cmp_ui(ggcd,1)>0&&mpz_cmp(ggcd,gN)<0){
+                                mpz_divexact(gtmp,gN,ggcd);
+                                gmp_printf("  [SHOR] phase-derived A=%Zd r=%Zd → FACTOR\n", A_ph, gr);
+                                gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                                cascade_factored=1; break;
+                            }
+                        }
+                    }
+                }
+                if (!cascade_factored)
+                    gmp_printf("  [SHOR] phase-derived A CFE missed\n");
+                mpq_clear(rq); mpz_clears(num, den, A_ph, NULL);
+        }
+        mpq_clears(s0r, s0i, s1r, s1i, d0, r0r, r0i, num_r, num_i, NULL);
+    }
+    }
+    if (cascade_factored) goto done;
+
+    /* ── Discrete bin mapping: derive A from artifact peak bin indices
+       (pure integer arithmetic, no floating-point noise amplification).
+       Top bin, top-two sum, and top-two product mod N. ── */
+    {
+        int try_bins = (top_k[1] > 1) ? 3 : 1; /* up to 3 mappings */
+        for (int mapper = 0; mapper < try_bins && !cascade_factored; mapper++) {
+            mpz_t A_bin; mpz_init(A_bin);
+            if (mapper == 0)
+                mpz_set_ui(A_bin, (unsigned long)top_k[0]);
+            else if (mapper == 1)
+                mpz_set_ui(A_bin, (unsigned long)(top_k[0] + top_k[1]));
+            else {
+                mpz_set_ui(A_bin, (unsigned long)top_k[0]);
+                mpz_mul_ui(A_bin, A_bin, (unsigned long)top_k[1]);
+                mpz_mod(A_bin, A_bin, gN);
+            }
+            if (mpz_cmp_ui(A_bin, 2) < 0) { mpz_clear(A_bin); continue; }
+            mpz_gcd(ggcd, A_bin, gN);
+            if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                mpz_divexact(gtmp, gN, ggcd);
+                gmp_printf("  [SHOR] bin-derived A=%Zd (gcd hit)\n", A_bin);
+                gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                cascade_factored = 1; mpz_clear(A_bin); break;
+            }
+            /* Full CFE on all artifact peaks with this bin-derived A */
+            for (int pk = 0; pk < n_peaks && !cascade_factored; pk++) {
+                if (top_k[pk] <= 1) continue;
+                int best_k = top_k[pk];
+                long ca = best_k, cb = Q;
+                long cf[64]; int ncf = 0;
+                while (cb && ncf < 64 && !cascade_factored) { cf[ncf++] = ca / cb; long t = ca % cb; ca = cb; cb = t; }
+                long p2 = 1, q2 = 0, p1 = cf[0], q1 = 1;
+                for (int ii = 1; ii < ncf && !cascade_factored; ii++) {
+                    long pp = cf[ii]*p1+p2, qq = cf[ii]*q1+q2;
+                    p2 = p1; q2 = q1; p1 = pp; q1 = qq;
+                    if (qq <= 1 || mpz_cmp_ui(gN, (unsigned long)qq) <= 0) continue;
+                    int deltas[] = {0, 2, -2, 4, -4, 6, -6};
+                    for (int d = 0; d < 7 && !cascade_factored; d++) {
+                        mpz_set_ui(gr, (unsigned long)qq);
+                        if (deltas[d] >= 0) mpz_add_ui(gr, gr, deltas[d]);
+                        else mpz_sub_ui(gr, gr, -deltas[d]);
+                        if (mpz_cmp_ui(gr, 2) < 0) continue;
+                        if (deltas[d] == 0) {
+                            mpz_powm(gtmp, A_bin, gr, gN);
+                            if (mpz_cmp_ui(gtmp, 1) == 0)
+                                gmp_printf("  [SHOR]  bin-derived A^%Zd ≡ 1 (mod N) — period %s (bin %d)\n",
+                                           gr, mpz_odd_p(gr) ? "ODD" : "CONFIRMED", best_k);
+                        }
+                        if (mpz_odd_p(gr)) continue;
+                        mpz_tdiv_q_ui(ghalf, gr, 2);
+                        mpz_powm(ghalf, A_bin, ghalf, gN);
+                        mpz_add_ui(gtmp, ghalf, 1);
+                        mpz_gcd(ggcd, gtmp, gN);
+                        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                            mpz_divexact(gtmp, gN, ggcd);
+                            gmp_printf("  [SHOR] bin-derived A=%Zd r=%Zd (bin %d) → FACTOR\n",
+                                       A_bin, gr, best_k);
+                            gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                            cascade_factored = 1;
+                            break;
+                        }
+                        mpz_sub_ui(gtmp, ghalf, 1);
+                        if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
+                        mpz_gcd(ggcd, gtmp, gN);
+                        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                            mpz_divexact(gtmp, gN, ggcd);
+                            gmp_printf("  [SHOR] bin-derived A=%Zd r=%Zd (bin %d) → FACTOR\n",
+                                       A_bin, gr, best_k);
+                            gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                            cascade_factored = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!cascade_factored)
+                gmp_printf("  [SHOR] bin-derived A=%Zd (CFE missed)\n", A_bin);
+            mpz_clear(A_bin);
+        }
+    }
+    if (cascade_factored) goto done;
+
+    /* ── Derive A from frequency: each peak bin k encodes a = 2^k mod N
+       via the room's cascade generator g=2.  Test greedily before
+       falling back to the grinding loop. ── */
+    {
+        mpz_t ga_try, base2; mpz_inits(ga_try, base2, NULL);
+        mpz_set_ui(base2, 2);
+        int found = 0;
+        for (int pk = 0; pk < n_peaks && !found; pk++) {
+            if (top_k[pk] <= 1) continue;
+            mpz_powm_ui(ga_try, base2, (unsigned long)top_k[pk], gN);
+            mpz_gcd(ggcd, ga_try, gN);
+            if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                mpz_divexact(gtmp, gN, ggcd);
+                gmp_printf("  [SHOR] freq-derived A=%Zd (bin %d) — gcd hit\n",
+                           ga_try, top_k[pk]);
+                gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                found = 1;
+                break;
+            }
+            /* Run full CFE on this peak with the derived a */
+            int best_k = top_k[pk];
+            long ca = best_k, cb = Q;
+            long cf[64]; int ncf = 0;
+            while (cb && ncf < 64) { cf[ncf++] = ca / cb; long t = ca % cb; ca = cb; cb = t; }
+            long p2 = 1, q2 = 0, p1 = cf[0], q1 = 1;
+            for (int ii = 1; ii < ncf && !found; ii++) {
+                long pp = cf[ii]*p1+p2, qq = cf[ii]*q1+q2;
+                p2 = p1; q2 = q1; p1 = pp; q1 = qq;
+                if (qq <= 1 || mpz_cmp_ui(gN, (unsigned long)qq) <= 0) continue;
+                int deltas[] = {0, 2, -2, 4, -4, 6, -6};
+                for (int d = 0; d < 7 && !found; d++) {
+                    mpz_set_ui(gr, (unsigned long)qq);
+                    if (deltas[d] >= 0) mpz_add_ui(gr, gr, deltas[d]);
+                    else mpz_sub_ui(gr, gr, -deltas[d]);
+                    if (mpz_cmp_ui(gr, 2) < 0) continue;
+                    if (deltas[d] == 0) {
+                        mpz_powm(gtmp, ga_try, gr, gN);
+                        if (mpz_cmp_ui(gtmp, 1) == 0)
+                            gmp_printf("  [SHOR]  freq-derived a^%Zd ≡ 1 (mod N) — period %s (bin %d)\n",
+                                       gr, mpz_odd_p(gr) ? "ODD" : "CONFIRMED", best_k);
+                    }
+                    if (mpz_odd_p(gr)) continue;
+                    mpz_tdiv_q_ui(ghalf, gr, 2);
+                    mpz_powm(ghalf, ga_try, ghalf, gN);
+                    mpz_add_ui(gtmp, ghalf, 1);
+                    mpz_gcd(ggcd, gtmp, gN);
+                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                        mpz_divexact(gtmp, gN, ggcd);
+                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                        gmp_printf("         freq-derived A=%Zd r=%Zd (bin %d, delta=%+d)\n",
+                                   ga_try, gr, best_k, deltas[d]);
+                        found = 1;
+                        break;
+                    }
+                    mpz_sub_ui(gtmp, ghalf, 1);
+                    if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
+                    mpz_gcd(ggcd, gtmp, gN);
+                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                        mpz_divexact(gtmp, gN, ggcd);
+                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                        gmp_printf("         freq-derived A=%Zd r=%Zd (bin %d, delta=%+d)\n",
+                                   ga_try, gr, best_k, deltas[d]);
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        mpz_clears(ga_try, base2, NULL);
+        if (found) goto done;
+        gmp_printf("  [SHOR] freq-derivation missed — falling back to base grind\n");
+    }
 
     /* ── Grind bases: for each a, CFE on the room's peaks.
        One capture, many bases — µs per attempt. ── */
