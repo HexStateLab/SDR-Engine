@@ -4088,6 +4088,7 @@ static int op_field(QvmCtx *q, double a1, double a2){
 static int op_shor(QvmCtx *q, double a1, double a2){
     mpz_t gN, ga, gr, ghalf, gtmp, ggcd;
     mpz_inits(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
+    int a_from_cmd = 0;
 
     /* Parse N from raw command text (arbitrary precision) */
     {
@@ -4100,11 +4101,27 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         numbuf[i] = 0;
         if (mpz_set_str(gN, numbuf, 0) != 0)
             mpz_set_ui(gN, (unsigned long)a1);
+
+        /* Optional third token: arbitrary-precision base a.
+           (Previously a came through a double, capping it at 2^53 —
+           useless for big N where bases must themselves be bignum.) */
+        char *t = s + i;
+        while (*t == ' ') t++;
+        if (*t && *t != '\n') {
+            char abuf[8192] = {0};
+            int j = 0;
+            while (t[j] && t[j] != ' ' && t[j] != '\n' && j < 8191)
+                { abuf[j] = t[j]; j++; }
+            if (j > 0 && mpz_set_str(ga, abuf, 0) == 0 && mpz_cmp_ui(ga, 2) >= 0)
+                a_from_cmd = 1;
+        }
     }
 
     unsigned long force_a = (unsigned long)a2;
-    if (force_a >= 2) mpz_set_ui(ga, force_a);
-    else mpz_set_ui(ga, 0);
+    if (!a_from_cmd) {
+        if (force_a >= 2) mpz_set_ui(ga, force_a);
+        else mpz_set_ui(ga, 0);
+    }
 
     if (mpz_cmp_ui(gN, 4) < 0) {
         printf("  [SHOR] N must be >= 4\n"); goto done;
@@ -4170,12 +4187,20 @@ static int op_shor(QvmCtx *q, double a1, double a2){
     {
         mpz_t val; mpz_init_set_ui(val, 1);
         double global_max = 0;
+        /* Encode val/N ∈ [0,1) instead of raw val: identical period
+           structure (constant scale), and no overflow — mpz_get_d returns
+           +Inf for val ≥ 2^1024, which NaN-poisons the whole OFDM buffer
+           for any N > ~1024 bits. */
+        signed long n_exp;
+        double n_d = mpz_get_d_2exp(&n_exp, gN);   /* gN = n_d · 2^n_exp */
         for (int b = 0; b < use_banks; b++) {
             int bank_start = b * bdim;
             if (bank_start > 0)
                 mpz_powm_ui(val, ga, (unsigned long)bank_start, gN);
             for (int k = 0; k < bdim; k++) {
-                double amp = mpz_get_d(val);
+                signed long v_exp;
+                double v_d = mpz_get_d_2exp(&v_exp, val); /* val = v_d·2^v_exp */
+                double amp = ldexp(v_d / n_d, (int)(v_exp - n_exp));
                 int idx = bank_start + k;
                 all_seq[idx] = amp;
                 if (amp > global_max) global_max = amp;
@@ -4185,7 +4210,7 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         }
         mpz_clear(val);
 
-        if (global_max < 1.0) global_max = 1.0;
+        if (global_max < 1e-300) global_max = 1.0;
 
         /* ── Pass 2: OFDM TX via gate_ofdm_tx — all bins simultaneously.
            The room's mixer + multipath IS the QFT.  Capture power
@@ -4301,7 +4326,10 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         int n_peaks = 20;
         int top_k[20] = {0};
         double top_pwr[20] = {0};
-        for (int i = 32; i < Q/2; i++) {
+        for (int i = 2; i < Q/2; i++) {
+            /* local maxima only — a flat top-N fills up with sidelobes
+               of the strongest peak instead of distinct harmonics */
+            if (qmag[i] <= qmag[i-1] || qmag[i] < qmag[i+1]) continue;
             if (qmag[i] > top_pwr[19]) {
                 top_pwr[19] = qmag[i]; top_k[19] = i;
                 for (int j = 18; j >= 0; j--) {
@@ -4339,8 +4367,19 @@ static int op_shor(QvmCtx *q, double a1, double a2){
                     mpz_set(r_try, gr);
                     if (deltas[d] >= 0) mpz_add_ui(r_try, r_try, deltas[d]);
                     else mpz_sub_ui(r_try, r_try, -deltas[d]);
-                    if (mpz_cmp_ui(r_try, 2) < 0 || mpz_odd_p(r_try))
+                    if (mpz_cmp_ui(r_try, 2) < 0)
                         { mpz_clear(r_try); continue; }
+                    /* Evidence: does a^r ≡ 1 (mod N)? Print it either way
+                       so a claimed period is verifiable, not asserted. */
+                    if (deltas[d] == 0) {
+                        mpz_powm(gtmp, ga, r_try, gN);
+                        if (mpz_cmp_ui(gtmp, 1) == 0)
+                            gmp_printf("  [SHOR]  verified a^%Zd ≡ 1 (mod N) — period %s (bin %d)\n",
+                                       r_try,
+                                       mpz_odd_p(r_try) ? "is ODD, unusable for factoring"
+                                                        : "CONFIRMED", best_k);
+                    }
+                    if (mpz_odd_p(r_try)) { mpz_clear(r_try); continue; }
 
                     mpz_tdiv_q_ui(ghalf, r_try, 2);
                     mpz_powm(ghalf, ga, ghalf, gN);
