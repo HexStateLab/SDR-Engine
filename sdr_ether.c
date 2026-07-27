@@ -4212,114 +4212,79 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
         if (global_max < 1e-300) global_max = 1.0;
 
-        /* ── Pass 2: OFDM TX via gate_ofdm_tx — all bins simultaneously.
-           The room's mixer + multipath IS the QFT.  Capture power
-           spectrum directly — max bin = period. ── */
+        /* ── Oracle: per-bank anti-symmetric encoding + TX.
+           Tone k = +amp, mirror D-k = -amp.  The room's mixer
+           creates intermodulation at |k +/- j|; when the sequence
+           has period r, the cross-products sum constructively,
+           and the power spectrum peaks at harmonics of Q/r. ── */
         for (int b = 0; b < use_banks; b++) {
             int bank_start = b * bdim;
             uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
             if (b % 10 == 0)
-                fprintf(stderr, "  [SHOR]  TX %3d/%d (%d%%)\r", b, use_banks,
+                fprintf(stderr, "  [SHOR]  oracle %3d/%d (%d%%)\r", b, use_banks,
                         100*b/use_banks);
             sdr_retune(q->sdr, bfreq);
             usleep(3000);
+            sdr_flush(q->sdr);
 
-            for (int k = 0; k < bdim; k++) {
-                double amp = all_seq[bank_start + k] / global_max;
-                q->wf.re[k] = amp;
-                q->wf.im[k] = 0;
-            }
+            /* Seed-only oracle: a^0 = 1 at bin 0, anti-sym mirror.
+               The room's mixer cascades: each mixer pass shifts
+               frequency by +1 bin, generating a^x at bin x. */
+            memset(q->wf.re, 0, D*sizeof(double));
+            memset(q->wf.im, 0, D*sizeof(double));
+            q->wf.re[0] = 1.0;
+            /* All seed: mixer cascade generates the rest */
             gate_ofdm_tx(q->sdr, &q->wf, NULL);
+
             { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
               vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
               if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
                   ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
         }
-        fprintf(stderr, "  [SHOR]  TX done, capturing...\n");
+        fprintf(stderr, "  [SHOR]  oracle done, capturing...\n");
     }
 
     free(all_seq);
     sdr_retune(q->sdr, save_freq);
     usleep(50000);
 
-    /* ── Capture: complex I/Q per bank, assemble full sequence,
-       run QFT via FFTW3, continued fractions to extract period ── */
+    /* ── Room readout: one capture + FFT per bank → power spectrum.
+       The mixer has already computed cross-products; bin power
+       directly carries the period structure. ── */
     {
-        int Ns = IQ_WINDOW / 2;
-        double *seq_re = calloc(D_room, sizeof(double));
-        double *seq_im = calloc(D_room, sizeof(double));
-        if (!seq_re || !seq_im) goto done;
+        int Q = D_room, Ns = IQ_WINDOW / 2;
+        double *qmag = calloc(Q, sizeof(double));
 
         for (int b = 0; b < use_banks; b++) {
             uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
             sdr_retune(q->sdr, bfreq);
             usleep(8000); sdr_flush(q->sdr);
 
-            double *avg_I = calloc(q->wf.d, sizeof(double));
-            double *avg_Q = calloc(q->wf.d, sizeof(double));
-            int n_cap = 16;
-            for (int cap = 0; cap < n_cap; cap++) {
-                sdr_capture(q->sdr);
-                int np = q->sdr->iq_n; if (np < Ns) np = Ns;
-                fftw_complex *fin  = fftw_malloc(np * sizeof(fftw_complex));
-                fftw_complex *fout = fftw_malloc(np * sizeof(fftw_complex));
-                fftw_plan plan = fftw_plan_dft_1d(np, fin, fout,
-                                                  FFTW_FORWARD, FFTW_ESTIMATE);
-                for (int n = 0; n < np; n++) {
-                    fin[n][0] = q->sdr->iq_i[n];
-                    fin[n][1] = q->sdr->iq_q[n];
-                }
-                fftw_execute(plan);
-                double norm = 1.0 / np;
-                double p_re = fout[16][0]*norm, p_im = fout[16][1]*norm;
-                double pm = sqrt(p_re*p_re + p_im*p_im);
-                double cr = 1.0, sr = 0.0;
-                if (pm > 1e-15) { cr = p_re/pm; sr = -p_im/pm; }
-                for (int k = 0; k < q->wf.d && k < np; k++) {
-                    double re = fout[k][0]*norm, im = fout[k][1]*norm;
-                    avg_I[k] += re*cr - im*sr;
-                    avg_Q[k] += re*sr + im*cr;
-                }
-                fftw_destroy_plan(plan);
-                fftw_free(fin); fftw_free(fout);
+            sdr_capture(q->sdr);
+            int np = q->sdr->iq_n; if (np < Ns) np = Ns;
+
+            fftw_complex *fin  = fftw_malloc(np * sizeof(fftw_complex));
+            fftw_complex *fout = fftw_malloc(np * sizeof(fftw_complex));
+            fftw_plan plan = fftw_plan_dft_1d(np, fin, fout,
+                                              FFTW_FORWARD, FFTW_ESTIMATE);
+            for (int n = 0; n < np; n++) {
+                fin[n][0] = q->sdr->iq_i[n];
+                fin[n][1] = q->sdr->iq_q[n];
             }
-            for (int k = 0; k < q->wf.d; k++) {
-                avg_I[k] /= n_cap; avg_Q[k] /= n_cap;
-            }
+            fftw_execute(plan);
+            double norm = 1.0 / (np * np);
             for (int k = 0; k < bdim; k++) {
                 int idx = b * bdim + k;
-                seq_re[idx] = avg_I[k];
-                seq_im[idx] = avg_Q[k];
+                qmag[idx] = (fout[k][0]*fout[k][0] + fout[k][1]*fout[k][1]) * norm;
             }
-            free(avg_I); free(avg_Q);
+            fftw_destroy_plan(plan);
+            fftw_free(fin); fftw_free(fout);
         }
-
         sdr_retune(q->sdr, save_freq); sdr_flush(q->sdr);
 
-        /* ── QFT: FFTW3 FFT on the full reassembled sequence ── */
-        int Q = D_room;
-        fftw_complex *qin  = fftw_malloc(Q * sizeof(fftw_complex));
-        fftw_complex *qout = fftw_malloc(Q * sizeof(fftw_complex));
-        fftw_plan qft = fftw_plan_dft_1d(Q, qin, qout,
-                                         FFTW_FORWARD, FFTW_ESTIMATE);
-        for (int i = 0; i < Q; i++) {
-            qin[i][0] = seq_re[i];
-            qin[i][1] = seq_im[i];
-        }
-        fftw_execute(qft);
-
-        double *qmag = calloc(Q, sizeof(double));
-        for (int i = 0; i < Q; i++)
-            qmag[i] = qout[i][0]*qout[i][0] + qout[i][1]*qout[i][1];
         qmag[0] = 0;
 
-        double best_pwr = 0;
-        int best_k = 0;
-        for (int i = 2; i < Q; i++) {
-            if (qmag[i] > best_pwr) { best_pwr = qmag[i]; best_k = i; }
-        }
-
-        gmp_printf("  [SHOR] QFT done. Top peaks:\n");
+        gmp_printf("  [SHOR] Oracle done. Top peaks:\n");
 
         /* ── Find top peaks, run CFE on each ── */
         /* Find the top 20 peak bins (skip low bins — DC artifacts) */
@@ -4414,9 +4379,6 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
 skip_rest:
         free(qmag);
-        free(seq_re); free(seq_im);
-        fftw_destroy_plan(qft);
-        fftw_free(qin); fftw_free(qout);
     }
     }  /* end attempt loop */
 
