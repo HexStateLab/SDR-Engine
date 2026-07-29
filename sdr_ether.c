@@ -4083,18 +4083,14 @@ static int op_field(QvmCtx *q, double a1, double a2){
  * continued fractions to extract period r from peak spacings.
  * GMP for arbitrary-precision N.
  *
- * The base `a` is whatever you specify (or 2 by default). The
- * room's QFT peaks are used ONLY to extract the period r of
- * a^x mod N for that a — a candidate r is only trusted once
- * a^r ≡ 1 (mod N) is verified.
- *
- *   SHOR <N> [a]   — factor N with base a (defaults to 2)
+ *   SHOR <N> [a]   — factor N, optionally specify base a
  * ═══════════════════════════════════════════════════════════════ */
 static int op_shor(QvmCtx *q, double a1, double a2){
     mpz_t gN, ga, gr, ghalf, gtmp, ggcd;
     mpz_inits(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
+    int a_from_cmd = 0;
 
-    /* Parse N (and optional a) from raw command text (arbitrary precision) */
+    /* Parse N from raw command text (arbitrary precision) */
     {
         char *s = q->last_cmd, numbuf[8192] = {0};
         while (*s && *s != ' ') s++;
@@ -4106,24 +4102,29 @@ static int op_shor(QvmCtx *q, double a1, double a2){
         if (mpz_set_str(gN, numbuf, 0) != 0)
             mpz_set_ui(gN, (unsigned long)a1);
 
-        /* Optional second token: arbitrary-precision base a.
+        /* Optional third token: arbitrary-precision base a.
            (Previously a came through a double, capping it at 2^53 —
            useless for big N where bases must themselves be bignum.) */
         char *t = s + i;
         while (*t == ' ') t++;
-        int have_a = 0;
         if (*t && *t != '\n') {
             char abuf[8192] = {0};
             int j = 0;
             while (t[j] && t[j] != ' ' && t[j] != '\n' && j < 8191)
                 { abuf[j] = t[j]; j++; }
             if (j > 0 && mpz_set_str(ga, abuf, 0) == 0 && mpz_cmp_ui(ga, 2) >= 0)
-                have_a = 1;
+                a_from_cmd = 1;
         }
-        if (!have_a) {
-            unsigned long force_a = (unsigned long)a2;
-            mpz_set_ui(ga, force_a >= 2 ? force_a : 2);
-        }
+    }
+
+    unsigned long force_a = (unsigned long)a2;
+    if (!a_from_cmd) {
+        if (force_a >= 2) mpz_set_ui(ga, force_a);
+        else mpz_set_ui(ga, 0);
+    }
+
+    if (mpz_cmp_ui(gN, 4) < 0) {
+        printf("  [SHOR] N must be >= 4\n"); goto done;
     }
 
     int D = q->wf.d, bdim = q->bank_dim;
@@ -4133,56 +4134,22 @@ static int op_shor(QvmCtx *q, double a1, double a2){
     int D_room = use_banks * bdim;
 
     gmp_printf("  ╔══════════════════════════════════╗\n"
-               "  ║  SHOR: N=%Zd  a=%Zd  D_room=%d  banks=%d\n"
+               "  ║  SHOR: N=%Zd  D_room=%d  banks=%d ║\n"
                "  ╚══════════════════════════════════╝\n",
-               gN, ga, D_room, use_banks);
+               gN, D_room, use_banks);
 
     if (!q->sdr_ok) { printf("  [SHOR] No SDR\n"); goto done; }
 
-    /* If the specified a already shares a factor with N, done instantly */
-    mpz_gcd(ggcd, ga, gN);
-    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-        mpz_divexact(gtmp, gN, ggcd);
-        gmp_printf("  [SHOR] a=%Zd already shares a factor with N\n", ga);
-        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-        goto done;
-    }
-
+    srand(time(NULL));
+    if (mpz_cmp_ui(ga, 0) == 0) mpz_set_ui(ga, 2);
     uint32_t save_freq = q->sdr->freq;
 
-    /* ── Pass 1: compute f(x)=a^x mod N / N for all x ∈ [0,D_room). ── */
-    double *all_seq = malloc(D_room * sizeof(double));
-    if (!all_seq) { printf("  [SHOR] OOM\n"); goto done; }
+    /* ── Seed-only TX: single impulse at bin 0, the room
+       generates the full sequence spectrum from this seed. ── */
     {
-        mpz_t val; mpz_init_set_ui(val, 1);
-        double global_max = 0;
-        signed long n_exp;
-        double n_d = mpz_get_d_2exp(&n_exp, gN);
         for (int b = 0; b < use_banks; b++) {
-            int bank_start = b * bdim;
-            if (bank_start > 0)
-                mpz_powm_ui(val, ga, (unsigned long)bank_start, gN);
-            for (int k = 0; k < bdim; k++) {
-                signed long v_exp;
-                double v_d = mpz_get_d_2exp(&v_exp, val);
-                double amp = ldexp(v_d / n_d, (int)(v_exp - n_exp));
-                int idx = bank_start + k;
-                all_seq[idx] = amp;
-                if (amp > global_max) global_max = amp;
-                mpz_mul(val, val, ga);
-                mpz_mod(val, val, gN);
-            }
-        }
-        mpz_clear(val);
-        if (global_max < 1e-300) global_max = 1.0;
-
-        /* ── Pass 2: phase-encode all_seq → OFDM transmission.
-           Phase = 2π · (a^x mod N)/N.  The periodic phase structure
-           survives the LTI channel; multipath only weights peaks. ── */
-        for (int b = 0; b < use_banks; b++) {
-            int bank_start = b * bdim;
             uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
-            fprintf(stderr, "  [SHOR]  TX %3d/%d (%d%%)\r", b, use_banks,
+            fprintf(stderr, "  [SHOR]  seed %3d/%d (%d%%)\r", b, use_banks,
                     100*b/use_banks);
             sdr_retune(q->sdr, bfreq);
             usleep(3000);
@@ -4190,29 +4157,20 @@ static int op_shor(QvmCtx *q, double a1, double a2){
 
             memset(q->wf.re, 0, D*sizeof(double));
             memset(q->wf.im, 0, D*sizeof(double));
-            for (int k = 1; k < bdim && k < D; k++) {
-                double frac = all_seq[bank_start + k] / global_max;
-                q->wf.re[k] = cos(2.0 * M_PI * frac);
-                q->wf.im[k] = sin(2.0 * M_PI * frac);
-                q->wf.re[D - k] = -q->wf.re[k];
-                q->wf.im[D - k] = -q->wf.im[k];
-            }
+            q->wf.re[0] = 1.0;
+            gate_ofdm_tx(q->sdr, &q->wf, NULL);
+
             { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
               vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
-              ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb);
-              ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
-            gate_ofdm_tx(q->sdr, &q->wf, NULL);
+              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
+                  ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
         }
-        fprintf(stderr, "  [SHOR]  TX done, capturing...\n");
+        fprintf(stderr, "  [SHOR]  seed done, capturing room response...\n");
     }
-    free(all_seq);
-    sdr_retune(q->sdr, save_freq);
-    usleep(50000);
 
-    /* ── Capture I/Q + FFT → complex bin amplitudes → QFT → peaks ── */
+    /* ── Capture room spectrum once — valid for all bases ── */
     int Q = D_room, Ns = IQ_WINDOW / 2;
-    typedef double cplx[2];
-    cplx *seq = calloc(Q, sizeof(cplx)); /* complex sequence per bin */
+    double *qmag = calloc(Q, sizeof(double));
 
     for (int b = 0; b < use_banks; b++) {
         uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
@@ -4231,41 +4189,19 @@ static int op_shor(QvmCtx *q, double a1, double a2){
             fin[n][1] = q->sdr->iq_q[n];
         }
         fftw_execute(plan);
-        double norm = 1.0 / np;
-        /* Phase-derotate by bin 16 (channel reference) */
-        double pr = fout[16][0]*norm, pi = fout[16][1]*norm;
-        double pm = sqrt(pr*pr+pi*pi), cr = 1.0, sr = 0.0;
-        if (pm > 1e-15) { cr = pr/pm; sr = -pi/pm; }
+        double norm = 1.0 / (np * np);
         for (int k = 0; k < bdim; k++) {
-            double re = fout[k][0]*norm, im = fout[k][1]*norm;
             int idx = b * bdim + k;
-            seq[idx][0] = re*cr - im*sr;
-            seq[idx][1] = re*sr + im*cr;
+            qmag[idx] = (fout[k][0]*fout[k][0] + fout[k][1]*fout[k][1]) * norm;
         }
         fftw_destroy_plan(plan);
         fftw_free(fin); fftw_free(fout);
     }
     sdr_retune(q->sdr, save_freq); sdr_flush(q->sdr);
-
-    /* ── QFT: FFTW on the full reassembled sequence ── */
-    fftw_complex *qin  = fftw_malloc(Q * sizeof(fftw_complex));
-    fftw_complex *qout = fftw_malloc(Q * sizeof(fftw_complex));
-    fftw_plan qft = fftw_plan_dft_1d(Q, qin, qout,
-                                     FFTW_FORWARD, FFTW_ESTIMATE);
-    for (int i = 0; i < Q; i++) { qin[i][0] = seq[i][0]; qin[i][1] = seq[i][1]; }
-    fftw_execute(qft);
-
-    double *qmag = calloc(Q, sizeof(double));
-    for (int i = 0; i < Q; i++)
-        qmag[i] = qout[i][0]*qout[i][0] + qout[i][1]*qout[i][1];
     qmag[0] = 0;
 
-    free(seq);
-    fftw_destroy_plan(qft);
-    fftw_free(qin); fftw_free(qout);
-
-    /* ── Extract the room's artifact peaks — candidate c values for
-       the QPE relation c/Q ≈ s/r. ── */
+    /* ── Extract the room's artifact peaks — these are fixed
+       by the channel, same for every base. ── */
     int n_peaks = 20;
     int top_k[20] = {0};
     double top_pwr[20] = {0};
@@ -4286,76 +4222,102 @@ static int op_shor(QvmCtx *q, double a1, double a2){
     for (int pk = 0; pk < n_peaks && top_k[pk] > 1; pk++)
         gmp_printf("  [SHOR]  peak %d: bin=%d pwr=%.6f\n", pk+1, top_k[pk], top_pwr[pk]);
 
-    /* ── Test the specified base `a` against every peak.  A candidate
-       period r is only trusted once a^r ≡ 1 (mod N) is verified. ── */
-    int cascade_factored = 0;
-    for (int pk = 0; pk < n_peaks && !cascade_factored; pk++) {
-        if (top_k[pk] <= 1) continue;
-        int best_k = top_k[pk];
-
-        /* Continued-fraction expansion of best_k / Q */
-        long ca = best_k, cb = Q;
-        long cf[64]; int ncf = 0;
-        while (cb && ncf < 64) { cf[ncf++] = ca / cb; long t = ca % cb; ca = cb; cb = t; }
-
-        long p2 = 1, q2 = 0, p1 = cf[0], q1 = 1;
-        for (int ii = 1; ii < ncf && !cascade_factored; ii++) {
-            long pp = cf[ii]*p1+p2, qq = cf[ii]*q1+q2;
-            p2 = p1; q2 = q1; p1 = pp; q1 = qq;
-            if (qq <= 1 || mpz_cmp_ui(gN, (unsigned long)qq) <= 0) continue;
-
-            /* Try the convergent denominator itself and small multiples
-               (true period can be a multiple of what QPE resolved to). */
-            for (int mult = 1; mult <= 4 && !cascade_factored; mult++) {
-                mpz_set_ui(gr, (unsigned long)qq);
-                mpz_mul_ui(gr, gr, (unsigned long)mult);
-                if (mpz_cmp_ui(gr, 2) < 0) continue;
-
-                /* Verify this candidate is actually a period before
-                   trusting it for the gcd step. */
-                mpz_powm(gtmp, ga, gr, gN);
-                if (mpz_cmp_ui(gtmp, 1) != 0) continue;
-                if (mpz_odd_p(gr)) {
-                    gmp_printf("  [SHOR]  a=%Zd: verified period r=%Zd is ODD "
-                               "(peak %d, bin %d) — unusable\n",
-                               ga, gr, pk+1, best_k);
-                    continue;
-                }
-
-                mpz_tdiv_q_ui(ghalf, gr, 2);
-                mpz_powm(ghalf, ga, ghalf, gN);
-
-                mpz_add_ui(gtmp, ghalf, 1);
-                mpz_gcd(ggcd, gtmp, gN);
-                if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-                    mpz_divexact(gtmp, gN, ggcd);
-                    gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-                    gmp_printf("         a=%Zd r=%Zd (verified, peak %d, bin %d)\n",
-                               ga, gr, pk+1, best_k);
-                    cascade_factored = 1;
-                    break;
-                }
-                mpz_sub_ui(gtmp, ghalf, 1);
-                if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
-                mpz_gcd(ggcd, gtmp, gN);
-                if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-                    mpz_divexact(gtmp, gN, ggcd);
-                    gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-                    gmp_printf("         a=%Zd r=%Zd (verified, peak %d, bin %d)\n",
-                               ga, gr, pk+1, best_k);
-                    cascade_factored = 1;
-                    break;
-                }
-                /* r verified but gcd was trivial both times — this a/r
-                   pair doesn't split N (happens when r/2 power ≡ -1).
-                   Keep looking at other peaks. */
+    /* ── Grind bases: for each a, CFE on the room's peaks.
+       One capture, many bases — µs per attempt. ── */
+    int attempt = 0;
+    while (1) {
+        if (attempt > 0) {
+            mpz_add_ui(ga, ga, 1);
+            mpz_mod(ga, ga, gN);
+            if (mpz_cmp_ui(ga, 2) < 0) mpz_set_ui(ga, 2);
+            mpz_gcd(ggcd, ga, gN);
+            if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                mpz_divexact(gtmp, gN, ggcd);
+                gmp_printf("  [SHOR] a=%Zd gcd=%Zd → %Zd = %Zd × %Zd\n",
+                           ga, ggcd, gN, ggcd, gtmp);
+                goto done;
+            }
+            while (mpz_cmp_ui(ggcd, 1) != 0 && mpz_cmp(ga, gN) < 0) {
+                mpz_add_ui(ga, ga, 1);
+                mpz_gcd(ggcd, ga, gN);
             }
         }
-    }
 
-    if (!cascade_factored)
-        gmp_printf("  [SHOR] a=%Zd: no peak yielded a verified, "
-                   "splitting period. Try a different a.\n", ga);
+        mpz_gcd(ggcd, ga, gN);
+        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+            mpz_divexact(gtmp, gN, ggcd);
+            gmp_printf("  [SHOR] a=%Zd gcd=%Zd → %Zd = %Zd × %Zd\n",
+                       ga, ggcd, gN, ggcd, gtmp);
+            goto done;
+        }
+
+        if (attempt % 100 == 0)
+            gmp_printf("  [SHOR] a=%Zd (%d attempted)...\n", ga, attempt);
+
+        int factored = 0;
+        for (int peak = 0; peak < n_peaks && !factored; peak++) {
+            if (top_k[peak] <= 1) continue;
+            int best_k = top_k[peak];
+
+            long a = best_k, b = Q;
+            long cf[64]; int ncf = 0;
+            while (b && ncf < 64) { cf[ncf++] = a / b; long t = a % b; a = b; b = t; }
+
+            long p2 = 1, q2 = 0, p1 = cf[0], q1 = 1;
+            for (int ii = 1; ii < ncf; ii++) {
+                long pp = cf[ii]*p1+p2, qq = cf[ii]*q1+q2;
+                p2 = p1; q2 = q1; p1 = pp; q1 = qq;
+                if (qq <= 1 || mpz_cmp_ui(gN, (unsigned long)qq) <= 0) continue;
+
+                int deltas[] = {0, 2, -2, 4, -4, 6, -6};
+                for (int d = 0; d < 7; d++) {
+                    mpz_set_ui(gr, (unsigned long)qq);
+                    if (deltas[d] >= 0) mpz_add_ui(gr, gr, deltas[d]);
+                    else mpz_sub_ui(gr, gr, -deltas[d]);
+                    if (mpz_cmp_ui(gr, 2) < 0) continue;
+                    if (deltas[d] == 0) {
+                        mpz_powm(gtmp, ga, gr, gN);
+                        if (mpz_cmp_ui(gtmp, 1) == 0)
+                            gmp_printf("  [SHOR]  a=%Zd: a^%Zd ≡ 1 (mod N) — period %s (bin %d)\n",
+                                       ga, gr,
+                                       mpz_odd_p(gr) ? "is ODD, unusable for factoring"
+                                                      : "CONFIRMED", best_k);
+                    }
+                    if (mpz_odd_p(gr)) continue;
+                    mpz_tdiv_q_ui(ghalf, gr, 2);
+                    mpz_powm(ghalf, ga, ghalf, gN);
+
+                    mpz_add_ui(gtmp, ghalf, 1);
+                    mpz_gcd(ggcd, gtmp, gN);
+                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                        mpz_divexact(gtmp, gN, ggcd);
+                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                        gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
+                                   ga, gr, peak+1, best_k, deltas[d]);
+                        factored = 1;
+                        goto done;
+                    }
+                    mpz_sub_ui(gtmp, ghalf, 1);
+                    if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
+                    mpz_gcd(ggcd, gtmp, gN);
+                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
+                        mpz_divexact(gtmp, gN, ggcd);
+                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
+                        gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
+                                   ga, gr, peak+1, best_k, deltas[d]);
+                        factored = 1;
+                        goto done;
+                    }
+                }
+            }
+        }
+        if (!factored) {
+            attempt++;
+            if (attempt % 100 == 0)
+                gmp_printf("  [SHOR] gcd trivial so far: %d bases checked, a=%Zd\n",
+                           attempt, ga);
+        }
+    }
 
 done:
     if (qmag) free(qmag);
