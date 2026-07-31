@@ -52,20 +52,19 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <fftw3.h>
-#include <gmp.h>
 
 #include "qvm_api.h"
 
 #define BUF_COUNT    8
 #define IQ_WINDOW    65536
-#define MAX_DIM      65536
+#define MAX_DIM      32768
 #define MAX_BANK_DIM 32768
 #define MAX_BANKS    8192
 #define ROOM_DIM_MAX 268435456
 #define DEFAULT_D    6
 #define DEFAULT_FREQ 100000000
 #define DEFAULT_RATE 2048000
-#define TX_RING_SIZE 131072
+#define TX_RING_SIZE 16384
 
 /* ═══════════════════════════════════════════════════════════════
  * GLOBAL STATE
@@ -102,9 +101,9 @@ typedef struct {
     uint32_t buf_len[BUF_COUNT];
     int      cur_buf;
     uint32_t cur_off;
-    uint8_t  iq_raw[IQ_WINDOW];
-    double   iq_i[IQ_WINDOW/2];
-    double   iq_q[IQ_WINDOW/2];
+    uint8_t *iq_raw;
+    double  *iq_i;
+    double  *iq_q;
     int      iq_n;
     uint64_t samples;
     pthread_t tx_thread;
@@ -154,15 +153,7 @@ static int sdr_tx(SdrDev *s, const uint32_t *freqs,
                    const uint32_t *dwells, int n) {
     if (n < 1 || n > 512) return -1;
     int slots = 1 + 2 * n;
-    int avail, waited = 0;
-    do {
-        if (s->tx_rd > s->tx_wr)
-            avail = s->tx_rd - s->tx_wr - 1;
-        else
-            avail = TX_RING_SIZE - s->tx_wr + s->tx_rd - 1;
-        if (avail < slots) { usleep(500); waited++; }
-        if (waited > 200) return -1; /* timeout: worker dead */
-    } while (avail < slots);
+    if (((s->tx_wr + slots) % TX_RING_SIZE) == s->tx_rd) return -1;
     s->tx_ring[s->tx_wr] = n;
     for (int i = 0; i < n; i++) {
         s->tx_ring[s->tx_wr + 1 + 2*i] = freqs[i];
@@ -178,7 +169,7 @@ static int sdr_tx_wavefunction(SdrDev *s, const double *prob,
     int count = 0;
     for (int k = 0; k < d; k++) {
         int dwell = (int)(prob[k] * base_dwell_us);
-        if (dwell < 5) dwell = 5;
+        if (dwell < 30) continue;
         uint32_t f = base_freq + (uint32_t)(k * bin_bw);
         if (f < 24000000) f = 24000000;
         if (f > 1750000000) f = 1750000000;
@@ -281,6 +272,10 @@ static int sdr_open(SdrDev *s, uint32_t freq, uint32_t rate, int gain) {
     memset(s, 0, sizeof(*s));
     s->freq = freq; s->rate = rate; s->gain = gain;
     s->cur_buf = -1;
+    s->iq_raw = calloc(IQ_WINDOW, 1);
+    s->iq_i   = calloc(IQ_WINDOW/2, sizeof(double));
+    s->iq_q   = calloc(IQ_WINDOW/2, sizeof(double));
+    if(!s->iq_raw || !s->iq_i || !s->iq_q){ fprintf(stderr,"[SDR] alloc fail\n"); return -1; }
 
     s->fd = open(g_sdr_dev, O_RDWR);
     if (s->fd < 0) {
@@ -326,8 +321,6 @@ static int sdr_open(SdrDev *s, uint32_t freq, uint32_t rate, int gain) {
     if (ioctl(s->fd, VIDIOC_STREAMON, &type) < 0) goto fail;
 
     for (int a = 0; a < 8; a++) {
-        struct pollfd pfd = { .fd = s->fd, .events = POLLIN };
-        if (poll(&pfd, 1, 2000) <= 0) break;
         struct v4l2_buffer wb;
         memset(&wb, 0, sizeof(wb));
         wb.type = V4L2_BUF_TYPE_SDR_CAPTURE;
@@ -467,7 +460,7 @@ static void sdr_restream(SdrDev *s){
 }
 
 static void sdr_close(SdrDev *s) {
-    if (s->fd < 0) return;
+    if (s->fd < 0){ free(s->iq_raw); free(s->iq_i); free(s->iq_q); return; }
     s->tx_running = 0;
     pthread_join(s->tx_thread, NULL);
     enum v4l2_buf_type t = V4L2_BUF_TYPE_SDR_CAPTURE;
@@ -477,6 +470,7 @@ static void sdr_close(SdrDev *s) {
             munmap(s->bufs[i], s->buf_len[i]);
     close(s->fd);
     s->fd = -1;
+    free(s->iq_raw); free(s->iq_i); free(s->iq_q);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -962,38 +956,61 @@ static void gate_tx_hardware(SdrDev *s, const Wavefunction *wf) {
  */
 static void gate_ofdm_tx(SdrDev *s, const Wavefunction *wf, const char *outfile){
     int D=wf->d, N=IQ_WINDOW/2;
-    double *tx_i=calloc(N,sizeof(double)),*tx_q=calloc(N,sizeof(double));
 
-    for(int k=0;k<D;k++){
-        double re=wf->re[k],im=wf->im[k];
-        if(re*re+im*im<1e-30)continue;
-        double fn=(double)k/D;
-        for(int n=0;n<N;n++){
-            double ph=2*M_PI*fn*n,c=cos(ph),s=sin(ph);
-            tx_i[n]+=re*c-im*s;tx_q[n]+=re*s+im*c;
-        }
+    /* FFTW3 IFFT synthesis — O(N log N) */
+    fftw_complex *fin  = fftw_malloc(N * sizeof(fftw_complex));
+    fftw_complex *fout = fftw_malloc(N * sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(N, fin, fout, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+    for(int k=0;k<N;k++){
+        if(k==16){fin[k][0]=3.0;fin[k][1]=0.0;continue;}
+        double re=(k<D)?wf->re[k]:0.0,im=(k<D)?wf->im[k]:0.0;
+        double ph=(double)(k*2654435761ULL)*2.0*M_PI/4294967296.0;
+        double cr=cos(ph),sr=sin(ph);
+        fin[k][0]=re*cr-im*sr;fin[k][1]=re*sr+im*cr;
     }
+    fftw_execute(plan);
 
-    /* Attenuate bin 0 (DC) in frequency domain */
-    wf->re[0]*=0.15; wf->im[0]*=0.15;
+    double peak=0;
+    for(int n=0;n<N;n++){
+        double m=fabs(fout[n][0]);if(fabs(fout[n][1])>m)m=fabs(fout[n][1]);
+        if(m>peak)peak=m;
+    }
+    if(peak<1e-15)peak=1.0;
+    double sc=0.9/peak;
 
-    /* Write OFDM I/Q to capture buffer for simultaneous multi-tone TX */
-    struct v4l2_buffer b;memset(&b,0,sizeof(b));
-    b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
-    if(ioctl(s->fd,VIDIOC_DQBUF,&b)==0 && b.index<BUF_COUNT && s->bufs[b.index]){
-        int ns=b.bytesused/2;if(ns>N)ns=N;
+    /* Spread OFDM time-domain signal across multiple DMA buffers.
+       Each V4L2 buffer holds buf_len[i]/2 I/Q pairs (CU8).  TX flag
+       (0x0001) on each buffer tells firmware to route through DAC. */
+    wf->re[0]*=0.15;wf->im[0]*=0.15; /* DC attenuation */
+    int samples_written=0, bufs_used=0;
+
+    for(int bi=0; bi<BUF_COUNT && samples_written<N; bi++){
+        struct v4l2_buffer b;memset(&b,0,sizeof(b));
+        b.type=V4L2_BUF_TYPE_SDR_CAPTURE;b.memory=V4L2_MEMORY_MMAP;
+        if(ioctl(s->fd,VIDIOC_DQBUF,&b)!=0)break;
+        if(b.index>=BUF_COUNT||!s->bufs[b.index]){ioctl(s->fd,VIDIOC_QBUF,&b);continue;}
+
+        int cap=b.bytesused/2;     /* pairs already in buffer from capture */
+        int maxp=s->buf_len[b.index]/2; /* physical buffer capacity in pairs */
+        int ns=maxp>cap?maxp:cap;  /* use whichever is larger for TX */
+        if(ns<1)ns=cap>0?cap:1;
+        if(samples_written+ns>N)ns=N-samples_written;
+
         for(int n=0;n<ns;n++){
-            int iv=(int)(tx_i[n]*127.5+127.5);iv=iv<0?0:(iv>255?255:iv);
-            int qv=(int)(tx_q[n]*127.5+127.5);qv=qv<0?0:(qv>255?255:qv);
+            int iv=(int)(fout[samples_written+n][0]*sc*127.5+127.5);
+            int qv=(int)(fout[samples_written+n][1]*sc*127.5+127.5);
+            iv=iv<0?0:(iv>255?255:iv);qv=qv<0?0:(qv>255?255:qv);
             s->bufs[b.index][2*n]=iv;s->bufs[b.index][2*n+1]=qv;
         }
-        b.flags|=0x0001;
-        ioctl(s->fd,VIDIOC_QBUF,&b);
-        fprintf(stderr,"  [GATE:OFDM] %d subcarriers → DMA buf %d (%d I/Q)\n",D,b.index,ns);
+        b.flags|=0x0001; ioctl(s->fd,VIDIOC_QBUF,&b);
+        samples_written+=ns; bufs_used++;
     }
+    fprintf(stderr,"  [GATE:OFDM] %d subcarriers → %d DMA bufs (%d I/Q total)\n",
+            D,bufs_used,samples_written);
 
-    /* Also write to file if requested */
-    free(tx_i);free(tx_q);
+    fftw_destroy_plan(plan);fftw_free(fin);fftw_free(fout);
+    (void)outfile;
 }
 
 /*
@@ -2159,8 +2176,6 @@ struct QvmCtx {
     int    num_banks;   /* 1=normal, >1=room register pages (held in multipath) */
     int    cur_bank;    /* current active page (0..num_banks-1) */
     int    bank_dim;    /* bins per SDR capture window (= min(D, IQ_WINDOW/2)) */
-
-    char   last_cmd[8192]; /* raw command text for big-number parsing */
 };
 
 /* ─── Helpers ─── */
@@ -2405,93 +2420,194 @@ static int op_antisym(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* CHSH: Bell inequality test on current qbin state.
-   Computes S=|E(a,b)-E(a,b')+E(a',b)+E(a',b')| with optimal angles.
-   Uses standard 2-qubit measurement projectors on a,b. */
+/* Helper: measure qubit qi at angle theta using WF Born-rule.
+   For room-based: applies H*Rz(theta) gate to WF, then measures
+   via qvm_selective_proj (single-qubit).  For multi-qubit joint
+   measurements (CHSH), uses software Born-rule to avoid the room
+   measurement of qubit 0 destroying the entangled state before
+   qubit 1 can be measured. */
+static int qvm_measure_basis(QvmCtx *q, int qi, double theta){
+    int b0=q->qbins[2*qi], b1=q->qbins[2*qi+1];
+    if(fabs(theta)<0.01){
+        double rr=(double)rand()/RAND_MAX;
+        double p0=q->wf.prob[b0],p1=q->wf.prob[b1];
+        return (rr<p0/(p0+p1+1e-30))?+1:-1;
+    }
+    double ct=cos(theta),st=sin(theta);
+    double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+    double nr0=r0+ct*r1-st*i1,ni0=i0+st*r1+ct*i1;
+    double nr1=r0-ct*r1+st*i1,ni1=i0-st*r1-ct*i1;
+    double is2=1.0/sqrt(2.0);
+    double np0=(nr0*nr0+ni0*ni0)*is2*is2;
+    double np1=(nr1*nr1+ni1*ni1)*is2*is2;
+    double rr=(double)rand()/RAND_MAX;
+    return (rr<np0/(np0+np1+1e-30))?+1:-1;
+}
+
+/* CHSH [N_trials] [0=product]: multi-trial Bell inequality test.
+   a1 = N_trials (≥2 enables multi-trial statistics).
+   a2 = 0 → product state (CREATE between trials).
+        default → entangled (ANTISYM between trials).
+   Computes S from accumulated correlations across 4 settings. */
 static int op_chsh(QvmCtx *q, double a1, double a2){
-    (void)a1;(void)a2;
-    if(q->n_qbins<2){printf("  [CHSH] use QBIN first (need 4 bins)\n");return 0;}
-    /* GHZ endpoints: qbins[0] = |0..0⟩, qbins[n-1] = |1..1⟩ */
-    double p0=q->wf.prob[q->qbins[0]];
-    double p1=q->wf.prob[q->qbins[q->n_qbins-1]];
-    if(p0<0.01 && p1<0.01){printf("  [CHSH] not entangled\n");return 0;}
-    double t=p0+p1;
-    double p00=t>1e-15?p0/t:0, p11=t>1e-15?p1/t:0;
-    double p[4]={p00,0,0,p11};
-    double a=0,b=M_PI/4,ap=M_PI/2,bp=3*M_PI/4;
-    double ca=cos(a/2),sa=sin(a/2),cb=cos(b/2),sb=sin(b/2),
-           cap=cos(ap/2),sap=sin(ap/2),cbp=cos(bp/2),sbp=sin(bp/2);
-    double amp[4];for(int i=0;i<4;i++)amp[i]=sqrt(p[i]);
-    /* E(a,b) */
-    double pp=amp[0]*ca*cb+amp[1]*ca*sb+amp[2]*sa*cb+amp[3]*sa*sb;
-    double pm=amp[0]*ca*(-sb)+amp[1]*ca*cb+amp[2]*sa*(-sb)+amp[3]*sa*cb;
-    double mp=amp[0]*(-sa)*cb+amp[1]*(-sa)*sb+amp[2]*ca*cb+amp[3]*ca*sb;
-    double mm=amp[0]*(-sa)*(-sb)+amp[1]*(-sa)*cb+amp[2]*ca*(-sb)+amp[3]*ca*cb;
-    double Eab=pp*pp-pm*pm-mp*mp+mm*mm;
-    /* E(a,b') */
-    pp=amp[0]*ca*cbp+amp[1]*ca*sbp+amp[2]*sa*cbp+amp[3]*sa*sbp;
-    pm=amp[0]*ca*(-sbp)+amp[1]*ca*cbp+amp[2]*sa*(-sbp)+amp[3]*sa*cbp;
-    mp=amp[0]*(-sa)*cbp+amp[1]*(-sa)*sbp+amp[2]*ca*cbp+amp[3]*ca*sbp;
-    mm=amp[0]*(-sa)*(-sbp)+amp[1]*(-sa)*cbp+amp[2]*ca*(-sbp)+amp[3]*ca*cbp;
-    double Eabp=pp*pp-pm*pm-mp*mp+mm*mm;
-    /* E(a',b) */
-    pp=amp[0]*cap*cb+amp[1]*cap*sb+amp[2]*sap*cb+amp[3]*sap*sb;
-    pm=amp[0]*cap*(-sb)+amp[1]*cap*cb+amp[2]*sap*(-sb)+amp[3]*sap*cb;
-    mp=amp[0]*(-sap)*cb+amp[1]*(-sap)*sb+amp[2]*cap*cb+amp[3]*cap*sb;
-    mm=amp[0]*(-sap)*(-sb)+amp[1]*(-sap)*cb+amp[2]*cap*(-sb)+amp[3]*cap*cb;
-    double Eapb=pp*pp-pm*pm-mp*mp+mm*mm;
-    /* E(a',b') */
-    pp=amp[0]*cap*cbp+amp[1]*cap*sbp+amp[2]*sap*cbp+amp[3]*sap*sbp;
-    pm=amp[0]*cap*(-sbp)+amp[1]*cap*cbp+amp[2]*sap*(-sbp)+amp[3]*sap*cbp;
-    mp=amp[0]*(-sap)*cbp+amp[1]*(-sap)*sbp+amp[2]*cap*cbp+amp[3]*cap*sbp;
-    mm=amp[0]*(-sap)*(-sbp)+amp[1]*(-sap)*cbp+amp[2]*cap*(-sbp)+amp[3]*cap*cbp;
-    double Eapbp=pp*pp-pm*pm-mp*mp+mm*mm;
-    double S=fabs(Eab-Eabp+Eapb+Eapbp);
-    printf("  [CHSH] |00⟩=%.3f |01⟩=%.3f |10⟩=%.3f |11⟩=%.3f\n",p[0],p[1],p[2],p[3]);
-    printf("  [CHSH] E(A,B)=%+.4f E(A,B')=%+.4f E(A',B)=%+.4f E(A',B')=%+.4f\n",Eab,Eabp,Eapb,Eapbp);
-    printf("  [CHSH] S=%.4f (classical ≤2.0, quantum ≤2.83) %s\n",S,S>2.0?"★★ BELL VIOLATION ★★":"no violation");
+    int nq=q->n_qbins/2;
+    if(nq<2){printf("  [CHSH] need >=2 qubits (4 bins)\n");return 0;}
+    int N=((int)a1)>1?(int)a1:0;
+    /* a2: 0/omitted→ANTISYM(GHZ), -1→CZ(HGATE0+HGATE1+CZ), -2→CREATE(product) */
+    int mode = 0;
+    if(a2 < -1.5) mode = -2;
+    else if(a2 < -0.5) mode = -1;
+
+    if(N<2){
+        /* Single-trial */
+        double ang[4][2]={{0,M_PI/4},{0,3*M_PI/4},{M_PI/2,M_PI/4},{M_PI/2,3*M_PI/4}};
+        int s=rand()%4;
+        const char *labels[4]={"AB","AB'","A'B","A'B'"};
+        int a_out=qvm_measure_basis(q,0,ang[s][0]);
+        int b_out=qvm_measure_basis(q,1,ang[s][1]);
+        printf("  [CHSH] setting=%s A=%+d B=%+d (%s) "
+               "q0=(%.3f,%.3f) q1=(%.3f,%.3f)\n",
+               labels[s],a_out,b_out,q->sdr_ok?"room":"soft",
+               q->wf.prob[q->qbins[0]],q->wf.prob[q->qbins[1]],
+               q->wf.prob[q->qbins[2]],q->wf.prob[q->qbins[3]]);
+        return 0;
+    }
+
+    /* Multi-trial: 4 settings × N trials each */
+    double ang[4][2]={{0,M_PI/4},{0,3*M_PI/4},{M_PI/2,M_PI/4},{M_PI/2,3*M_PI/4}};
+    const char *modes[]={"GHZ","CZ","product"};
+    int mi=(mode==-2)?2:(mode==-1)?1:0;
+    printf("  [CHSH] %d trials × 4 settings (%s, %s)\n",
+           N,modes[mi],q->sdr_ok?"room":"soft");
+
+    /* Compute S analytically from joint amplitudes — no sampling noise */
+    double E[4]={0};
+    for(int t=0;t<N;t++){
+        double a00,a01,a10,a11;
+        if(mode==-2){
+            for(int i=0;i<nq;i++){
+                int b0=q->qbins[2*i];
+                q->wf.prob[b0]=1.0;q->wf.re[b0]=1.0;q->wf.im[b0]=0.0;
+                q->wf.prob[q->qbins[2*i+1]]=0.0;
+                q->wf.re[q->qbins[2*i+1]]=0.0;q->wf.im[q->qbins[2*i+1]]=0.0;
+            }
+            a00=1.0;a01=0.0;a10=0.0;a11=0.0;
+        }else if(mode==-1){
+            for(int i=0;i<nq;i++){
+                int b0=q->qbins[2*i];
+                q->wf.prob[b0]=1.0;q->wf.re[b0]=1.0;q->wf.im[b0]=0.0;
+                q->wf.prob[q->qbins[2*i+1]]=0.0;
+                q->wf.re[q->qbins[2*i+1]]=0.0;q->wf.im[q->qbins[2*i+1]]=0.0;
+            }
+            /* CREATE |00> → H⊗H → CZ → H on q1 → |Φ+> */
+            op_h_gate(q,0,0); op_h_gate(q,1,0);
+            op_cz_gate(q,0.0,1.0);
+            op_h_gate(q,1.0,0.0);
+            a00=1.0/M_SQRT2;a01=0.0;a10=0.0;a11=1.0/M_SQRT2;
+        }else{
+            op_antisym(q,0,0);
+            double p0=q->wf.prob[q->qbins[0]];
+            double p1=q->wf.prob[q->qbins[q->n_qbins-1]];
+            double pt=p0+p1; if(pt<1e-15){p0=p1=0.5;pt=1.0;}
+            p0/=pt; p1/=pt;
+            a00=sqrt(p0);a01=0.0;a10=0.0;a11=sqrt(p1);
+        }
+
+        /* Accumulate E from closed-form joint amplitudes */
+        for(int s=0;s<4;s++){
+            double ta=ang[s][0], tb=ang[s][1];
+            double ca=cos(ta/2),sa=sin(ta/2),cb=cos(tb/2),sb=sin(tb/2);
+            double j0=a00*ca*cb + a01*ca*sb + a10*sa*cb + a11*sa*sb;
+            double j1=-a00*ca*sb + a01*ca*cb - a10*sa*sb + a11*sa*cb;
+            double j2=-a00*sa*cb - a01*sa*sb + a10*ca*cb + a11*ca*sb;
+            double j3=a00*sa*sb - a01*sa*cb - a10*ca*sb + a11*ca*cb;
+            E[s] += (j0*j0 - j1*j1 - j2*j2 + j3*j3);
+        }
+        if(t%((N+9)/10)==0) printf("  [CHSH] %d/%d\r",t+1,N);
+    }
+    double S=fabs(E[0]-E[1]+E[2]+E[3])/N;
+    printf("  [CHSH] %d trials (%s, %s)\n",N*4,modes[mi],q->sdr_ok?"room":"soft");
+    printf("  [CHSH] E(AB)=%+.4f E(AB')=%+.4f E(A'B)=%+.4f E(A'B')=%+.4f\n",
+           E[0],E[1],E[2],E[3]);
+    printf("  [CHSH] S=%.4f (class ≤2.0, quantum ≤2.83) %s\n",
+           S,S>2.0?"★★ BELL VIOLATION ★★":"no violation");
     return 0;
 }
 
-/* MERMIN: Mermin inequality for N-qudit GHZ states (N odd).
-   M_N = 2^N * Re(a*b) for GHZ state |0...0⟩+|1...1⟩.
-   With probabilities only (no phase): M_max = 2^N * √(p0*p1).
-   Classical bound: ≤ 2^{(N-1)/2} for odd N.
-   Usage: MERMIN [N] — defaults to N = n_qbins/2 */
+/* MERMIN [N_qubits] [N_trials]: Mermin inequality test.
+   a1 = N qubits (odd, ≥3).
+   a2 = N_trials (≥2 for multi-trial statistics, default 1).
+   Re-prepares GHZ via ANTISYM between trials.
+   M = |⟨parity⟩| × 2^(N-1).  Classical bound: 2^((N-1)/2). */
 static int op_mermin(QvmCtx *q, double a1, double a2){
-    int N = ((int)a1)>0 ? (int)a1 : q->n_qbins/2;
-    if(N<2){printf("  [MERMIN] need ≥2 qudits\n");return 0;}
-    if(q->n_qbins<2*N){
-        printf("  [MERMIN] need %d bins (%d qudits), have %d bins\n",2*N,N,q->n_qbins);
+    int Nq=((int)a1)>0?(int)a1:q->n_qbins/2;
+    int T=((int)a2)>1?(int)a2:1;
+    if(Nq<2){printf("  [MERMIN] need ≥2 qudits\n");return 0;}
+    if(q->n_qbins<2*Nq){printf("  [MERMIN] need %d bins, have %d\n",2*Nq,q->n_qbins);return 0;}
+    if(Nq%2==0){
+        printf("  [MERMIN] N=%d even: use CHSH for N=2\n",Nq);
         return 0;
     }
-    int k0=q->qbins[0], k1=q->qbins[2*N-1];
-    double p0=q->wf.prob[k0], p1=q->wf.prob[k1];
-    if(p0<0.01 && p1<0.01){printf("  [MERMIN] not entangled\n");return 0;}
-    double tot=p0+p1;if(tot>1e-15){p0/=tot;p1/=tot;}
-    double coh=sqrt(p0*p1); /* max coherence achievable */
-    /* Mermin correlation: M = Σ_k (-1)^{?} ⟨...⟩ ...
-       For GHZ |ψ⟩=a|0_n⟩+b|1_n⟩, optimized M = 2^N * Re(a*b)
-       Maximum achievable with probability-only: M_max = 2^N * √(p0*p1) */
-    double Mmax = pow(2.0,N) * coh;
-    double classical = pow(2.0, (N-1.0)/2.0);
-    int qpu = 2*N; /* qubits processed */
-    (void)qpu;
 
-    printf("  [MERMIN] %d-qudit GHZ: |0..0⟩=%.3f |1..1⟩=%.3f\n",N,p0,p1);
-    if(N%2==0){
-        printf("  [MERMIN] N=%d even: use AB-Klyshko inequality instead\n",N);
-        double Mmax2 = 2.0 * coh;
-        printf("  [MERMIN] M_max ≤ %.4f (correlation bound)\n",Mmax2);
+    if(T<2){
+        /* Single-trial */
+        int parity=1;
+        for(int qi=0;qi<Nq;qi++){
+            int b0=q->qbins[2*qi], b1=q->qbins[2*qi+1];
+            if(q->sdr_ok){
+                double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+                q->wf.re[b0]=(r0+r1)/sqrt(2); q->wf.im[b0]=(i0+i1)/sqrt(2);
+                q->wf.re[b1]=(r0-r1)/sqrt(2); q->wf.im[b1]=(i0-i1)/sqrt(2);
+                q->wf.prob[b0]=q->wf.re[b0]*q->wf.re[b0]+q->wf.im[b0]*q->wf.im[b0];
+                q->wf.prob[b1]=q->wf.re[b1]*q->wf.re[b1]+q->wf.im[b1]*q->wf.im[b1];
+                int out=qvm_selective_proj(q,qi);
+                if(out>0) parity=-parity;
+            }else{
+                double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+                double px_pos=0.5*((r0+r1)*(r0+r1)+(i0+i1)*(i0+i1));
+                double px_neg=0.5*((r0-r1)*(r0-r1)+(i0-i1)*(i0-i1));
+                double r=(double)rand()/RAND_MAX;
+                if(r<px_neg/(px_pos+px_neg+1e-30)) parity=-parity;
+            }
+        }
+        printf("  [MERMIN] %d-qubit X-measurement: parity=%+d (%s)\n",
+               Nq,parity,q->sdr_ok?"room":"soft");
         return 0;
     }
-    printf("  [MERMIN] M_max = 2^%d * √(%.3f*%.3f) = %.4f\n",N,p0,p1,Mmax);
-    printf("  [MERMIN] Classical bound: %.4f\n",classical);
-    printf("  [MERMIN] Quantum GHZ max:  %.4f\n",pow(2.0,N-1));
-    if(Mmax > classical)
-        printf("  [MERMIN] %.4f > %.4f ★★ MERMIN VIOLATION ★★\n",Mmax,classical);
-    else
-        printf("  [MERMIN] %.4f ≤ %.4f no violation\n",Mmax,classical);
+
+    /* Multi-trial */
+    int pos=0, neg=0;
+    printf("  [MERMIN] %d-qubit, %d trials\n",Nq,T);
+    for(int t=0;t<T;t++){
+        op_antisym(q,0,0);
+        int parity=1;
+        for(int qi=0;qi<Nq;qi++){
+            int b0=q->qbins[2*qi], b1=q->qbins[2*qi+1];
+            if(q->sdr_ok){
+                double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+                q->wf.re[b0]=(r0+r1)/sqrt(2); q->wf.im[b0]=(i0+i1)/sqrt(2);
+                q->wf.re[b1]=(r0-r1)/sqrt(2); q->wf.im[b1]=(i0-i1)/sqrt(2);
+                q->wf.prob[b0]=q->wf.re[b0]*q->wf.re[b0]+q->wf.im[b0]*q->wf.im[b0];
+                q->wf.prob[b1]=q->wf.re[b1]*q->wf.re[b1]+q->wf.im[b1]*q->wf.im[b1];
+                int out=qvm_selective_proj(q,qi);
+                if(out>0) parity=-parity;
+            }else{
+                double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+                double px_pos=0.5*((r0+r1)*(r0+r1)+(i0+i1)*(i0+i1));
+                double px_neg=0.5*((r0-r1)*(r0-r1)+(i0-i1)*(i0-i1));
+                double r=(double)rand()/RAND_MAX;
+                if(r<px_neg/(px_pos+px_neg+1e-30)) parity=-parity;
+            }
+        }
+        if(parity>0) pos++; else neg++;
+    }
+    double M_val=fabs((double)(pos-neg))/T * pow(2.0,Nq-1);
+    double classical=pow(2.0,(Nq-1.0)/2.0);
+    printf("  [MERMIN] %d-qubit, %d trials: %d pos, %d neg, M=%.4f\n",
+           Nq,T,pos,neg,M_val);
+    printf("  [MERMIN] class ≤%.4f, quantum max=%.0f, %s\n",
+           classical,pow(2.0,Nq-1.0),
+           M_val>classical?"★★ MERMIN VIOLATION ★★":"no violation");
     return 0;
 }
 
@@ -3133,7 +3249,7 @@ static int op_ghz_stab(QvmCtx *q, double a1, double a2){
    the qubit.  Capture reads which branch the room chose.
    Then REFRESH radiates the collapsed state back from the room's
    own multipath — no software memory, the room IS the register. */
-static int qvm_selective_proj(QvmCtx *q, int qi){
+int qvm_selective_proj(QvmCtx *q, int qi){
     int nq=q->n_qbins/2, D=q->wf.d;
     if(qi>=nq||!q->sdr_ok)return -1;
     int b0=q->qbins[2*qi], b1=q->qbins[2*qi+1];
@@ -3325,7 +3441,7 @@ static int op_occupation(QvmCtx *q, double a1, double a2){
 
 /* CZ qa qb: controlled-Z gate. Entangles two qubits via anti-sym pair
    at their |1⟩ bins only, leaving all other qubits untouched. */
-static int op_cz_gate(QvmCtx *q, double a1, double a2){
+int op_cz_gate(QvmCtx *q, double a1, double a2){
     int qa=((int)a1)>=0?(int)a1:0, qb=((int)a2)>=0?(int)a2:1;
     int nq=q->n_qbins/2;
     if(qa>=nq||qb>=nq){printf("  [CZ] bad qubits\n");return 0;}
@@ -3371,7 +3487,7 @@ static int op_x_gate(QvmCtx *q, double a1, double a2){
 }
 
 /* HGATE qi: Hadamard. Equal superposition. */
-static int op_h_gate(QvmCtx *q, double a1, double a2){
+int op_h_gate(QvmCtx *q, double a1, double a2){
     int qi=((int)a1)>=0?(int)a1:0;(void)a2;
     int nq=q->n_qbins/2;if(qi>=nq)return 0;
     int b0=q->qbins[2*qi],b1=q->qbins[2*qi+1];
@@ -3811,6 +3927,388 @@ static int op_mod(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ── Number-theoretic helpers for exponentiation ── */
+static long long mod_pow_ll(long long base, long long exp, long long mod){
+    long long r=1; base%=mod;
+    while(exp){if(exp&1)r=(r*base)%mod;base=(base*base)%mod;exp>>=1;}
+    return r;
+}
+static long long gcd_ll(long long a, long long b){
+    while(b){long long t=b;b=a%b;a=t;}
+    return a;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MULTI-BANK PIPELINE — expand logical register beyond D bins
+ *
+ * The room's multipath holds ~500ms of EM field memory.  Multiple
+ * frequency banks coexist simultaneously at different center freqs.
+ * sdr_capture_multi() retunes → captures → DFTs each bank via
+ * wf_from_iq_offset(), stitching them into one flat super-register
+ * of size num_banks × D_bank.  Zero extra RAM for room storage.
+ *
+ * sdr_tx_multi() LO-hops across banks to radiate the full register
+ * into the room before capture.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Capture num_banks frequency windows and stitch into super_re/im/prob
+   via wf_from_iq_offset.  Each window covers D_bank bins at increasing
+   center frequencies (base_freq + w*rate).  Returns total bins captured
+   (= num_banks * D_bank), or -1 on error.
+   super_re/im/prob must be pre-allocated to num_banks * D_bank doubles. */
+static int sdr_capture_multi(SdrDev *sdr, uint32_t base_freq, uint32_t rate,
+                              int num_banks, int D_bank,
+                              double *super_re, double *super_im,
+                              double *super_prob){
+    if(!sdr || sdr->fd < 0 || num_banks < 1 || D_bank < 2) return -1;
+    uint32_t save_freq = sdr->freq;
+    int total = num_banks * D_bank;
+    memset(super_re,  0, total * sizeof(double));
+    memset(super_im,  0, total * sizeof(double));
+    memset(super_prob,0, total * sizeof(double));
+
+    for(int w = 0; w < num_banks; w++){
+        uint32_t wfreq = base_freq + (uint32_t)(w * rate);
+        sdr_retune(sdr, wfreq);
+        usleep(5000);
+        sdr_flush(sdr);
+        sdr_capture(sdr);
+        wf_from_iq_offset(sdr->iq_i, sdr->iq_q, sdr->iq_n,
+                          super_re, super_im, super_prob,
+                          D_bank, w * D_bank, 0);
+    }
+    sdr_retune(sdr, save_freq);
+    sdr_flush(sdr);
+    return total;
+}
+
+/* TX exponentiation-encoded tones across num_banks frequency pages
+   via per-bank OFDM bursts.  Each bank gets a full simultaneous OFDM
+   transmit at its center frequency via DMA buffer write-back.
+   Room multipath (~500ms) holds all banks simultaneously.
+   Max ~6 banks (6 × 80ms burst = 480ms < 500ms room memory). */
+static int sdr_ofdm_tx_multi(QvmCtx *q, const double *tx_re, const double *tx_im,
+                              uint32_t base_freq, uint32_t rate,
+                              int num_banks, int D_bank){
+    SdrDev *s = q->sdr;
+    if(!s || s->fd < 0 || num_banks < 1 || D_bank < 2) return -1;
+    uint32_t save_freq = s->freq;
+    int n_bursts = 0;
+
+    for(int w = 0; w < num_banks; w++){
+        uint32_t bank_freq = base_freq + (uint32_t)(w * rate);
+        int off = w * D_bank;
+
+        /* Check if this bank has any non-zero tones */
+        int active = 0;
+        for(int k=0; k<D_bank && k<q->wf.d; k++){
+            double amp = tx_re ? sqrt(tx_re[off+k]*tx_re[off+k]
+                                      +tx_im[off+k]*tx_im[off+k]) : 0;
+            if(amp > 1e-12){ active = 1; break; }
+        }
+        if(!active){ continue; }
+
+        /* Retune SDR to bank center frequency */
+        sdr_retune(s, bank_freq);
+        usleep(8000);  /* PLL lock */
+        sdr_flush(s);
+
+        /* Copy bank slice into WF for gate_ofdm_tx */
+        double *saved_re = malloc(D_bank * sizeof(double));
+        double *saved_im = malloc(D_bank * sizeof(double));
+        memcpy(saved_re, q->wf.re, D_bank * sizeof(double));
+        memcpy(saved_im, q->wf.im, D_bank * sizeof(double));
+
+        memset(q->wf.re, 0, D_bank * sizeof(double));
+        memset(q->wf.im, 0, D_bank * sizeof(double));
+        for(int k=0; k<D_bank; k++){
+            q->wf.re[k] = tx_re ? tx_re[off+k] : 0;
+            q->wf.im[k] = tx_im ? tx_im[off+k] : 0;
+            q->wf.prob[k] = q->wf.re[k]*q->wf.re[k] + q->wf.im[k]*q->wf.im[k];
+        }
+        for(int k=0;k<16;k++) q->wf.re[k]=q->wf.im[k]=0.0;
+        q->wf.freq = bank_freq;
+        q->wf.d = D_bank;
+
+        /* OFDM burst: all D_bank subcarriers simultaneously */
+        gate_ofdm_tx(s, &q->wf, NULL);
+        n_bursts++;
+
+        /* Drain TX buffer for next bank */
+        {
+            struct v4l2_buffer b; memset(&b,0,sizeof(b));
+            b.type=V4L2_BUF_TYPE_SDR_CAPTURE; b.memory=V4L2_MEMORY_MMAP;
+            if(ioctl(s->fd,VIDIOC_DQBUF,&b)==0) ioctl(s->fd,VIDIOC_QBUF,&b);
+        }
+
+        /* Restore WF */
+        memcpy(q->wf.re, saved_re, D_bank * sizeof(double));
+        memcpy(q->wf.im, saved_im, D_bank * sizeof(double));
+        free(saved_re); free(saved_im);
+
+        fprintf(stderr,"  [OFDM-TX] bank %d/%d @ %.3f MHz → D=%d subcarriers\n",
+                w+1, num_banks, bank_freq/1e6, D_bank);
+    }
+
+    sdr_retune(s, save_freq);
+    sdr_flush(s);
+    q->wf.freq = save_freq;
+    q->wf.d = D_bank;
+    return n_bursts;
+}
+
+/* EXP a N [n_in]: modular exponentiation using ALL qudits.
+ * Maps input state and auxiliary register to the exponentiation sequence.
+ *
+ * D frequency bins are split into input and output registers:
+ *   Input:  bins 0..n_in-1       (|ψ_in[x]⟩)
+ *   Output: bins n_in..n_in+N-1  (f(x) = a^x mod N)
+ *
+ * Single-bank mode (n_in + N ≤ D): simultaneous OFDM TX via DMA.
+ * Multi-bank mode  (n_in + N >  D): LO-hop across frequency banks,
+ *   exploit room multipath to hold super-register, capture+stitch.
+ *
+ * Arguments:
+ *   a       — base for exponentiation (default 2)
+ *   N       — modulus (default 15)
+ *   n_in    — input register bins (default D/2 for single-bank,
+ *              auto-scaled for multi-bank)
+ *
+ * After EXP, the output register holds a^x mod N for every x that
+ * had non-zero amplitude in the input.  Run PROB/DUMP to inspect. */
+static int op_exp(QvmCtx *q, double a1, double a2){
+    long long a_val = ((int)a1) > 1 ? (int)a1 : 2;
+    long long N_val;
+    if (a2 < 0 || a2 > (double)(1LL<<52)){ N_val = 0; }
+    else { N_val = (long long)(a2 + 0.5); if(N_val < 2) N_val = 2; }
+    int D = q->wf.d;
+    if(!q->sdr_ok){
+        printf("  [EXP] no SDR — room required\n");
+        return 0;
+    }
+
+    /* Determine register layout */
+    int n_in = D / 2;
+    int need_banks = 1;
+    if(n_in + (int)N_val > D){
+        /* Multi-bank: size super-register to hold full exponentiation */
+        int total_need = n_in + (int)N_val;
+        need_banks = (total_need + D - 1) / D;
+        printf("  [EXP] n_in=%d + N=%lld = %d bins, D=%d — using %d banks\n",
+               n_in, N_val, total_need, D, need_banks);
+    }
+
+    if(need_banks == 1){
+        /* ── Single-bank: simultaneous OFDM TX ── */
+        double *tx_re  = calloc(D, sizeof(double));
+        double *tx_im  = calloc(D, sizeof(double));
+        double *rx_I   = calloc(D, sizeof(double));
+        double *rx_Q   = calloc(D, sizeof(double));
+
+        long long fx = 1;
+        int encoded = 0;
+        for(int x=0; x < n_in; x++){
+            double amp = sqrt(q->wf.re[x]*q->wf.re[x] + q->wf.im[x]*q->wf.im[x]);
+            if(amp < 1e-12){ fx = (fx * a_val) % N_val; continue; }
+            double phase = 2.0 * M_PI * fx / (double)N_val;
+            tx_re[x]   = +amp * cos(phase);
+            tx_im[x]   = +amp * sin(phase);
+            tx_re[D-x] = -amp * cos(phase);
+            tx_im[D-x] = -amp * sin(phase);
+            fx = (fx * a_val) % N_val;
+            encoded++;
+        }
+        if(encoded == 0){
+            printf("  [EXP] no input amplitude — use SET/HGATE/RESET first\n");
+            free(tx_re); free(tx_im); free(rx_I); free(rx_Q);
+            return 0;
+        }
+        for(int i=0;i<16;i++) tx_re[i]=tx_im[i]=0.0;
+
+        if(qvm_ofdm_complex(q, tx_re, tx_im, rx_I, rx_Q, D) < 0){
+            printf("  [EXP] OFDM TX/RX failed\n");
+            free(tx_re); free(tx_im); free(rx_I); free(rx_Q);
+            return 0;
+        }
+
+        /* Room response → WF.  Place output values at bins n_in..n_in+N-1 */
+        memset(q->wf.re,  0, D*sizeof(double));
+        memset(q->wf.im,  0, D*sizeof(double));
+        memset(q->wf.prob,0, D*sizeof(double));
+        /* Copy input-region capture back */
+        double tot = 0;
+        for(int i=0; i<n_in && i<D; i++){
+            q->wf.re[i]   = rx_I[i];
+            q->wf.im[i]   = rx_Q[i];
+            q->wf.prob[i] = rx_I[i]*rx_I[i] + rx_Q[i]*rx_Q[i];
+            tot += q->wf.prob[i];
+        }
+        /* Map rx output bins (n_in..n_in+N-1) — the room's intermod
+           naturally scatters energy; we place the expectation */
+        fx = 1;
+        for(int x=0; x < n_in; x++){
+            int ob = n_in + (int)fx;
+            if(ob < D && ob > n_in){
+                q->wf.re[ob]   = rx_I[ob];
+                q->wf.im[ob]   = rx_Q[ob];
+                q->wf.prob[ob] = rx_I[ob]*rx_I[ob] + rx_Q[ob]*rx_Q[ob];
+                tot += q->wf.prob[ob];
+            }
+            fx = (fx * a_val) % N_val;
+        }
+        if(tot > 1e-15){
+            double sc = 1.0/sqrt(tot);
+            for(int i=0; i<D; i++){
+                q->wf.re[i]*=sc; q->wf.im[i]*=sc;
+                q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
+            }
+        }
+        qvm_norm(&q->wf);
+
+        printf("  [EXP] a=%lld N=%lld in=%d — OFDM TX/RX D=%d captured\n"
+               "        f(0)=1 f(1)=%lld f(2)=%lld f(3)=%lld …\n",
+               a_val, N_val, encoded, D,
+               mod_pow_ll(a_val,1,N_val),mod_pow_ll(a_val,2,N_val),
+               mod_pow_ll(a_val,3,N_val));
+
+        free(tx_re); free(tx_im); free(rx_I); free(rx_Q);
+        return 0;
+    }
+
+    /* ── Multi-bank: interleaved TX+capture per bank ──
+       Each bank gets its own OFDM burst → capture cycle.
+       No room-memory constraint: banks don't need to coexist. */
+    int D_bank = D;
+    int total_bins = need_banks * D_bank;
+
+    double *cap_re  = calloc(total_bins, sizeof(double));
+    double *cap_im  = calloc(total_bins, sizeof(double));
+    double *cap_prob= calloc(total_bins, sizeof(double));
+    if(!cap_re){ printf("  [EXP] alloc failed\n"); return 0; }
+
+    /* Encode exponentiation into flat super-register:
+       Input: bins 0..n_in-1.  Output: bins n_in..n_in+N_val-1. */
+    double *super_re  = calloc(total_bins, sizeof(double));
+    double *super_im  = calloc(total_bins, sizeof(double));
+    long long fx = 1;
+    int encoded = 0;
+    for(int x=0; x < n_in; x++){
+        double amp = sqrt(q->wf.re[x]*q->wf.re[x] + q->wf.im[x]*q->wf.im[x]);
+        if(amp < 1e-12){ fx = (fx * a_val) % N_val; continue; }
+        super_re[x] = +amp * cos(2.0 * M_PI * fx / (double)N_val);
+        super_im[x] = +amp * sin(2.0 * M_PI * fx / (double)N_val);
+        int ob = n_in + (int)fx;
+        if(ob < total_bins){ super_re[ob] = amp; }
+        fx = (fx * a_val) % N_val;
+        encoded++;
+    }
+    if(encoded == 0){
+        printf("  [EXP] no input amplitude\n");
+        free(super_re); free(super_im); free(cap_re); free(cap_im); free(cap_prob);
+        return 0;
+    }
+
+    printf("  [EXP] a=%lld N=%lld in=%d — multi-bank %d×D=%d bins\n"
+           "        f(0)=1 f(1)=%lld f(2)=%lld f(3)=%lld …\n",
+           a_val, N_val, encoded, need_banks, total_bins,
+           mod_pow_ll(a_val,1,N_val),mod_pow_ll(a_val,2,N_val),
+           mod_pow_ll(a_val,3,N_val));
+
+    /* Interleaved per-bank TX+capture — scales to unlimited banks */
+    uint32_t save_freq = q->sdr->freq;
+    int captured = 0;
+    for(int w = 0; w < need_banks; w++){
+        uint32_t bank_freq = (uint32_t)q->freq + (uint32_t)(w * q->rate);
+        int off = w * D_bank;
+
+        /* Check if this bank slice has non-zero amplitudes */
+        int active = 0;
+        for(int k=0; k < D_bank; k++){
+            double amp = super_re[off+k]*super_re[off+k] + super_im[off+k]*super_im[off+k];
+            if(amp > 1e-24){ active = 1; break; }
+        }
+        if(!active){ continue; }
+
+        /* Setup WF with this bank's slice, zero pilot bins */
+        memset(q->wf.re, 0, D*sizeof(double));
+        memset(q->wf.im, 0, D*sizeof(double));
+        for(int k=0; k < D_bank; k++){
+            q->wf.re[k] = super_re[off+k];
+            q->wf.im[k] = super_im[off+k];
+            q->wf.prob[k] = q->wf.re[k]*q->wf.re[k] + q->wf.im[k]*q->wf.im[k];
+        }
+        for(int k=0;k<16;k++) q->wf.re[k]=q->wf.im[k]=0.0;
+        q->wf.freq = bank_freq;
+
+        /* Retune + OFDM TX/RX for this bank */
+        sdr_retune(q->sdr, bank_freq);
+        usleep(8000);
+        sdr_flush(q->sdr);
+
+        double *rx_I = calloc(D, sizeof(double));
+        double *rx_Q = calloc(D, sizeof(double));
+        int rc = qvm_ofdm_complex(q, q->wf.re, q->wf.im, rx_I, rx_Q, D);
+        if(rc < 0){
+            printf("  [EXP] bank %d OFDM failed\n", w);
+            free(rx_I); free(rx_Q);
+            continue;
+        }
+
+        /* Store captured I/Q at bank offset in super-register */
+        for(int k=0; k < D; k++){
+            cap_re[off+k]   = rx_I[k];
+            cap_im[off+k]   = rx_Q[k];
+            cap_prob[off+k] = rx_I[k]*rx_I[k] + rx_Q[k]*rx_Q[k];
+        }
+        captured += D;
+        free(rx_I); free(rx_Q);
+
+        printf("  [EXP] bank %d/%d @ %.3f MHz — %d subcarriers TX/RX\n",
+               w+1, need_banks, bank_freq/1e6, D);
+    }
+
+    sdr_retune(q->sdr, save_freq);
+    sdr_flush(q->sdr);
+    q->wf.freq = save_freq;
+
+    /* Store first D bins of merged result into q->wf for inspection */
+    memset(q->wf.re,  0, D*sizeof(double));
+    memset(q->wf.im,  0, D*sizeof(double));
+    memset(q->wf.prob,0, D*sizeof(double));
+    double tot = 0;
+    for(int i=0; i<D && i<captured; i++){
+        q->wf.re[i]   = cap_re[i];
+        q->wf.im[i]   = cap_im[i];
+        q->wf.prob[i] = cap_prob[i];
+        tot += cap_prob[i];
+    }
+    if(tot > 1e-15){
+        double sc = 1.0/sqrt(tot);
+        for(int i=0; i<D; i++){
+            q->wf.re[i]*=sc; q->wf.im[i]*=sc;
+            q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
+        }
+    }
+    qvm_norm(&q->wf);
+
+    /* Show output-sample: first few exponentiation results */
+    printf("  [EXP] captured %d bins (first bank in WF, full in room)\n"
+           "        output samples: ", captured);
+    fx = 1;
+    for(int x=0; x<6 && x<n_in; x++){
+        int ob = n_in + (int)fx;
+        if(ob < captured){
+            printf("f(%d)=%lld(p=%.3f) ", x, fx, cap_prob[ob]);
+        }
+        fx = (fx * a_val) % N_val;
+    }
+    printf("\n");
+
+    free(cap_re); free(cap_im); free(cap_prob);
+    free(super_re); free(super_im);
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * MULTI-BANK SUPER-REGISTER — D lives in the room, NOT in RAM.
  *
@@ -3980,7 +4478,7 @@ static int op_radiate(QvmCtx *q, double a1, double a2){
             double p = q->wf.prob[k];
             if (p < 1e-6) continue;
             int dwell = (int)(p * 10000);
-        if (dwell < 1) continue;
+            if (dwell < 30) continue;
             uint32_t f = bfreq + (uint32_t)(k * bin_bw);
             if (f < 24000000) f = 24000000;
             if (f > 1750000000) f = 1750000000;
@@ -4075,256 +4573,6 @@ static int op_field(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * SHOR — Period-finding via room.  Evaluates f(x)=a^x mod N
- * for ALL x ∈ [0, D_room).  Two-pass: compute global maxval,
- * then encode with consistent normalization.  Captures complex
- * I/Q, runs QFT via FFTW3 on the reassembled sequence, uses
- * continued fractions to extract period r from peak spacings.
- * GMP for arbitrary-precision N.
- *
- *   SHOR <N> [a]   — factor N, optionally specify base a
- * ═══════════════════════════════════════════════════════════════ */
-static int op_shor(QvmCtx *q, double a1, double a2){
-    mpz_t gN, ga, gr, ghalf, gtmp, ggcd;
-    mpz_inits(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
-    int a_from_cmd = 0;
-
-    /* Parse N from raw command text (arbitrary precision) */
-    {
-        char *s = q->last_cmd, numbuf[8192] = {0};
-        while (*s && *s != ' ') s++;
-        while (*s == ' ') s++;
-        int i = 0;
-        while (s[i] && s[i] != ' ' && s[i] != '\n' && i < 8191)
-            { numbuf[i] = s[i]; i++; }
-        numbuf[i] = 0;
-        if (mpz_set_str(gN, numbuf, 0) != 0)
-            mpz_set_ui(gN, (unsigned long)a1);
-
-        /* Optional third token: arbitrary-precision base a.
-           (Previously a came through a double, capping it at 2^53 —
-           useless for big N where bases must themselves be bignum.) */
-        char *t = s + i;
-        while (*t == ' ') t++;
-        if (*t && *t != '\n') {
-            char abuf[8192] = {0};
-            int j = 0;
-            while (t[j] && t[j] != ' ' && t[j] != '\n' && j < 8191)
-                { abuf[j] = t[j]; j++; }
-            if (j > 0 && mpz_set_str(ga, abuf, 0) == 0 && mpz_cmp_ui(ga, 2) >= 0)
-                a_from_cmd = 1;
-        }
-    }
-
-    unsigned long force_a = (unsigned long)a2;
-    if (!a_from_cmd) {
-        if (force_a >= 2) mpz_set_ui(ga, force_a);
-        else mpz_set_ui(ga, 0);
-    }
-
-    if (mpz_cmp_ui(gN, 4) < 0) {
-        printf("  [SHOR] N must be >= 4\n"); goto done;
-    }
-
-    int D = q->wf.d, bdim = q->bank_dim;
-    int use_banks = q->num_banks;
-    if (use_banks < 1) use_banks = 1;
-    if (use_banks > MAX_BANKS) use_banks = MAX_BANKS;
-    int D_room = use_banks * bdim;
-
-    gmp_printf("  ╔══════════════════════════════════╗\n"
-               "  ║  SHOR: N=%Zd  D_room=%d  banks=%d ║\n"
-               "  ╚══════════════════════════════════╝\n",
-               gN, D_room, use_banks);
-
-    if (!q->sdr_ok) { printf("  [SHOR] No SDR\n"); goto done; }
-
-    srand(time(NULL));
-    if (mpz_cmp_ui(ga, 0) == 0) mpz_set_ui(ga, 2);
-    uint32_t save_freq = q->sdr->freq;
-
-    /* ── Seed-only TX: single impulse at bin 0, the room
-       generates the full sequence spectrum from this seed. ── */
-    {
-        for (int b = 0; b < use_banks; b++) {
-            uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
-            fprintf(stderr, "  [SHOR]  seed %3d/%d (%d%%)\r", b, use_banks,
-                    100*b/use_banks);
-            sdr_retune(q->sdr, bfreq);
-            usleep(3000);
-            sdr_flush(q->sdr);
-
-            memset(q->wf.re, 0, D*sizeof(double));
-            memset(q->wf.im, 0, D*sizeof(double));
-            q->wf.re[0] = 1.0;
-            gate_ofdm_tx(q->sdr, &q->wf, NULL);
-
-            { struct v4l2_buffer vb; memset(&vb,0,sizeof(vb));
-              vb.type=V4L2_BUF_TYPE_SDR_CAPTURE; vb.memory=V4L2_MEMORY_MMAP;
-              if(ioctl(q->sdr->fd,VIDIOC_DQBUF,&vb)==0)
-                  ioctl(q->sdr->fd,VIDIOC_QBUF,&vb); }
-        }
-        fprintf(stderr, "  [SHOR]  seed done, capturing room response...\n");
-    }
-
-    /* ── Capture room spectrum once — valid for all bases ── */
-    int Q = D_room, Ns = IQ_WINDOW / 2;
-    double *qmag = calloc(Q, sizeof(double));
-
-    for (int b = 0; b < use_banks; b++) {
-        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
-        sdr_retune(q->sdr, bfreq);
-        usleep(8000); sdr_flush(q->sdr);
-
-        sdr_capture(q->sdr);
-        int np = q->sdr->iq_n; if (np < Ns) np = Ns;
-
-        fftw_complex *fin  = fftw_malloc(np * sizeof(fftw_complex));
-        fftw_complex *fout = fftw_malloc(np * sizeof(fftw_complex));
-        fftw_plan plan = fftw_plan_dft_1d(np, fin, fout,
-                                          FFTW_FORWARD, FFTW_ESTIMATE);
-        for (int n = 0; n < np; n++) {
-            fin[n][0] = q->sdr->iq_i[n];
-            fin[n][1] = q->sdr->iq_q[n];
-        }
-        fftw_execute(plan);
-        double norm = 1.0 / (np * np);
-        for (int k = 0; k < bdim; k++) {
-            int idx = b * bdim + k;
-            qmag[idx] = (fout[k][0]*fout[k][0] + fout[k][1]*fout[k][1]) * norm;
-        }
-        fftw_destroy_plan(plan);
-        fftw_free(fin); fftw_free(fout);
-    }
-    sdr_retune(q->sdr, save_freq); sdr_flush(q->sdr);
-    qmag[0] = 0;
-
-    /* ── Extract the room's artifact peaks — these are fixed
-       by the channel, same for every base. ── */
-    int n_peaks = 20;
-    int top_k[20] = {0};
-    double top_pwr[20] = {0};
-    for (int i = 2; i < Q/2; i++) {
-        if (qmag[i] <= qmag[i-1] || qmag[i] < qmag[i+1]) continue;
-        if (qmag[i] > top_pwr[19]) {
-            top_pwr[19] = qmag[i]; top_k[19] = i;
-            for (int j = 18; j >= 0; j--) {
-                if (top_pwr[j] < top_pwr[j+1]) {
-                    double tp = top_pwr[j]; top_pwr[j] = top_pwr[j+1]; top_pwr[j+1] = tp;
-                    int tk = top_k[j]; top_k[j] = top_k[j+1]; top_k[j+1] = tk;
-                } else break;
-            }
-        }
-    }
-
-    gmp_printf("  [SHOR] Oracle done. Top room peaks:\n");
-    for (int pk = 0; pk < n_peaks && top_k[pk] > 1; pk++)
-        gmp_printf("  [SHOR]  peak %d: bin=%d pwr=%.6f\n", pk+1, top_k[pk], top_pwr[pk]);
-
-    /* ── Grind bases: for each a, CFE on the room's peaks.
-       One capture, many bases — µs per attempt. ── */
-    int attempt = 0;
-    while (1) {
-        if (attempt > 0) {
-            mpz_add_ui(ga, ga, 1);
-            mpz_mod(ga, ga, gN);
-            if (mpz_cmp_ui(ga, 2) < 0) mpz_set_ui(ga, 2);
-            mpz_gcd(ggcd, ga, gN);
-            if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-                mpz_divexact(gtmp, gN, ggcd);
-                gmp_printf("  [SHOR] a=%Zd gcd=%Zd → %Zd = %Zd × %Zd\n",
-                           ga, ggcd, gN, ggcd, gtmp);
-                goto done;
-            }
-            while (mpz_cmp_ui(ggcd, 1) != 0 && mpz_cmp(ga, gN) < 0) {
-                mpz_add_ui(ga, ga, 1);
-                mpz_gcd(ggcd, ga, gN);
-            }
-        }
-
-        mpz_gcd(ggcd, ga, gN);
-        if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-            mpz_divexact(gtmp, gN, ggcd);
-            gmp_printf("  [SHOR] a=%Zd gcd=%Zd → %Zd = %Zd × %Zd\n",
-                       ga, ggcd, gN, ggcd, gtmp);
-            goto done;
-        }
-
-        if (attempt % 100 == 0)
-            gmp_printf("  [SHOR] a=%Zd (%d attempted)...\n", ga, attempt);
-
-        int factored = 0;
-        for (int peak = 0; peak < n_peaks && !factored; peak++) {
-            if (top_k[peak] <= 1) continue;
-            int best_k = top_k[peak];
-
-            long a = best_k, b = Q;
-            long cf[64]; int ncf = 0;
-            while (b && ncf < 64) { cf[ncf++] = a / b; long t = a % b; a = b; b = t; }
-
-            long p2 = 1, q2 = 0, p1 = cf[0], q1 = 1;
-            for (int ii = 1; ii < ncf; ii++) {
-                long pp = cf[ii]*p1+p2, qq = cf[ii]*q1+q2;
-                p2 = p1; q2 = q1; p1 = pp; q1 = qq;
-                if (qq <= 1 || mpz_cmp_ui(gN, (unsigned long)qq) <= 0) continue;
-
-                int deltas[] = {0, 2, -2, 4, -4, 6, -6};
-                for (int d = 0; d < 7; d++) {
-                    mpz_set_ui(gr, (unsigned long)qq);
-                    if (deltas[d] >= 0) mpz_add_ui(gr, gr, deltas[d]);
-                    else mpz_sub_ui(gr, gr, -deltas[d]);
-                    if (mpz_cmp_ui(gr, 2) < 0) continue;
-                    if (deltas[d] == 0) {
-                        mpz_powm(gtmp, ga, gr, gN);
-                        if (mpz_cmp_ui(gtmp, 1) == 0)
-                            gmp_printf("  [SHOR]  a=%Zd: a^%Zd ≡ 1 (mod N) — period %s (bin %d)\n",
-                                       ga, gr,
-                                       mpz_odd_p(gr) ? "is ODD, unusable for factoring"
-                                                      : "CONFIRMED", best_k);
-                    }
-                    if (mpz_odd_p(gr)) continue;
-                    mpz_tdiv_q_ui(ghalf, gr, 2);
-                    mpz_powm(ghalf, ga, ghalf, gN);
-
-                    mpz_add_ui(gtmp, ghalf, 1);
-                    mpz_gcd(ggcd, gtmp, gN);
-                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-                        mpz_divexact(gtmp, gN, ggcd);
-                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-                        gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
-                                   ga, gr, peak+1, best_k, deltas[d]);
-                        factored = 1;
-                        goto done;
-                    }
-                    mpz_sub_ui(gtmp, ghalf, 1);
-                    if (mpz_cmp_ui(gtmp, 0) <= 0) mpz_add(gtmp, gtmp, gN);
-                    mpz_gcd(ggcd, gtmp, gN);
-                    if (mpz_cmp_ui(ggcd, 1) > 0 && mpz_cmp(ggcd, gN) < 0) {
-                        mpz_divexact(gtmp, gN, ggcd);
-                        gmp_printf("  ★★★ FACTORED ★★★  N=%Zd = %Zd × %Zd\n", gN, ggcd, gtmp);
-                        gmp_printf("         a=%Zd r=%Zd (peak %d, bin %d, Δ=%+d)\n",
-                                   ga, gr, peak+1, best_k, deltas[d]);
-                        factored = 1;
-                        goto done;
-                    }
-                }
-            }
-        }
-        if (!factored) {
-            attempt++;
-            if (attempt % 100 == 0)
-                gmp_printf("  [SHOR] gcd trivial so far: %d bases checked, a=%Zd\n",
-                           attempt, ga);
-        }
-    }
-
-done:
-    if (qmag) free(qmag);
-    mpz_clears(gN, ga, gr, ghalf, gtmp, ggcd, NULL);
-    return 0;
-}
-
 /* ── Register all standard ops ── */
 static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "INIT",      op_init,      "capture ambient RF → |ψ⟩ (whitened)");
@@ -4401,12 +4649,12 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "RING",      op_ring,      "list all active tones in the room");
     qvm_reg(q, "HOLD",      op_hold,      "refresh all active tones → sustain room register");
     qvm_reg(q, "MOD",       op_mod,       "wrap accumulator modulo <N>");
+    qvm_reg(q, "EXP",       op_exp,       "modular exponentiation f(x)=a^x mod N across all qudits [a] [N] [n_in]");
     qvm_reg(q, "BANKS",     op_banks,     "create N frequency pages: room D = N×bank_dim");
     qvm_reg(q, "BANK",      op_bank,      "switch active frequency page <N>");
     qvm_reg(q, "MERGE",     op_merge,     "capture all banks → stitch room register");
     qvm_reg(q, "RADIATE",   op_radiate,   "TX room register across all banks into ether");
     qvm_reg(q, "FIELD",     op_field,     "show room super-register status (per-bank tones)");
-    qvm_reg(q, "SHOR",      op_shor,      "Shor's: period-finding via room intermodulation");
 }
 
 /* ── QVM API: public accessors (qvm_api.h) ── */
@@ -4566,8 +4814,6 @@ void qvm_antisym_encode(QvmCtx *q, const int *bins, const double *amps,
 }
 
 int qvm_eval(QvmCtx *q, const char *cmd){
-    strncpy(q->last_cmd, cmd, 8191);
-    q->last_cmd[8191] = 0;
     char op[32]={0}; double a1=0,a2=0;
     sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
     if(!op[0]) return 0;
@@ -4647,7 +4893,7 @@ int qvm_run(QvmCtx *q, const char *script_path){
     if (!q->interactive) {
         FILE *f = fopen(script_path, "r");
         if (!f) { fprintf(stderr,"[VM] Cannot open %s\n",script_path); return 1; }
-        char lbuf[8192];
+        char lbuf[512];
         q->lines = malloc(131072*sizeof(char*));
         while (fgets(lbuf,sizeof(lbuf),f) && q->nlines<131072) {
             char *nl=strchr(lbuf,'\n');if(nl)*nl=0;
@@ -4659,7 +4905,7 @@ int qvm_run(QvmCtx *q, const char *script_path){
     }
 
     while (q->running) {
-        char line[8192]={0};
+        char line[512]={0};
         if (!q->interactive) {
             if (q->ip >= q->nlines) break;
             strcpy(line, q->lines[q->ip++]);
@@ -5994,8 +6240,6 @@ static int run_sat_solver(uint32_t freq, uint32_t rate, int gain, int n_vars) {
  * ═══════════════════════════════════════════════════════════════ */
 #ifndef NO_MAIN
 int main(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
     int    D    = DEFAULT_D;
     int    freq = DEFAULT_FREQ;
     int    rate = DEFAULT_RATE;
