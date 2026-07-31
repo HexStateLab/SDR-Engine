@@ -79,7 +79,8 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
             angle = (2.0 * math.pi * c / N) % (2.0 * math.pi)
             script = ["RESET", "SET 2 0.70710678", "SET 3 0.70710678"]
             if K > 0:
-                fb = (math.pi * P) / (1 << K)
+                from fractions import Fraction
+                fb = math.pi * float(Fraction(P, 1 << K))
                 script.append(f"Z {-fb/2:.15f} 2")
                 script.append(f"Z {+fb/2:.15f} 3")
             script.extend([f"Z {angle:.15f} 3", "HCTRL", "PROB", "QUIT"])
