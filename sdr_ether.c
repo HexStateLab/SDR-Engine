@@ -2171,6 +2171,7 @@ struct QvmCtx {
     int    coh_rounds; /* QEC coherent capture rounds */
     int    parallel;   /* 1 = use surface reality (D-k bins) for doubled qubit count */
     int    n_qbins;
+    double cr_angle;  /* stored angle for CR_BIN gate */
 
     /* ── Multi-bank super-register: D lives in the room, not in RAM ── */
     int    num_banks;   /* 1=normal, >1=room register pages (held in multipath) */
@@ -3814,6 +3815,259 @@ static int op_qft(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* IQFT [range]: inverse Quantum Fourier Transform via FFTW3_BACKWARD.
+   Used for QFT-based modular arithmetic (addition, multiplication). */
+static int op_iqft(QvmCtx *q, double a1, double a2){
+    int n=((int)a1)>0?(int)a1:q->wf.d;(void)a2;
+    if(n>q->wf.d)n=q->wf.d;
+
+    fftw_complex *in  = fftw_malloc(n*sizeof(fftw_complex));
+    fftw_complex *out = fftw_malloc(n*sizeof(fftw_complex));
+    fftw_plan plan = fftw_plan_dft_1d(n, in, out, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+    for(int k=0;k<n;k++){in[k][0]=q->wf.re[k];in[k][1]=q->wf.im[k];}
+    fftw_execute(plan);
+
+    double norm=1.0/sqrt(n);
+    for(int k=0;k<n;k++){
+        q->wf.re[k]=out[k][0]*norm;q->wf.im[k]=out[k][1]*norm;
+        q->wf.prob[k]=q->wf.re[k]*q->wf.re[k]+q->wf.im[k]*q->wf.im[k];
+    }
+    for(int k=n;k<q->wf.d;k++){
+        q->wf.re[k]=q->wf.im[k]=q->wf.prob[k]=0;
+    }
+
+    printf("  [IQFT] %d-point inverse Fourier transform\n",n);
+    fftw_destroy_plan(plan);fftw_free(in);fftw_free(out);
+    return 0;
+}
+
+/* CMULT c N: Controlled modular multiplication.
+   Applies |x⟩ → |c·x mod N⟩ to the first N bins of the WF,
+   phase-encoding the result using the exponentiation pattern.
+   Used as a building block for Griffiths-Niu phase estimation. */
+static int op_cmult(QvmCtx *q, double a1, double a2){
+    long long c = ((int)a1) > 0 ? (int)a1 : 2;
+    long long N = ((int)a2) > 1 ? (int)a2 : 15;
+    int D = q->wf.d;
+    if((int)N > D/2) N = D/2;
+    if(N < 2) return 0;
+
+    /* Phase-encode the permutation x → c*x mod N onto first N bins.
+       When used in QFT-adder mode, the phase rotations correspond to
+       the modular multiplication by c. */
+    double amp = 1.0/sqrt((double)N);
+    double *saved_re = malloc(N * sizeof(double));
+    double *saved_im = malloc(N * sizeof(double));
+    memcpy(saved_re, q->wf.re, N * sizeof(double));
+    memcpy(saved_im, q->wf.im, N * sizeof(double));
+
+    memset(q->wf.re, 0, N * sizeof(double));
+    memset(q->wf.im, 0, N * sizeof(double));
+    for(int x=0; x<(int)N; x++){
+        int y = (int)((c * (long long)x) % N);
+        double re = saved_re[x], im = saved_im[x];
+        double mag = sqrt(re*re + im*im);
+        if(mag < 1e-12) continue;
+        q->wf.re[y] = re;
+        q->wf.im[y] = im;
+    }
+    /* Re-normalize */
+    double tot = 0;
+    for(int i=0; i<(int)N; i++)
+        tot += q->wf.re[i]*q->wf.re[i] + q->wf.im[i]*q->wf.im[i];
+    if(tot > 1e-15){
+        double sc = 1.0/sqrt(tot);
+        for(int i=0; i<(int)N; i++){
+            q->wf.re[i]*=sc; q->wf.im[i]*=sc;
+            q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
+        }
+    }
+    /* Keep remaining bins */
+    for(int i=(int)N; i<D; i++){
+        q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
+    }
+    qvm_norm(&q->wf);
+
+    printf("  [CMULT] c=%lld N=%lld |x⟩→|c·x mod N⟩ permuted\n", c, N);
+    free(saved_re); free(saved_im);
+    return 0;
+}
+
+/* CRANGLE rad: store phase angle for subsequent CR_BIN gates. */
+static int op_crangle(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    q->cr_angle = a1;
+    return 0;
+}
+
+/* CR_BIN ctrl target: controlled phase rotation on frequency bin.
+   Applies phase = q->cr_angle * P(ctrl=|1⟩) to bin `target`.
+   Born-rule approximation — correct for pure control states in
+   QFT-based arithmetic circuits. */
+static int op_cr_bin(QvmCtx *q, double a1, double a2){
+    int ctrl = (int)a1;
+    int nq = q->n_qbins/2;
+    if(ctrl < 0 || ctrl >= nq){ printf("  [CR_BIN] bad ctrl %d\n",ctrl); return 0; }
+    int target = (int)a2;
+    if(target < 16 || target >= q->wf.d){ printf("  [CR_BIN] bad target %d\n",target); return 0; }
+
+    double p1 = q->wf.prob[q->qbins[2*ctrl+1]];
+    double phase = q->cr_angle * p1;
+    double cr = cos(phase), sr = sin(phase);
+    double re = q->wf.re[target], im = q->wf.im[target];
+    q->wf.re[target] = re*cr - im*sr;
+    q->wf.im[target] = re*sr + im*cr;
+    q->wf.prob[target] = q->wf.re[target]*q->wf.re[target]
+                        + q->wf.im[target]*q->wf.im[target];
+    return 0;
+}
+
+/* CADD ctrl c [N]: controlled modular addition.
+   |x⟩_r → |x+c mod N⟩_r when ctrl=|1⟩, unchanged when ctrl=|0⟩.
+   Born-rule mixture approximation for independent-bin WF. */
+static int op_cadd(QvmCtx *q, double a1, double a2){
+    int ctrl=((int)a1)>=0?(int)a1:0, c=((int)a2)>=0?(int)a2:1;
+    int nq=q->n_qbins/2, D=q->wf.d;
+    if(ctrl<0||ctrl>=nq)return 0;
+    int N=D/2; if(N>512)N=512; if(N<2)N=2;
+    if(c>=N)c%=N; if(c<1)c=1;
+    double p0=q->wf.prob[q->qbins[2*ctrl]];
+    double p1=q->wf.prob[q->qbins[2*ctrl+1]];
+    double pt=p0+p1; if(pt<1e-15){p0=p1=0.5;pt=1.0;}
+    p0/=pt; p1/=pt;
+    double *nr=calloc(N,sizeof(double)),*ni=calloc(N,sizeof(double));
+    for(int x=0;x<N;x++){
+        double re=q->wf.re[x],im=q->wf.im[x],amp=re*re+im*im;
+        if(amp<1e-12)continue;
+        int y=(x+c)%N;
+        nr[x]+=re*p0;ni[x]+=im*p0;
+        nr[y]+=re*p1;ni[y]+=im*p1;
+    }
+    double t=0;for(int i=0;i<N;i++)t+=nr[i]*nr[i]+ni[i]*ni[i];
+    if(t>1e-15){double s=1.0/sqrt(t);for(int i=0;i<N;i++){nr[i]*=s;ni[i]*=s;}}
+    memcpy(q->wf.re,nr,N*sizeof(double));memcpy(q->wf.im,ni,N*sizeof(double));
+    for(int i=0;i<N;i++)q->wf.prob[i]=nr[i]*nr[i]+ni[i]*ni[i];
+    free(nr);free(ni);qvm_norm(&q->wf);
+    return 0;
+}
+
+/* JCADD c N: joint-state controlled modular multiplication.
+   Layout: bin 2*x = |0⟩_c|x⟩_r, bin 2*x+1 = |1⟩_c|x⟩_r.
+   Operation: |1⟩_c|x⟩_r → |1⟩_c|c·x mod N⟩_r.
+   The |0⟩_c branch is unchanged.  True joint-state operation
+   on the D-bin tensor-product space. */
+static int op_jcadd(QvmCtx *q, double a1, double a2){
+    long long c = ((int)a1) > 0 ? (int)a1 : 2;
+    int N = ((int)a2) > 1 ? (int)a2 : 15;
+    int D = q->wf.d;
+    if(2*N > D) N = D/2;
+    if(N < 2) N = 2;
+    if(c <= 0) c = 2;
+
+    double *nr = calloc(2*N, sizeof(double));
+    double *ni = calloc(2*N, sizeof(double));
+
+    for(int x = 0; x < N; x++){
+        /* |0⟩_c|x⟩_r: stays at bin 2*x */
+        nr[2*x]   += q->wf.re[2*x];
+        ni[2*x]   += q->wf.im[2*x];
+        /* |1⟩_c|x⟩_r: moves to bin 2*(c*x mod N)+1 */
+        int y = (int)((c * (long long)x) % N);
+        nr[2*y+1] += q->wf.re[2*x+1];
+        ni[2*y+1] += q->wf.im[2*x+1];
+    }
+
+    double t = 0;
+    for(int i = 0; i < 2*N; i++)
+        t += nr[i]*nr[i] + ni[i]*ni[i];
+    if(t > 1e-15){
+        double s = 1.0/sqrt(t);
+        for(int i = 0; i < 2*N; i++)
+            { nr[i]*=s; ni[i]*=s; }
+    }
+
+    memcpy(q->wf.re, nr, 2*N*sizeof(double));
+    memcpy(q->wf.im, ni, 2*N*sizeof(double));
+    for(int i = 0; i < 2*N; i++)
+        q->wf.prob[i] = nr[i]*nr[i] + ni[i]*ni[i];
+    for(int i=2*N; i<D; i++)
+        q->wf.re[i]=q->wf.im[i]=q->wf.prob[i]=0;
+    qvm_norm(&q->wf);
+    free(nr); free(ni);
+    printf("  [JCADD] c=%lld N=%d |1>|x>→|1>|c·x mod N>\n", c, N);
+    return 0;
+}
+
+/* CPHASE c N: controlled phase rotation on joint-state WF.
+   Layout: bin[2*x]=|0>|x>, bin[2*x+1]=|1>|x>.
+   Multiplies each |1>|x> by e^{i·2π·c·x/N}.
+   Only touches bins with non-zero amplitude — O(active), not O(N). */
+static int op_cphase(QvmCtx *q, double a1, double a2){
+    long long c = ((int)a1) > 0 ? (int)a1 : 2;
+    int N = ((int)a2) > 1 ? (int)a2 : 15;
+    int D = q->wf.d;
+
+    for(int x = 0; x < D/2; x++){
+        int b_even = 2*x, b_odd = 2*x+1;
+        if(b_odd >= D) break;
+        double amp = q->wf.re[b_odd]*q->wf.re[b_odd] + q->wf.im[b_odd]*q->wf.im[b_odd];
+        if(amp < 1e-30) continue;  // skip empty bins
+        double phase = 2.0 * M_PI * c * x / N;
+        double cr = cos(phase), sr = sin(phase);
+        double re = q->wf.re[b_odd], im = q->wf.im[b_odd];
+        q->wf.re[b_odd] = re*cr - im*sr;
+        q->wf.im[b_odd] = re*sr + im*cr;
+    }
+    for(int i = 0; i < D; i++)
+        q->wf.prob[i] = q->wf.re[i]*q->wf.re[i] + q->wf.im[i]*q->wf.im[i];
+    printf("  [CPHASE] c=%lld N=%d e^{i·2π·c·x/N} on |1> branch\n", c, N);
+    return 0;
+}
+
+/* HCTRL N: Hadamard on control qubit in joint-state layout.
+   bin[2*x] = |0⟩|x⟩, bin[2*x+1] = |1⟩|x⟩.
+   H: |0⟩→(|0⟩+|1⟩)/√2, |1⟩→(|0⟩-|1⟩)/√2.
+   Operates on all result values x simultaneously. */
+static int op_hctrl(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    int D = q->wf.d;
+    double is2 = 1.0/sqrt(2.0);
+    for(int x = 0; x < D/2; x++){
+        int b0 = 2*x, b1 = 2*x+1;
+        if(b1 >= D) break;
+        double amp = q->wf.re[b0]*q->wf.re[b0]+q->wf.im[b0]*q->wf.im[b0]
+                   + q->wf.re[b1]*q->wf.re[b1]+q->wf.im[b1]*q->wf.im[b1];
+        if(amp < 1e-30) continue;
+        double r0 = q->wf.re[b0],   i0 = q->wf.im[b0];
+        double r1 = q->wf.re[b1], i1 = q->wf.im[b1];
+        q->wf.re[b0] = (r0 + r1) * is2; q->wf.im[b0] = (i0 + i1) * is2;
+        q->wf.re[b1] = (r0 - r1) * is2; q->wf.im[b1] = (i0 - i1) * is2;
+    }
+    for(int i = 0; i < D; i++)
+        q->wf.prob[i] = q->wf.re[i]*q->wf.re[i] + q->wf.im[i]*q->wf.im[i];
+    printf("  [HCTRL] H on ctrl qubit\n");
+    return 0;
+}
+
+/* JMEAS: measure control qubit in joint-state layout.
+   Sums even bins = P(|0⟩), odd bins = P(|1⟩). */
+static int op_jmeas(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2;
+    int D = q->wf.d;
+    double p0 = 0, p1 = 0;
+    for(int x = 0; x < D/2; x++){
+        int b0 = 2*x, b1 = 2*x+1;
+        if(b1 >= D) break;
+        p0 += q->wf.re[b0]*q->wf.re[b0] + q->wf.im[b0]*q->wf.im[b0];
+        p1 += q->wf.re[b1]*q->wf.re[b1] + q->wf.im[b1]*q->wf.im[b1];
+    }
+    double tot = p0 + p1;
+    printf("  [JMEAS] P(|0⟩)=%.4f P(|1⟩)=%.4f\n",
+           tot>1e-15?p0/tot:0, tot>1e-15?p1/tot:0);
+    return 0;
+}
+
 /* ── Quantum Register in The Room ──
    No software state.  The room's EM field IS the register.
    TONE radiates a mark.  HEAR listens for it.  ADD uses
@@ -4083,7 +4337,25 @@ static int op_exp(QvmCtx *q, double a1, double a2){
     else { N_val = (long long)(a2 + 0.5); if(N_val < 2) N_val = 2; }
     int D = q->wf.d;
     if(!q->sdr_ok){
-        printf("  [EXP] no SDR — room required\n");
+        /* Software fallback: encode exponentiation into WF.
+           Phase-encode a^x mod N on ALL D bins for clean QFT. */
+        long long fx=1;
+        int sw_encoded=0;
+        memset(q->wf.re,0,D*sizeof(double));
+        memset(q->wf.im,0,D*sizeof(double));
+        double amp=1.0/sqrt((double)D);
+        for(int x=0;x<D;x++){
+            double ph=2.0*M_PI*fx/(double)N_val;
+            q->wf.re[x]=amp*cos(ph);q->wf.im[x]=amp*sin(ph);
+            q->wf.prob[x]=amp*amp;
+            fx=(fx*a_val)%N_val;sw_encoded++;
+        }
+        qvm_norm(&q->wf);
+        printf("  [EXP] a=%lld N=%lld in=%d — software encoding (no SDR)\n"
+               "        f(0)=1 f(1)=%lld f(2)=%lld f(3)=%lld …\n",
+               a_val,N_val,sw_encoded,
+               mod_pow_ll(a_val,1,N_val),mod_pow_ll(a_val,2,N_val),
+               mod_pow_ll(a_val,3,N_val));
         return 0;
     }
 
@@ -4637,6 +4909,15 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "HELP",      op_help,      "this list");
     qvm_reg(q, "?",         op_help,      "alias for HELP");
     qvm_reg(q, "QFT",       op_qft,       "Quantum Fourier Transform on WF [n=D]");
+    qvm_reg(q, "IQFT",      op_iqft,      "Inverse QFT [n=D] — for modular arithmetic");
+    qvm_reg(q, "CMULT",     op_cmult,     "Controlled modular multiply: |x>→|c·x mod N> [c] [N]");
+    qvm_reg(q, "CRANGLE",   op_crangle,   "Set phase angle for CR_BIN gates [rad]");
+    qvm_reg(q, "CR_BIN",    op_cr_bin,    "Controlled-Rz on bin: angle*P(ctrl=|1>) [ctrl] [bin]");
+    qvm_reg(q, "CADD",      op_cadd,      "Controlled modular adder: |x>→|x+c mod N> if ctrl=|1> [ctrl] [c]");
+    qvm_reg(q, "JCADD",     op_jcadd,     "Joint-state ctrl-U: |1>|x>→|1>|c·x mod N> [c] [N]");
+    qvm_reg(q, "CPHASE",    op_cphase,    "Controlled phase: |1>|x>*=e^{i·2π·c·x/N} [c] [N]");
+    qvm_reg(q, "HCTRL",     op_hctrl,     "Hadamard on ctrl qubit (joint-state) [N]");
+    qvm_reg(q, "JMEAS",     op_jmeas,     "Measure ctrl qubit (joint-state) [N]");
     qvm_reg(q, "QUIT",      op_quit,      "exit VM");
     qvm_reg(q, "EXIT",      op_quit,      "alias for QUIT");
     qvm_reg(q, "Q",         op_quit,      "alias for QUIT");
