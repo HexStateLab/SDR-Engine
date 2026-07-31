@@ -2171,6 +2171,7 @@ struct QvmCtx {
     int    coh_rounds; /* QEC coherent capture rounds */
     int    parallel;   /* 1 = use surface reality (D-k bins) for doubled qubit count */
     int    n_qbins;
+    char   last_cmd[512];
     double cr_angle;  /* stored angle for CR_BIN gate */
 
     /* ── Multi-bank super-register: D lives in the room, not in RAM ── */
@@ -3959,7 +3960,15 @@ static int op_cadd(QvmCtx *q, double a1, double a2){
    on the D-bin tensor-product space. */
 static int op_jcadd(QvmCtx *q, double a1, double a2){
     long long c = ((int)a1) > 0 ? (int)a1 : 2;
-    int N = ((int)a2) > 1 ? (int)a2 : 15;
+    long long N = ((int)a2) > 1 ? (int)a2 : 15;
+    /* strtoll fallback for large integers */
+    if(N < 2 || c < 2){
+        char astr[128]={0}, nstr[128]={0};
+        sscanf(q->last_cmd, "%*s %127s %127s", astr, nstr);
+        long long pc = strtoll(astr, NULL, 10);
+        long long pn = strtoll(nstr, NULL, 10);
+        if(pc > 1) c = pc; if(pn > 1) N = pn;
+    }
     int D = q->wf.d;
     if(2*N > D) N = D/2;
     if(N < 2) N = 2;
@@ -4065,6 +4074,112 @@ static int op_jmeas(QvmCtx *q, double a1, double a2){
     double tot = p0 + p1;
     printf("  [JMEAS] P(|0⟩)=%.4f P(|1⟩)=%.4f\n",
            tot>1e-15?p0/tot:0, tot>1e-15?p1/tot:0);
+    return 0;
+}
+
+/* ROOM: OFDM TX/RX through R820T2 mixer. Transmits current WF,
+   room processes via multipath + mixer, captures result. */
+static int op_room(QvmCtx *q, double a1, double a2){
+    (void)a1;(void)a2; int D = q->wf.d;
+    if(!q->sdr_ok){ printf("  [ROOM] no SDR\n"); return 0; }
+    double *rx_I = calloc(D, sizeof(double));
+    double *rx_Q = calloc(D, sizeof(double));
+    if(qvm_ofdm_complex(q, q->wf.re, q->wf.im, rx_I, rx_Q, D) < 0)
+        { free(rx_I); free(rx_Q); return 0; }
+    double tot=0;
+    for(int i=0;i<D;i++){ q->wf.re[i]=rx_I[i]; q->wf.im[i]=rx_Q[i];
+        q->wf.prob[i]=rx_I[i]*rx_I[i]+rx_Q[i]*rx_Q[i]; tot+=q->wf.prob[i]; }
+    if(tot>1e-15){ double s=1.0/sqrt(tot);
+        for(int i=0;i<D;i++){ q->wf.re[i]*=s; q->wf.im[i]*=s;
+            q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i]; }}
+    qvm_norm(&q->wf); free(rx_I); free(rx_Q);
+    return 0;
+}
+
+/* QFTQ m: QFT on first m QBIN-mapped qubits. H + controlled-Rz pairs. */
+static int op_qftq(QvmCtx *q, double a1, double a2){
+    int m=((int)a1)>0?(int)a1:2,nq=q->n_qbins/2;(void)a2;if(m>nq)m=nq;if(m<2)return 0;
+    double is2=1.0/sqrt(2.0);
+    for(int j=0;j<m;j++){int b0=q->qbins[2*j],b1=q->qbins[2*j+1];
+        double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+        q->wf.re[b0]=(r0+r1)*is2;q->wf.im[b0]=(i0+i1)*is2;
+        q->wf.re[b1]=(r0-r1)*is2;q->wf.im[b1]=(i0-i1)*is2;}
+    for(int k=1;k<m;k++)for(int j=0;j<k;j++){
+        double ang=M_PI/(1<<(k-j)),p1j=q->wf.prob[q->qbins[2*j+1]];
+        double ph=ang*p1j,cr=cos(ph),sr=sin(ph);
+        int b1=q->qbins[2*k+1];double re=q->wf.re[b1],im=q->wf.im[b1];
+        q->wf.re[b1]=re*cr-im*sr;q->wf.im[b1]=re*sr+im*cr;}
+    for(int i=0;i<q->wf.d;i++)q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
+    printf("  [QFTQ] %d-qubit QFT\n",m);return 0;
+}
+/* IQFTQ m: inverse QFT on first m QBIN-mapped qubits. */
+static int op_iqftq(QvmCtx *q, double a1, double a2){
+    int m=((int)a1)>0?(int)a1:2,nq=q->n_qbins/2;(void)a2;if(m>nq)m=nq;if(m<2)return 0;
+    for(int k=m-1;k>=1;k--)for(int j=k-1;j>=0;j--){
+        double ang=-M_PI/(1<<(k-j)),p1j=q->wf.prob[q->qbins[2*j+1]];
+        double ph=ang*p1j,cr=cos(ph),sr=sin(ph);
+        int b1=q->qbins[2*k+1];double re=q->wf.re[b1],im=q->wf.im[b1];
+        q->wf.re[b1]=re*cr-im*sr;q->wf.im[b1]=re*sr+im*cr;}
+    double is2=1.0/sqrt(2.0);
+    for(int j=0;j<m;j++){int b0=q->qbins[2*j],b1=q->qbins[2*j+1];
+        double r0=q->wf.re[b0],i0=q->wf.im[b0],r1=q->wf.re[b1],i1=q->wf.im[b1];
+        q->wf.re[b0]=(r0+r1)*is2;q->wf.im[b0]=(i0+i1)*is2;
+        q->wf.re[b1]=(r0-r1)*is2;q->wf.im[b1]=(i0-i1)*is2;}
+    for(int i=0;i<q->wf.d;i++)q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
+    printf("  [IQFTQ] %d-qubit inverse QFT\n",m);    return 0;
+}
+
+/* CR_GATE ctrl tgt: true controlled-R_z between QBIN qubits.
+   Uses CRANGLE-stored angle. Decomposition: R_z(θ/2)·CZ·R_z(-θ/2)·CZ. */
+static int op_cr_gate(QvmCtx *q, double a1, double a2){
+    int ctrl=((int)a1)>=0?(int)a1:0, tgt=((int)a2)>=0?(int)a2:1;
+    int nq=q->n_qbins/2;
+    if(ctrl>=nq||tgt>=nq||ctrl==tgt){printf("  [CR_GATE] bad qubits\n");return 0;}
+    double angle = q->cr_angle;
+    int b0t=q->qbins[2*tgt], b1t=q->qbins[2*tgt+1];
+    /* Step 1: R_z(angle/2) on target |1⟩ */
+    double cr=cos(angle/2),sr=sin(angle/2);
+    double re=q->wf.re[b1t],im=q->wf.im[b1t];
+    q->wf.re[b1t]=re*cr-im*sr; q->wf.im[b1t]=re*sr+im*cr;
+    /* Step 2: H on target (|0⟩ and |1⟩ bins) via op_h_gate */
+    {double is2=1.0/sqrt(2.0);double r0=q->wf.re[b0t],i0=q->wf.im[b0t],r1=q->wf.re[b1t],i1=q->wf.im[b1t];
+     q->wf.re[b0t]=(r0+r1)*is2;q->wf.im[b0t]=(i0+i1)*is2;
+     q->wf.re[b1t]=(r0-r1)*is2;q->wf.im[b1t]=(i0-i1)*is2;}
+    /* Step 3: CZ */
+    op_cz_gate(q, (double)ctrl, (double)tgt);
+    /* Step 4: H on target */
+    {double is2=1.0/sqrt(2.0);double r0=q->wf.re[b0t],i0=q->wf.im[b0t],r1=q->wf.re[b1t],i1=q->wf.im[b1t];
+     q->wf.re[b0t]=(r0+r1)*is2;q->wf.im[b0t]=(i0+i1)*is2;
+     q->wf.re[b1t]=(r0-r1)*is2;q->wf.im[b1t]=(i0-i1)*is2;}
+    /* Step 5: R_z(-angle/2) on target |1⟩ */
+    cr=cos(-angle/2);sr=sin(-angle/2);
+    re=q->wf.re[b1t];im=q->wf.im[b1t];
+    q->wf.re[b1t]=re*cr-im*sr; q->wf.im[b1t]=re*sr+im*cr;
+    /* Step 6: H on target */
+    {double is2=1.0/sqrt(2.0);double r0=q->wf.re[b0t],i0=q->wf.im[b0t],r1=q->wf.re[b1t],i1=q->wf.im[b1t];
+     q->wf.re[b0t]=(r0+r1)*is2;q->wf.im[b0t]=(i0+i1)*is2;
+     q->wf.re[b1t]=(r0-r1)*is2;q->wf.im[b1t]=(i0-i1)*is2;}
+    /* Step 7: CZ */
+    op_cz_gate(q, (double)ctrl, (double)tgt);
+    /* Step 8: H on target */
+    {double is2=1.0/sqrt(2.0);double r0=q->wf.re[b0t],i0=q->wf.im[b0t],r1=q->wf.re[b1t],i1=q->wf.im[b1t];
+     q->wf.re[b0t]=(r0+r1)*is2;q->wf.im[b0t]=(i0+i1)*is2;
+     q->wf.re[b1t]=(r0-r1)*is2;q->wf.im[b1t]=(i0-i1)*is2;}
+    return 0;
+}
+
+/* CPRATIO ratio: CPHASE via precomputed ratio = 2π·c/N.
+   Applies phase = ratio*x to each |1⟩_c|x⟩_r bin. Single C loop,
+   no large-int parsing needed — ratio fits in a double. */
+static int op_cpratio(QvmCtx *q, double a1, double a2){
+    (void)a2; double ratio = a1; int D = q->wf.d;
+    for(int x=0;x<D/2;x++){int bo=2*x+1;if(bo>=D)break;
+        double amp=q->wf.re[bo]*q->wf.re[bo]+q->wf.im[bo]*q->wf.im[bo];
+        if(amp<1e-30)continue;
+        double ph=ratio*x,cr=cos(ph),sr=sin(ph);
+        double re=q->wf.re[bo],im=q->wf.im[bo];
+        q->wf.re[bo]=re*cr-im*sr;q->wf.im[bo]=re*sr+im*cr;}
+    for(int i=0;i<D;i++)q->wf.prob[i]=q->wf.re[i]*q->wf.re[i]+q->wf.im[i]*q->wf.im[i];
     return 0;
 }
 
@@ -4912,12 +5027,17 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "IQFT",      op_iqft,      "Inverse QFT [n=D] — for modular arithmetic");
     qvm_reg(q, "CMULT",     op_cmult,     "Controlled modular multiply: |x>→|c·x mod N> [c] [N]");
     qvm_reg(q, "CRANGLE",   op_crangle,   "Set phase angle for CR_BIN gates [rad]");
+    qvm_reg(q, "CR_GATE",   op_cr_gate,   "Controlled-Rz between QBIN qubits [ctrl] [tgt] (uses CRANGLE)");
     qvm_reg(q, "CR_BIN",    op_cr_bin,    "Controlled-Rz on bin: angle*P(ctrl=|1>) [ctrl] [bin]");
     qvm_reg(q, "CADD",      op_cadd,      "Controlled modular adder: |x>→|x+c mod N> if ctrl=|1> [ctrl] [c]");
     qvm_reg(q, "JCADD",     op_jcadd,     "Joint-state ctrl-U: |1>|x>→|1>|c·x mod N> [c] [N]");
     qvm_reg(q, "CPHASE",    op_cphase,    "Controlled phase: |1>|x>*=e^{i·2π·c·x/N} [c] [N]");
+    qvm_reg(q, "CPRATIO",   op_cpratio,   "CPHASE via ratio: phase=ratio*x per bin [ratio]");
     qvm_reg(q, "HCTRL",     op_hctrl,     "Hadamard on ctrl qubit (joint-state) [N]");
     qvm_reg(q, "JMEAS",     op_jmeas,     "Measure ctrl qubit (joint-state) [N]");
+    qvm_reg(q, "ROOM",      op_room,      "OFDM TX/RX: current WF → R820T2 → capture");
+    qvm_reg(q, "QFTQ",      op_qftq,      "QFT on m QBIN-mapped qubits [m]");
+    qvm_reg(q, "IQFTQ",     op_iqftq,     "Inverse QFT on m qubits [m]");
     qvm_reg(q, "QUIT",      op_quit,      "exit VM");
     qvm_reg(q, "EXIT",      op_quit,      "alias for QUIT");
     qvm_reg(q, "Q",         op_quit,      "alias for QUIT");
@@ -5103,6 +5223,7 @@ int qvm_eval(QvmCtx *q, const char *cmd){
     if (!fn) { printf("  ? Unknown: %s\n", op); return 0; }
     if (fn == op_echo) { printf("  %s\n", cmd+4); return 0; }
 
+    strncpy(q->last_cmd, cmd, 511); q->last_cmd[511] = 0;
     int rc = fn(q, a1, a2);
 
     /* Auto-sync with ether only for operations that NEED the room.
@@ -6519,6 +6640,7 @@ static int run_sat_solver(uint32_t freq, uint32_t rate, int gain, int n_vars) {
 /* ═══════════════════════════════════════════════════════════════
  * MAIN
  * ═══════════════════════════════════════════════════════════════ */
+
 #ifndef NO_MAIN
 int main(int argc, char **argv) {
     int    D    = DEFAULT_D;
