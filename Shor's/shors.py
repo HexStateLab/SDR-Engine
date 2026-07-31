@@ -32,11 +32,28 @@ def run_engine(script, D, freq, rate, gain):
     finally: os.unlink(sp)
 
 def parse_probs(output):
-    # Match PROB output: |k>=prob or |k⟩=prob
     ps = {}
     for m in re.finditer(r'\|(\d+)[⟩>]=(\d+\.\d+)', output):
         ps[int(m.group(1))] = float(m.group(2))
     return ps
+def extract_period_int(P, K, N, a):
+    """Extract period r from exact rational P/2^K via integer continued fractions."""
+    if K < 1 or P == 0:
+        return None
+    # Integer Euclidean algorithm on (num, den) — no float conversions
+    num, den = P, 1 << K
+    n0, d0, n1, d1 = 0, 1, 1, 0
+    while den > 0:
+        ai = num // den
+        if ai < 0: break
+        n2, d2 = ai * n1 + n0, ai * d1 + d0
+        if d2 > N or d2 < 0: break
+        if d2 > 1 and mod_pow(a, d2, N) == 1:
+            return d2
+        n0, d0, n1, d1 = n1, d1, n2, d2
+        num, den = den, num - ai * den
+        if den == 0: break
+    return None
 
 def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
     M = 2*N
@@ -48,9 +65,10 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
     
     for trial in range(trials):
         phase = 0.0
+        # Integer-phase accumulator: exact binary fraction
+        P = 0  # numerator, denominator = 2^k
+        K = 0  # number of bits accumulated
         handoff_x = sqrt_n
-        prev_phi = -1
-        stable_count = 0
         
         # Per-iteration subprocess (clean WF each time), early exit on geodesic/phase
         for k in range(max_k):
@@ -73,6 +91,11 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
             phi_k = 2.0 * math.acos(max(-1.0, min(1.0, math.sqrt(p0))))
             phase = (phase + phi_k) / 2.0
             
+            # Integer-phase: store bit with full precision (binary threshold)
+            bit = 1 if phi_k > math.pi/2 else 0
+            P = (bit << K) | P
+            K += 1
+            
             # Geodesic
             z_val = int(phi_k * N / (2.0 * math.pi))
             resonance = (c * handoff_x - z_val * remainder) % N
@@ -84,63 +107,39 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
                 return (min(g,N//g), max(g,N//g))
             handoff_x = (handoff_x * c + z_val) % N
             
-            # Early exit on phase convergence
-            if prev_phi > 0 and abs(phi_k - prev_phi) < 0.001:
-                stable_count += 1
-            else:
-                stable_count = 0
-            prev_phi = phi_k
-            
             if k < 12 or k % 8 == 0:
                 print(f"  k={k:3d} c={str(c)[:20]}... p0={p0:.4f} p1={p1:.4f} "
                       f"φ_k={phi_k/math.pi:.4f}π phase={phase/math.pi:.6f}π")
             
-            if k >= N.bit_length() and phase > 1e-8:
-                # Extract period via continued fractions on accumulated phase
-                frac = (phase / (2.0 * math.pi)) % 1.0
-                if frac > 1e-10:
-                    p0, q0, p1, q1 = 0, 1, 1, 0
-                    x = frac
-                    for _ in range(60):
-                        if abs(x) < 1e-15: break
-                        ai = int(math.floor(x + 1e-12))
-                        if ai < 0: break
-                        p2, q2 = ai * p1 + p0, ai * q1 + q0
-                        if q2 > N or q2 < 0: break
-                        if q2 > 1 and mod_pow(a, q2, N) == 1:
-                            r = q2
-                            print(f"  Converged: r={r} (k={k})")
-                            if r % 2 == 0:
-                                h = mod_pow(a, r // 2, N)
-                                if h != N - 1:
-                                    f1, f2 = gcd(h+1, N), gcd(h-1, N)
-                                    if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
-                                        print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (phase r={r})")
-                                        return (min(f1,f2), max(f1,f2))
-                            print(f"  r={r} no factor")
-                            return None
-                        p0, q0, p1, q1 = p1, q1, p2, q2
-                        x = 1.0 / (x - ai)
-                print(f"  k={k:3d} c={str(c)[:20]}... p0={p0:.4f} p1={p1:.4f} "
-                      f"φ_k={phi_k/math.pi:.4f}π phase={phase/math.pi:.6f}π")
-            
-            # Phase convergence → try period
-            if stable_count >= 10:
-                print(f"  Phase stable at {phase/math.pi:.6f}π after {k} iterations, early exit")
-                break
-            
-            if phase > 1e-8:
-                r = round(1.0 / (phase / (2.0 * math.pi)))
-                if r >= 2 and r <= N and mod_pow(a, r, N) == 1:
-                    print(f"  Found: r={r}")
+            # Period extraction via continued fractions on integer phase
+            if k >= N.bit_length() and K > 0:
+                r = extract_period_int(P, K, N, a)
+                if r:
+                    print(f"  Converged: r={r} (k={k})")
                     if r % 2 == 0:
                         h = mod_pow(a, r // 2, N)
                         if h != N - 1:
-                            f1, f2 = gcd(h + 1, N), gcd(h - 1, N)
-                            if 1 < f1 < N and 1 < f2 < N and f1 * f2 == N:
-                                print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)}")
-                                return (min(f1, f2), max(f1, f2))
+                            f1, f2 = gcd(h+1, N), gcd(h-1, N)
+                            if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
+                                print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (phase r={r})")
+                                return (min(f1,f2), max(f1,f2))
+                    print(f"  r={r} no factor")
                     return None
+        # Post-loop
+        if K > 0:
+            r = extract_period_int(P, K, N, a)
+            if r:
+                print(f"  Post-loop r={r}")
+                if r % 2 == 0:
+                    h = mod_pow(a, r // 2, N)
+                    if h != N - 1:
+                        f1, f2 = gcd(h+1, N), gcd(h-1, N)
+                        if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
+                            print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (post-loop)")
+                            return (min(f1,f2), max(f1,f2))
+                print(f"  r={r} no factor")
+                return None
+        print(f"  Trial complete: phase={phase/math.pi:.6f}π (no period found)")
     return None
 
 if __name__ == '__main__':
