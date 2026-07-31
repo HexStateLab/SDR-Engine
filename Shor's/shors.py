@@ -83,8 +83,9 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
             phase = (phase + phi_k) / 2.0
             
             # Geodesic resonance check — direct GCD extraction
-            z_val = int(phi_k * N / (2.0 * math.pi))  # phase → z-coordinate
-            resonance = abs(c * handoff_x - z_val * remainder)
+            z_val = int(phi_k * N / (2.0 * math.pi))
+            resonance = (c * handoff_x - z_val * remainder) % N
+            if resonance == 0: resonance = c % N
             g = gcd(resonance, N)
             if 1 < g < N and N % g == 0:
                 f1, f2 = min(g, N//g), max(g, N//g)
