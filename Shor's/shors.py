@@ -32,72 +32,102 @@ def run_engine(script, D, freq, rate, gain):
     finally: os.unlink(sp)
 
 def parse_probs(output):
-    m=re.search(r'\[PROB\](.*?)S=',output)
-    if not m: return {}
-    ps={}
-    for p in m.group(1).split():
-        kv=re.match(r'\|(\d+)[⟩>]=(\d+\.\d+)',p)
-        if kv: ps[int(kv.group(1))]=float(kv.group(2))
+    # Match PROB output: |k>=prob or |k⟩=prob
+    ps = {}
+    for m in re.finditer(r'\|(\d+)[⟩>]=(\d+\.\d+)', output):
+        ps[int(m.group(1))] = float(m.group(2))
     return ps
 
 def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
-    """Griffiths-Niu via CR_BIN phase rotations on Fourier bins."""
-    
-    M = 2*N  # unused now — CPHASE/HCTRL/JMEAS scale to any N
+    M = 2*N
     print(f"[gn] N={N} a={a} D={D} {'room' if use_sdr else 'soft'}")
+    
+    sqrt_n = int(math.isqrt(N))
+    remainder = N - sqrt_n * (N // sqrt_n)
+    max_k = 2 * N.bit_length() + 6
     
     for trial in range(trials):
         phase = 0.0
-        # Geodesic accumulator state (from Squarer.py)
-        sqrt_n = int(math.isqrt(N))
-        remainder = N - sqrt_n * (N // sqrt_n)
-        handoff_x = sqrt_n  # initial coordinate shadow
+        handoff_x = sqrt_n
+        prev_phi = -1
+        stable_count = 0
         
-        for k in range(2 * N.bit_length() + 6):
+        # Per-iteration subprocess (clean WF each time), early exit on geodesic/phase
+        for k in range(max_k):
             c = mod_pow(a, 1 << k, N)
             if c == 0 or gcd(c, N) != 1:
                 phase = phase / 2.0; continue
-            
-            # Circuit: QFT → CR_BIN phase rotations → IQFT → H on ctrl → measure
-            # Circuit: CPHASE → HCTRL → JMEAS (no QFT needed!)
-            # CPHASE applies e^{i·2π·c·x/N} to |1⟩|x⟩ components
-            # This is the eigenvalue directly — no Fourier basis needed
+            angle = (2.0 * math.pi * c / N) % (2.0 * math.pi)
             script = [
-                "RESET",
-                "SET 2 0.70710678",  # |0⟩|1⟩  (joint-state bins 2,3)
-                "SET 3 0.70710678",  # |1⟩|1⟩
-                f"CPHASE {c} {N}",   # controlled phase = eigenvalue
-                f"HCTRL {N}",        # H on control → interference
-                f"JMEAS {N}",        # measure
-                "QUIT"
+                "RESET", "SET 2 0.70710678", "SET 3 0.70710678",
+                f"Z {angle:.15f} 3", "HCTRL", "PROB", "QUIT"
             ]
-            
             out = run_engine(script, D, freq, rate, gain)
             if not out: print(f"  k={k} fail"); break
-            
-            m = re.search(r'JMEAS.*P\(.*?\)=(\d+\.\d+).*?P\(.*?\)=(\d+\.\d+)', out)
-            if not m: print(f"  k={k} no JMEAS"); continue
-            p0, p1 = float(m.group(1)), float(m.group(2))
+            ps = parse_probs(out)
+            p0 = ps.get(2, 0); p1 = ps.get(3, 0)
+            tot = p0 + p1
+            if tot < 1e-12: p0 = p1 = 0.5; tot = 1.0
+            p0 /= tot; p1 /= tot
             
             phi_k = 2.0 * math.acos(max(-1.0, min(1.0, math.sqrt(p0))))
             phase = (phase + phi_k) / 2.0
             
-            # Geodesic resonance check — direct GCD extraction
+            # Geodesic
             z_val = int(phi_k * N / (2.0 * math.pi))
             resonance = (c * handoff_x - z_val * remainder) % N
             if resonance == 0: resonance = c % N
             g = gcd(resonance, N)
             if 1 < g < N and N % g == 0:
-                f1, f2 = min(g, N//g), max(g, N//g)
-                print(f"  GEODESIC: c={c} φ={phi_k/math.pi:.4f}π → gcd={g}")
-                print(f"[gn] ★ {N} = {f1} × {f2}")
-                return (f1, f2)
-            # Accumulate coordinate shadow
+                print(f"  GEODESIC k={k}: c={c} φ={phi_k/math.pi:.4f}π → gcd={g}")
+                print(f"[gn] ★ {N} = {min(g,N//g)} × {max(g,N//g)}")
+                return (min(g,N//g), max(g,N//g))
             handoff_x = (handoff_x * c + z_val) % N
             
+            # Early exit on phase convergence
+            if prev_phi > 0 and abs(phi_k - prev_phi) < 0.001:
+                stable_count += 1
+            else:
+                stable_count = 0
+            prev_phi = phi_k
+            
             if k < 12 or k % 8 == 0:
-                print(f"  k={k:3d} c={c:5d} p0={p0:.4f} p1={p1:.4f} "
+                print(f"  k={k:3d} c={str(c)[:20]}... p0={p0:.4f} p1={p1:.4f} "
                       f"φ_k={phi_k/math.pi:.4f}π phase={phase/math.pi:.6f}π")
+            
+            if k >= N.bit_length() and phase > 1e-8:
+                # Extract period via continued fractions on accumulated phase
+                frac = (phase / (2.0 * math.pi)) % 1.0
+                if frac > 1e-10:
+                    p0, q0, p1, q1 = 0, 1, 1, 0
+                    x = frac
+                    for _ in range(60):
+                        if abs(x) < 1e-15: break
+                        ai = int(math.floor(x + 1e-12))
+                        if ai < 0: break
+                        p2, q2 = ai * p1 + p0, ai * q1 + q0
+                        if q2 > N or q2 < 0: break
+                        if q2 > 1 and mod_pow(a, q2, N) == 1:
+                            r = q2
+                            print(f"  Converged: r={r} (k={k})")
+                            if r % 2 == 0:
+                                h = mod_pow(a, r // 2, N)
+                                if h != N - 1:
+                                    f1, f2 = gcd(h+1, N), gcd(h-1, N)
+                                    if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
+                                        print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (phase r={r})")
+                                        return (min(f1,f2), max(f1,f2))
+                            print(f"  r={r} no factor")
+                            return None
+                        p0, q0, p1, q1 = p1, q1, p2, q2
+                        x = 1.0 / (x - ai)
+                print(f"  k={k:3d} c={str(c)[:20]}... p0={p0:.4f} p1={p1:.4f} "
+                      f"φ_k={phi_k/math.pi:.4f}π phase={phase/math.pi:.6f}π")
+            
+            # Phase convergence → try period
+            if stable_count >= 10:
+                print(f"  Phase stable at {phase/math.pi:.6f}π after {k} iterations, early exit")
+                break
             
             if phase > 1e-8:
                 r = round(1.0 / (phase / (2.0 * math.pi)))
@@ -111,18 +141,6 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
                                 print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)}")
                                 return (min(f1, f2), max(f1, f2))
                     return None
-        
-        # End of k-loop: try accumulated phase
-        if phase > 1e-8:
-            r = round(1.0 / (phase / (2.0 * math.pi)))
-            if r >= 2 and r <= N and mod_pow(a, r, N) == 1:
-                if r % 2 == 0:
-                    h = mod_pow(a, r // 2, N)
-                    if h != N - 1:
-                        f1, f2 = gcd(h + 1, N), gcd(h - 1, N)
-                        if 1 < f1 < N and 1 < f2 < N and f1 * f2 == N:
-                            print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (final phase)")
-                            return (min(f1, f2), max(f1, f2))
     return None
 
 if __name__ == '__main__':
