@@ -71,15 +71,18 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
         handoff_x = sqrt_n
         
         # Per-iteration subprocess (clean WF each time), early exit on geodesic/phase
+        # Per-iteration: feedback depends on prior measurement outcomes
         for k in range(max_k):
             c = mod_pow(a, 1 << k, N)
             if c == 0 or gcd(c, N) != 1:
-                phase = phase / 2.0; continue
+                P <<= 1; K += 1; phase = phase / 2.0; continue
             angle = (2.0 * math.pi * c / N) % (2.0 * math.pi)
-            script = [
-                "RESET", "SET 2 0.70710678", "SET 3 0.70710678",
-                f"Z {angle:.15f} 3", "HCTRL", "PROB", "QUIT"
-            ]
+            script = ["RESET", "SET 2 0.70710678", "SET 3 0.70710678"]
+            if K > 0:
+                fb = (math.pi * P) / (1 << K)
+                script.append(f"Z {-fb/2:.15f} 2")
+                script.append(f"Z {+fb/2:.15f} 3")
+            script.extend([f"Z {angle:.15f} 3", "HCTRL", "PROB", "QUIT"])
             out = run_engine(script, D, freq, rate, gain)
             if not out: print(f"  k={k} fail"); break
             ps = parse_probs(out)
@@ -96,15 +99,17 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
             P = (bit << K) | P
             K += 1
             
-            # Geodesic
+            # Geodesic — pad z_val ±1 in SDR mode for phase jitter
             z_val = int(phi_k * N / (2.0 * math.pi))
-            resonance = (c * handoff_x - z_val * remainder) % N
-            if resonance == 0: resonance = c % N
-            g = gcd(resonance, N)
-            if 1 < g < N and N % g == 0:
-                print(f"  GEODESIC k={k}: c={c} φ={phi_k/math.pi:.4f}π → gcd={g}")
-                print(f"[gn] ★ {N} = {min(g,N//g)} × {max(g,N//g)}")
-                return (min(g,N//g), max(g,N//g))
+            for dz in (range(-1, 2) if use_sdr else [0]):
+                zv = z_val + dz
+                resonance = (c * handoff_x - zv * remainder) % N
+                if resonance == 0: resonance = c % N
+                g = gcd(resonance, N)
+                if 1 < g < N and N % g == 0:
+                    print(f"  GEODESIC k={k}: c={c} φ={phi_k/math.pi:.4f}π → gcd={g}")
+                    print(f"[gn] ★ {N} = {min(g,N//g)} × {max(g,N//g)}")
+                    return (min(g,N//g), max(g,N//g))
             handoff_x = (handoff_x * c + z_val) % N
             
             if k < 12 or k % 8 == 0:
