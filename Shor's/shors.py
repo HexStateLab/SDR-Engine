@@ -25,7 +25,7 @@ def run_engine(script, D, freq, rate, gain):
     with tempfile.NamedTemporaryFile(mode='w', suffix='.qvm', delete=False) as f:
         f.write(s); sp=f.name
     try:
-        r=subprocess.run([ENGINE,str(D),str(freq),str(rate),str(gain),'--vm',sp],
+        r=subprocess.run(['stdbuf','-oL','-eL',ENGINE,str(D),str(freq),str(rate),str(gain),'--vm',sp],
                         capture_output=True,text=True,timeout=300,env={**os.environ})
         return r.stdout+r.stderr
     except: return None
@@ -56,51 +56,49 @@ def extract_period_int(P, K, N, a):
     return None
 
 def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
-    M = 2*N
-    print(f"[gn] N={N} a={a} D={D} {'room' if use_sdr else 'soft'}")
+    M = min(2*N, D)
+    N_reg = M // 2  # effective N for QFT/HCTRL/JMEAS bin count
+    print(f"[gn] N={N} D={D} M={M} {'room' if use_sdr else 'soft'}")
     
     sqrt_n = int(math.isqrt(N))
     remainder = N - sqrt_n * (N // sqrt_n)
-    max_k = 2 * N.bit_length() + 6
+    max_k = 4 * N.bit_length() + 64  # reach non-zero bits for large r
     
     for trial in range(trials):
         phase = 0.0
-        # Integer-phase accumulator: exact binary fraction
-        P = 0  # numerator, denominator = 2^k
-        K = 0  # number of bits accumulated
+        P = 0; K = 0
         handoff_x = sqrt_n
         
-        # Per-iteration subprocess (clean WF each time), early exit on geodesic/phase
-        # Per-iteration: feedback depends on prior measurement outcomes
         for k in range(max_k):
             c = mod_pow(a, 1 << k, N)
             if c == 0 or gcd(c, N) != 1:
                 P <<= 1; K += 1; phase = phase / 2.0; continue
-            angle = (2.0 * math.pi * c / N) % (2.0 * math.pi)
+            
+            # IPE circuit with semi-classical QFT feedback
+            ratio = (2.0 * math.pi * c / N) % (2.0 * math.pi)
             script = ["RESET", "SET 2 0.70710678", "SET 3 0.70710678"]
             if K > 0:
                 from fractions import Fraction
-                fb = math.pi * float(Fraction(P, 1 << K))
+                fb = 2.0 * math.pi * float(Fraction(P, 1 << K))
                 script.append(f"Z {-fb/2:.15f} 2")
                 script.append(f"Z {+fb/2:.15f} 3")
-            script.extend([f"Z {angle:.15f} 3", "HCTRL", "PROB", "QUIT"])
+            script.extend([f"QFT {M}", f"CPRATIO {ratio:.15f}", f"IQFT {M}"])
+            if use_sdr:
+                script.append("ROOM")  # R820T2 mixer: physical interferometry
+            script.extend([f"HCTRL {N_reg}", f"JMEAS {N_reg}", "QUIT"])
             out = run_engine(script, D, freq, rate, gain)
             if not out: print(f"  k={k} fail"); break
-            ps = parse_probs(out)
-            p0 = ps.get(2, 0); p1 = ps.get(3, 0)
-            tot = p0 + p1
-            if tot < 1e-12: p0 = p1 = 0.5; tot = 1.0
-            p0 /= tot; p1 /= tot
+            m = re.search(r'P\(.*?\)=(\d+\.\d+).*?P\(.*?\)=(\d+\.\d+)', out)
+            if not m: print(f"  k={k} no JMEAS"); continue
+            p0, p1 = float(m.group(1)), float(m.group(2))
             
             phi_k = 2.0 * math.acos(max(-1.0, min(1.0, math.sqrt(p0))))
             phase = (phase + phi_k) / 2.0
-            
-            # Integer-phase: store bit with full precision (binary threshold)
             bit = 1 if phi_k > math.pi/2 else 0
             P = (bit << K) | P
             K += 1
             
-            # Geodesic — pad z_val ±1 in SDR mode for phase jitter
+            # Geodesic
             z_val = int(phi_k * N / (2.0 * math.pi))
             for dz in (range(-1, 2) if use_sdr else [0]):
                 zv = z_val + dz
@@ -117,34 +115,39 @@ def griffiths_niu(N, a, D, freq, rate, gain, trials, use_sdr):
                 print(f"  k={k:3d} c={str(c)[:20]}... p0={p0:.4f} p1={p1:.4f} "
                       f"φ_k={phi_k/math.pi:.4f}π phase={phase/math.pi:.6f}π")
             
-            # Period extraction via continued fractions on integer phase
-            if k >= N.bit_length() and K > 0:
-                r = extract_period_int(P, K, N, a)
-                if r:
-                    print(f"  Converged: r={r} (k={k})")
+            if k >= N.bit_length() and phase > 1e-8:
+                frac = (phase / (2.0 * math.pi)) % 1.0
+                for den in range(2, min(N, 100000)):
+                    num = round(frac * den)
+                    if abs(frac - num/den) < 1e-3 and mod_pow(a, den, N) == 1:
+                        r = den
+                        print(f"  Converged: r={r} (k={k})")
+                        if r % 2 == 0:
+                            h = mod_pow(a, r // 2, N)
+                            if h != N - 1:
+                                f1, f2 = gcd(h+1, N), gcd(h-1, N)
+                                if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
+                                    print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (phase r={r})")
+                                    return (min(f1,f2), max(f1,f2))
+                        print(f"  r={r} no factor")
+                        return None
+        # Post-loop
+        if phase > 1e-8:
+            frac = (phase / (2.0 * math.pi)) % 1.0
+            for den in range(2, min(N, 100000)):
+                num = round(frac * den)
+                if abs(frac - num/den) < 1e-3 and mod_pow(a, den, N) == 1:
+                    r = den
+                    print(f"  Post-loop r={r}")
                     if r % 2 == 0:
                         h = mod_pow(a, r // 2, N)
                         if h != N - 1:
                             f1, f2 = gcd(h+1, N), gcd(h-1, N)
                             if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
-                                print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (phase r={r})")
+                                print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (post-loop)")
                                 return (min(f1,f2), max(f1,f2))
                     print(f"  r={r} no factor")
                     return None
-        # Post-loop
-        if K > 0:
-            r = extract_period_int(P, K, N, a)
-            if r:
-                print(f"  Post-loop r={r}")
-                if r % 2 == 0:
-                    h = mod_pow(a, r // 2, N)
-                    if h != N - 1:
-                        f1, f2 = gcd(h+1, N), gcd(h-1, N)
-                        if 1 < f1 < N and 1 < f2 < N and f1*f2 == N:
-                            print(f"[gn] ★ {N} = {min(f1,f2)} × {max(f1,f2)} (post-loop)")
-                            return (min(f1,f2), max(f1,f2))
-                print(f"  r={r} no factor")
-                return None
         print(f"  Trial complete: phase={phase/math.pi:.6f}π (no period found)")
     return None
 
