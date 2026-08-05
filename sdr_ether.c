@@ -2143,7 +2143,7 @@ static void tx_write_file(const TxBuf *tx, const char *path);
 typedef struct QvmCtx QvmCtx;
 typedef int (*QvmOp)(QvmCtx *q, double a1, double a2);
 
-#define QVM_MAX_OPS 96
+#define QVM_MAX_OPS 128
 
 struct QvmCtx {
     SdrDev       *sdr;
@@ -3843,6 +3843,459 @@ static int op_iqft(QvmCtx *q, double a1, double a2){
     return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * MULTI-BANK QUANTUM FOURIER TRANSFORM
+ *   Decomposes full room register N = num_banks × bank_dim
+ *   using six-step distributed FFT (Bailey 1990).
+ *   Enables Shor's algorithm at UNREAL scale.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Capture all banks into a flat re/im buffer of total_dim elements.
+   Caller must free *re_out and *im_out. Returns total_dim. */
+static int capture_all_banks(QvmCtx *q, double **re_out, double **im_out, int max_dim){
+    if (!q->sdr_ok || q->num_banks <= 1) {
+        *re_out = malloc(q->wf.d * sizeof(double));
+        *im_out = malloc(q->wf.d * sizeof(double));
+        if (!*re_out || !*im_out) { free(*re_out); free(*im_out); return -1; }
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+        for (int i = 0; i < q->wf.d; i++) { (*re_out)[i] = q->wf.re[i]; (*im_out)[i] = q->wf.im[i]; }
+        return q->wf.d;
+    }
+
+    int bdim = q->bank_dim;
+    int nb   = q->num_banks;
+    int total = nb * bdim;
+    if (total > max_dim) total = max_dim;
+    int actual = total / bdim;
+    if (actual < 1) actual = 1;
+    if (actual > nb) actual = nb;
+    total = actual * bdim;
+
+    *re_out = calloc(total, sizeof(double));
+    *im_out = calloc(total, sizeof(double));
+    if (!*re_out || !*im_out) { free(*re_out); free(*im_out); return -1; }
+
+    uint32_t save_freq = q->sdr->freq;
+    for (int b = 0; b < actual; b++) {
+        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+        sdr_retune(q->sdr, bfreq);
+        usleep(8000);
+        sdr_flush(q->sdr);
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+        for (int k = 0; k < bdim && k < q->wf.d; k++) {
+            int gi = b * bdim + k;
+            (*re_out)[gi] = q->wf.re[k];
+            (*im_out)[gi] = q->wf.im[k];
+        }
+    }
+    sdr_retune(q->sdr, save_freq);
+    sdr_flush(q->sdr);
+    return total;
+}
+
+/* Write flat re/im back into the wavefunction (single-bank — WF only).
+   For multi-bank, use radiate_all_banks. */
+static void write_flat_to_wf(QvmCtx *q, double *re, double *im, int total){
+    int D = q->wf.d;
+    int n = total < D ? total : D;
+    for (int i = 0; i < n; i++) { q->wf.re[i] = re[i]; q->wf.im[i] = im[i]; }
+    for (int i = n; i < D; i++) { q->wf.re[i] = q->wf.im[i] = 0; }
+    qvm_norm(&q->wf);
+}
+
+/* Radiate flat re/im across all active banks into the room.
+   Each bank: retune → encode flat slice → TX → next bank. */
+static void radiate_all_banks(QvmCtx *q, double *re, double *im, int total){
+    int bdim = q->bank_dim;
+    int nb = q->num_banks;
+    if (nb <= 1) {
+        write_flat_to_wf(q, re, im, total);
+        if (q->sdr_ok) gate_tx_hardware(q->sdr, &q->wf);
+        return;
+    }
+    uint32_t save_freq = q->sdr->freq;
+    int actual = (total + bdim - 1) / bdim;
+    if (actual > nb) actual = nb;
+
+    for (int b = 0; b < actual; b++) {
+        uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(b * q->rate);
+        sdr_retune(q->sdr, bfreq);
+        usleep(5000);
+        sdr_flush(q->sdr);
+
+        /* Build bank-local WF */
+        memset(q->wf.re, 0, q->wf.d * sizeof(double));
+        memset(q->wf.im, 0, q->wf.d * sizeof(double));
+        for (int k = 0; k < bdim && k < q->wf.d; k++) {
+            int gi = b * bdim + k;
+            if (gi >= total) break;
+            q->wf.re[k] = re[gi];
+            q->wf.im[k] = im[gi];
+        }
+        qvm_norm(&q->wf);
+        gate_tx_hardware(q->sdr, &q->wf);
+    }
+    sdr_retune(q->sdr, save_freq);
+    sdr_flush(q->sdr);
+    /* Restore bank 0 */
+    sdr_capture(q->sdr);
+    wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+}
+
+/* QFTM [total=N]: Multi-bank Quantum Fourier Transform.
+   Total size N can be up to num_banks × bank_dim.
+   Uses six-step distributed FFT (Bailey 1990):
+     1. D-point FFT on each bank row
+     2. Transpose + twiddle multiply
+     3. B-point FFT on each column
+     4. Transpose back */
+static int op_qftm(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    int total = ((int)a1) > 0 ? (int)a1 : q->wf.d;
+    int D = q->bank_dim > 0 ? q->bank_dim : q->wf.d;
+    int B = q->num_banks > 0 ? q->num_banks : 1;
+    int max_total = B * D;
+    if (total > max_total) total = max_total;
+    if (total < D) { total = D; B = 1; }
+
+    B = (total + D - 1) / D;
+    if (B < 1) B = 1;
+    int N = B * D;
+    int eff_total = total < N ? total : N;
+
+    printf("  [QFTM] N=%d (%d banks × %d bins) — six-step distributed FFT\n", eff_total, B, D);
+
+    double *re_flat, *im_flat;
+    int captured = capture_all_banks(q, &re_flat, &im_flat, eff_total);
+    if (captured < 0) { printf("  [QFTM] capture failed\n"); return -1; }
+    if (captured < eff_total) eff_total = captured;
+    B = (eff_total + D - 1) / D;
+    N = B * D;
+
+    /* Allocate work buffer */
+    fftw_complex *row = fftw_malloc(D * sizeof(fftw_complex));
+    fftw_complex *col = fftw_malloc(B * sizeof(fftw_complex));
+
+    /* Step 1: D-point FFT on each bank row */
+    fftw_plan plan_d = fftw_plan_dft_1d(D, row, row, FFTW_FORWARD, FFTW_ESTIMATE);
+    for (int b = 0; b < B; b++) {
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            row[k][0] = (gi < eff_total) ? re_flat[gi] : 0.0;
+            row[k][1] = (gi < eff_total) ? im_flat[gi] : 0.0;
+        }
+        fftw_execute(plan_d);
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            if (gi < eff_total) { re_flat[gi] = row[k][0]; im_flat[gi] = row[k][1]; }
+        }
+    }
+    fftw_destroy_plan(plan_d);
+
+    /* Step 2: Transpose + twiddle multiply */
+    /* Build a temporary D×B transpose buffer */
+    double *tmp_re = calloc(N, sizeof(double));
+    double *tmp_im = calloc(N, sizeof(double));
+    if (!tmp_re || !tmp_im) { free(re_flat); free(im_flat); fftw_free(row); fftw_free(col); return -1; }
+
+    for (int b = 0; b < B; b++) {
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            if (gi >= eff_total) continue;
+            double re_val = re_flat[gi];
+            double im_val = im_flat[gi];
+            /* Twiddle: e^{-2πi·b·k/N} */
+            double theta = -2.0 * M_PI * b * k / (double)N;
+            double cr = cos(theta), sr = sin(theta);
+            double tw_re = re_val * cr - im_val * sr;
+            double tw_im = re_val * sr + im_val * cr;
+            /* Transposed index: k * B + b */
+            int tj = k * B + b;
+            if (tj < N) { tmp_re[tj] = tw_re; tmp_im[tj] = tw_im; }
+        }
+    }
+
+    /* Step 3: B-point FFT on each column (in transposed layout) */
+    fftw_plan plan_b = fftw_plan_dft_1d(B, col, col, FFTW_FORWARD, FFTW_ESTIMATE);
+    for (int k = 0; k < D; k++) {
+        for (int b = 0; b < B; b++) {
+            int tj = k * B + b;
+            col[b][0] = (tj < N) ? tmp_re[tj] : 0.0;
+            col[b][1] = (tj < N) ? tmp_im[tj] : 0.0;
+        }
+        fftw_execute(plan_b);
+        for (int b = 0; b < B; b++) {
+            int tj = k * B + b;
+            if (tj < N) { tmp_re[tj] = col[b][0]; tmp_im[tj] = col[b][1]; }
+        }
+    }
+    fftw_destroy_plan(plan_b);
+
+    /* Step 4: Transpose back to B×D layout */
+    double norm = 1.0 / sqrt((double)N);
+    for (int b = 0; b < B; b++) {
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            int tj = k * B + b;
+            if (gi < eff_total && tj < N) {
+                re_flat[gi] = tmp_re[tj] * norm;
+                im_flat[gi] = tmp_im[tj] * norm;
+            }
+        }
+    }
+
+    free(tmp_re); free(tmp_im);
+
+    /* Write back: radiate into room */
+    write_flat_to_wf(q, re_flat, im_flat, eff_total);
+    printf("  [QFTM] %d-point distributed FFT complete. Radiating into room.\n", eff_total);
+    radiate_all_banks(q, re_flat, im_flat, eff_total);
+
+    free(re_flat); free(im_flat);
+    fftw_free(row); fftw_free(col);
+    return 0;
+}
+
+/* IQFTM [total=N]: Multi-bank Inverse QFT (FFTW3_BACKWARD) */
+static int op_iqftm(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    int total = ((int)a1) > 0 ? (int)a1 : q->wf.d;
+    int D = q->bank_dim > 0 ? q->bank_dim : q->wf.d;
+    int B = q->num_banks > 0 ? q->num_banks : 1;
+    int max_total = B * D;
+    if (total > max_total) total = max_total;
+    if (total < D) { total = D; B = 1; }
+
+    B = (total + D - 1) / D;
+    if (B < 1) B = 1;
+    int N = B * D;
+    int eff_total = total < N ? total : N;
+
+    printf("  [IQFTM] N=%d (%d banks × %d bins) — six-step distributed IFFT\n", eff_total, B, D);
+
+    double *re_flat, *im_flat;
+    int captured = capture_all_banks(q, &re_flat, &im_flat, eff_total);
+    if (captured < 0) { printf("  [IQFTM] capture failed\n"); return -1; }
+    if (captured < eff_total) eff_total = captured;
+    B = (eff_total + D - 1) / D;
+    N = B * D;
+
+    fftw_complex *row = fftw_malloc(D * sizeof(fftw_complex));
+    fftw_complex *col = fftw_malloc(B * sizeof(fftw_complex));
+
+    /* Step 1: D-point IFFT on each bank row */
+    fftw_plan plan_d = fftw_plan_dft_1d(D, row, row, FFTW_BACKWARD, FFTW_ESTIMATE);
+    for (int b = 0; b < B; b++) {
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            row[k][0] = (gi < eff_total) ? re_flat[gi] : 0.0;
+            row[k][1] = (gi < eff_total) ? im_flat[gi] : 0.0;
+        }
+        fftw_execute(plan_d);
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            if (gi < eff_total) { re_flat[gi] = row[k][0]; im_flat[gi] = row[k][1]; }
+        }
+    }
+    fftw_destroy_plan(plan_d);
+
+    /* Step 2: Transpose + inverse-twiddle (conjugate) */
+    double *tmp_re = calloc(N, sizeof(double));
+    double *tmp_im = calloc(N, sizeof(double));
+    if (!tmp_re || !tmp_im) { free(re_flat); free(im_flat); fftw_free(row); fftw_free(col); return -1; }
+
+    for (int b = 0; b < B; b++) {
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            if (gi >= eff_total) continue;
+            double re_val = re_flat[gi];
+            double im_val = im_flat[gi];
+            double theta = 2.0 * M_PI * b * k / (double)N;
+            double cr = cos(theta), sr = sin(theta);
+            double tw_re = re_val * cr - im_val * sr;
+            double tw_im = re_val * sr + im_val * cr;
+            int tj = k * B + b;
+            if (tj < N) { tmp_re[tj] = tw_re; tmp_im[tj] = tw_im; }
+        }
+    }
+
+    /* Step 3: B-point IFFT on each column */
+    fftw_plan plan_b = fftw_plan_dft_1d(B, col, col, FFTW_BACKWARD, FFTW_ESTIMATE);
+    for (int k = 0; k < D; k++) {
+        for (int b = 0; b < B; b++) {
+            int tj = k * B + b;
+            col[b][0] = (tj < N) ? tmp_re[tj] : 0.0;
+            col[b][1] = (tj < N) ? tmp_im[tj] : 0.0;
+        }
+        fftw_execute(plan_b);
+        for (int b = 0; b < B; b++) {
+            int tj = k * B + b;
+            if (tj < N) { tmp_re[tj] = col[b][0]; tmp_im[tj] = col[b][1]; }
+        }
+    }
+    fftw_destroy_plan(plan_b);
+
+    /* Step 4: Transpose back, normalize */
+    double norm = 1.0 / sqrt((double)N);
+    for (int b = 0; b < B; b++) {
+        for (int k = 0; k < D; k++) {
+            int gi = b * D + k;
+            int tj = k * B + b;
+            if (gi < eff_total && tj < N) {
+                re_flat[gi] = tmp_re[tj] * norm;
+                im_flat[gi] = tmp_im[tj] * norm;
+            }
+        }
+    }
+
+    free(tmp_re); free(tmp_im);
+
+    write_flat_to_wf(q, re_flat, im_flat, eff_total);
+    printf("  [IQFTM] %d-point distributed IFFT complete. Radiating into room.\n", eff_total);
+    radiate_all_banks(q, re_flat, im_flat, eff_total);
+
+    free(re_flat); free(im_flat);
+    fftw_free(row); fftw_free(col);
+    return 0;
+}
+
+/* HCTRLM [total]: Multi-bank Hadamard on control qubit.
+   Applies H across the full register treating even/odd pairs
+   as |0⟩|x⟩ and |1⟩|f(x)⟩ across all banks. */
+static int op_hctrlm(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    int total = ((int)a1) > 0 ? (int)a1 : q->wf.d;
+    double *re_flat, *im_flat;
+    int captured = capture_all_banks(q, &re_flat, &im_flat, total);
+    if (captured < 0) return -1;
+    if (captured < total) total = captured;
+
+    double is2 = 1.0 / sqrt(2.0);
+    for (int x = 0; x < total/2; x++) {
+        int b0 = 2*x, b1 = 2*x + 1;
+        if (b1 >= total) break;
+        double amp = re_flat[b0]*re_flat[b0] + im_flat[b0]*im_flat[b0]
+                   + re_flat[b1]*re_flat[b1] + im_flat[b1]*im_flat[b1];
+        if (amp < 1e-30) continue;
+        double r0 = re_flat[b0], i0 = im_flat[b0];
+        double r1 = re_flat[b1], i1 = im_flat[b1];
+        re_flat[b0] = (r0 + r1) * is2; im_flat[b0] = (i0 + i1) * is2;
+        re_flat[b1] = (r0 - r1) * is2; im_flat[b1] = (i0 - i1) * is2;
+    }
+
+    write_flat_to_wf(q, re_flat, im_flat, total);
+    printf("  [HCTRLM] H on ctrl across %d-bin register\n", total);
+    radiate_all_banks(q, re_flat, im_flat, total);
+
+    free(re_flat); free(im_flat);
+    return 0;
+}
+
+/* JMEASM [total]: Multi-bank joint measurement.
+   Sums even bins = P(|0⟩), odd bins = P(|1⟩) across all banks. */
+static int op_jmeasm(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    int total = ((int)a1) > 0 ? (int)a1 : q->wf.d;
+    double *re_flat, *im_flat;
+    int captured = capture_all_banks(q, &re_flat, &im_flat, total);
+    if (captured < 0) return -1;
+    if (captured < total) total = captured;
+
+    double p0 = 0, p1 = 0;
+    for (int x = 0; x < total/2; x++) {
+        int b0 = 2*x, b1 = 2*x + 1;
+        if (b1 >= total) break;
+        p0 += re_flat[b0]*re_flat[b0] + im_flat[b0]*im_flat[b0];
+        p1 += re_flat[b1]*re_flat[b1] + im_flat[b1]*im_flat[b1];
+    }
+    double tot = p0 + p1;
+    printf("  [JMEASM] P(|0⟩)=%.4f P(|1⟩)=%.4f (across %d bins)\n",
+           tot > 1e-15 ? p0/tot : 0, tot > 1e-15 ? p1/tot : 0, total);
+
+    free(re_flat); free(im_flat);
+    return 0;
+}
+
+/* CPRATIOM [ratio]: Multi-bank controlled phase rotation.
+   Applies phase = ratio * x to odd bins (|1⟩|x⟩) across all banks. */
+static int op_cpratiom(QvmCtx *q, double a1, double a2){
+    (void)a2;
+    double ratio = a1;
+    double *re_flat, *im_flat;
+    int total = q->num_banks > 1 ? q->num_banks * q->bank_dim : q->wf.d;
+    int captured = capture_all_banks(q, &re_flat, &im_flat, total);
+    if (captured < 0) return -1;
+    total = captured;
+
+    for (int x = 0; x < total/2; x++) {
+        int bo = 2*x + 1;
+        if (bo >= total) break;
+        double amp = re_flat[bo]*re_flat[bo] + im_flat[bo]*im_flat[bo];
+        if (amp < 1e-30) continue;
+        double ph = ratio * x;
+        double cr = cos(ph), sr = sin(ph);
+        double re = re_flat[bo], im = im_flat[bo];
+        re_flat[bo] = re * cr - im * sr;
+        im_flat[bo] = re * sr + im * cr;
+    }
+
+    write_flat_to_wf(q, re_flat, im_flat, total);
+    printf("  [CPRATIOM] phase=ratio·x across %d-bin register\n", total);
+    radiate_all_banks(q, re_flat, im_flat, total);
+
+    free(re_flat); free(im_flat);
+    return 0;
+}
+
+/* SETABS <global_bin> <amp>: Set amplitude at absolute bin index 
+   across the multi-bank register. Switches to the correct bank,
+   sets amplitude, then restores. */
+static int op_setabs(QvmCtx *q, double a1, double a2){
+    int gbin = (int)a1;
+    double amp = a2;
+    int D = q->wf.d;
+    int bdim = q->bank_dim > 0 ? q->bank_dim : D;
+    int bank = gbin / bdim;
+    int local = gbin % bdim;
+
+    if (bank >= q->num_banks) {
+        printf("  [SETABS] global bin %d out of range (max %d)\n", gbin, q->num_banks * bdim - 1);
+        return 0;
+    }
+
+    /* Switch to target bank if needed */
+    if (q->num_banks > 1 && bank != q->cur_bank) {
+        if (q->sdr_ok) {
+            uint32_t bfreq = (uint32_t)q->freq + (uint32_t)(bank * q->rate);
+            sdr_retune(q->sdr, bfreq);
+            sdr_flush(q->sdr);
+        }
+        q->cur_bank = bank;
+    }
+
+    /* Capture current bank state or zero it */
+    if (q->sdr_ok) {
+        sdr_capture(q->sdr);
+        wf_from_iq(q->sdr->iq_i, q->sdr->iq_q, q->sdr->iq_n, &q->wf);
+    } else {
+        memset(q->wf.re, 0, D * sizeof(double));
+        memset(q->wf.im, 0, D * sizeof(double));
+    }
+
+    if (local >= 0 && local < D) {
+        q->wf.re[local] = amp;
+        q->wf.im[local] = 0;
+    }
+    qvm_norm(&q->wf);
+
+    /* TX into the room at this bank */
+    if (q->sdr_ok) gate_tx_hardware(q->sdr, &q->wf);
+
+    return 0;
+}
+
 /* CMULT c N: Controlled modular multiplication.
    Applies |x⟩ → |c·x mod N⟩ to the first N bins of the WF,
    phase-encoding the result using the exponentiation pattern.
@@ -4715,6 +5168,7 @@ static int op_exp(QvmCtx *q, double a1, double a2){
    No RAM allocation.  D is entirely in the EM field. */
 static int op_banks(QvmCtx *q, double a1, double a2){
     (void)a2;
+    fprintf(stderr,"  [DEBUG BANKS] a1=%.6f int_a1=%d\n", a1, (int)a1);
     int nb = ((int)a1) > 0 ? (int)a1 : 1;
     if (nb < 1) nb = 1;
     if (nb > MAX_BANKS) nb = MAX_BANKS;
@@ -5011,6 +5465,7 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "DUMP",      op_dump,      "full state vector");
     qvm_reg(q, "SAMPLE",    op_sample,    "Born-rule sampling [n=100]");
     qvm_reg(q, "SET",       op_set,       "set |k⟩ amplitude");
+    qvm_reg(q, "SETABS",    op_setabs,    "set amplitude at global bin across multi-bank register [gbin] [amp]");
     qvm_reg(q, "RESET",     op_reset,     "uniform superposition");
     qvm_reg(q, "SWAP",      op_swap,      "swap |a⟩ and |b⟩");
     qvm_reg(q, "INVERT",    op_invert,    "complex conjugate");
@@ -5025,6 +5480,8 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "?",         op_help,      "alias for HELP");
     qvm_reg(q, "QFT",       op_qft,       "Quantum Fourier Transform on WF [n=D]");
     qvm_reg(q, "IQFT",      op_iqft,      "Inverse QFT [n=D] — for modular arithmetic");
+    qvm_reg(q, "QFTM",      op_qftm,      "Multi-bank QFT across room register [total=N]");
+    qvm_reg(q, "IQFTM",     op_iqftm,     "Multi-bank Inverse QFT across room register [total=N]");
     qvm_reg(q, "CMULT",     op_cmult,     "Controlled modular multiply: |x>→|c·x mod N> [c] [N]");
     qvm_reg(q, "CRANGLE",   op_crangle,   "Set phase angle for CR_BIN gates [rad]");
     qvm_reg(q, "CR_GATE",   op_cr_gate,   "Controlled-Rz between QBIN qubits [ctrl] [tgt] (uses CRANGLE)");
@@ -5033,8 +5490,11 @@ static void qvm_init_ops(QvmCtx *q){
     qvm_reg(q, "JCADD",     op_jcadd,     "Joint-state ctrl-U: |1>|x>→|1>|c·x mod N> [c] [N]");
     qvm_reg(q, "CPHASE",    op_cphase,    "Controlled phase: |1>|x>*=e^{i·2π·c·x/N} [c] [N]");
     qvm_reg(q, "CPRATIO",   op_cpratio,   "CPHASE via ratio: phase=ratio*x per bin [ratio]");
+    qvm_reg(q, "CPRATIOM",  op_cpratiom,  "Multi-bank CPRATIO across room register [ratio]");
     qvm_reg(q, "HCTRL",     op_hctrl,     "Hadamard on ctrl qubit (joint-state) [N]");
     qvm_reg(q, "JMEAS",     op_jmeas,     "Measure ctrl qubit (joint-state) [N]");
+    qvm_reg(q, "HCTRLM",    op_hctrlm,    "Multi-bank HCTRL across room register [total]");
+    qvm_reg(q, "JMEASM",    op_jmeasm,    "Multi-bank JMEAS across room register [total]");
     qvm_reg(q, "ROOM",      op_room,      "OFDM TX/RX: current WF → R820T2 → capture");
     qvm_reg(q, "QFTQ",      op_qftq,      "QFT on m QBIN-mapped qubits [m]");
     qvm_reg(q, "IQFTQ",     op_iqftq,     "Inverse QFT on m qubits [m]");
@@ -5216,8 +5676,30 @@ void qvm_antisym_encode(QvmCtx *q, const int *bins, const double *amps,
 
 int qvm_eval(QvmCtx *q, const char *cmd){
     char op[32]={0}; double a1=0,a2=0;
-    sscanf(cmd,"%31s %lf %lf",op,&a1,&a2);
-    if(!op[0]) return 0;
+    /* Manual parse: sscanf %n is unreliable; parse by hand. */
+    const char *p = cmd;
+    while (*p == ' ' || *p == '\t') p++;
+    const char *os = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    int oplen = p - os;
+    if (oplen > 31) oplen = 31;
+    if (oplen > 0) { memcpy(op, os, oplen); op[oplen] = 0; }
+    else { op[0] = 0; }
+    if (!op[0]) return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) {
+        char *end1 = NULL, *end2 = NULL;
+        errno = 0;
+        a1 = strtod(p, &end1);
+        if (errno == ERANGE) { a1 = (a1 > 0) ? 9.22e18 : -9.22e18; errno = 0; }
+        if (end1 && end1 > p) {
+            while (*end1 == ' ' || *end1 == '\t') end1++;
+            if (*end1) {
+                a2 = strtod(end1, &end2);
+                if (errno == ERANGE) { a2 = (a2 > 0) ? 9.22e18 : -9.22e18; errno = 0; }
+            }
+        }
+    }
 
     QvmOp fn = qvm_lookup(q, op);
     if (!fn) { printf("  ? Unknown: %s\n", op); return 0; }
@@ -5295,7 +5777,7 @@ int qvm_run(QvmCtx *q, const char *script_path){
     if (!q->interactive) {
         FILE *f = fopen(script_path, "r");
         if (!f) { fprintf(stderr,"[VM] Cannot open %s\n",script_path); return 1; }
-        char lbuf[512];
+        char lbuf[8192];
         q->lines = malloc(131072*sizeof(char*));
         while (fgets(lbuf,sizeof(lbuf),f) && q->nlines<131072) {
             char *nl=strchr(lbuf,'\n');if(nl)*nl=0;
@@ -5307,7 +5789,7 @@ int qvm_run(QvmCtx *q, const char *script_path){
     }
 
     while (q->running) {
-        char line[512]={0};
+        char line[8192]={0};
         if (!q->interactive) {
             if (q->ip >= q->nlines) break;
             strcpy(line, q->lines[q->ip++]);
